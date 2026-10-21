@@ -29,7 +29,16 @@ commit-msg.tmp
 .research/
 
 ide-models.json
-scripts
+scripts/*
+# ⚠️ 白名单：部署产物的打包脚本与安装模板是**交付物**（service.bat -Mode standalone /
+#    -Mode bootstrap 调用它们），必须入库；而 `scripts` 整目录忽略会误伤它们
+#    （注意：已入库的 scripts/*.mjs 不受影响，只有**新增**文件会被这条规则挡住，
+#     所以要改成「目录内通配 + 显式例外」的形式）。
+!scripts/build-standalone.mjs
+!scripts/build-bootstrap.mjs
+!scripts/local-agent.mjs
+!scripts/templates/
+!scripts/templates/install-bootstrap.ps1
 .minimax-forensics/
 
 # Qoder 私有签名体系的复现脚本（研究工具，仅本地保留）
@@ -102,6 +111,9 @@ tests/fixtures/test.png
 
 # 打包产物：npm/pnpm pack 生成的 tarball 不入库（2026-10-01）
 *.tgz
+
+# 打包产物目录（service.bat package / package -Mode standalone 的输出，体积数百 MB）
+dist/
 
 # 账号池备份（dsh-codearts-auth 导出的加密备份件）：凭据备份一律不入库（含加密码，2026-10-05 核查实锤 51 账号 blob）
 _过程归档/
