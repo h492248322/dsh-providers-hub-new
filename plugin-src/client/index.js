@@ -72,6 +72,7 @@ import { installJetHubStyles } from './jet-hub-styles.js'
 import { JET_HUB_RPC_CHANNEL, JetHubPage, providerLabel } from './jet-hub.js'
 import { startCarrierContribution } from './zcode-carrier.js'
 import { UsageBadge } from './usage-badge.js'
+import { registerJetHubSidebarEntry } from './sidebar-entry.js'
 
 export function apply(ctx) {
   ctx.effect(() => installJetHubStyles(), 'jet-hub: install styles')
@@ -101,6 +102,20 @@ export function apply(ctx) {
     label: () => 'Jet Hub',
     inject: () => ({ rpcCall }),
   }, JetHubPage))
+
+  /**
+   * 主导航里的「Jet Hub」入口 + 中央主面板（`main` 槽的 `jet-hub` key）。
+   *
+   * 与上面那条 `settings.section` 是**同一页的两条入口**：同组件、同 `rpcCall`，
+   * 差别只在宿主给的留白（设置页有 `SettingsRoot` 的左右内边距，主面板没有）。
+   * 显不显示由页头的「侧栏」开关控制，偏好落盘在宿主侧
+   * （`sidebarEntry.getEnabled` / `sidebarEntry.setEnabled`），细节见
+   * `plugin-src/client/sidebar-entry.js` 的文件头。
+   *
+   * ⚠️ 别把它包进 `ctx.effect`：槽注册自己就是可撤销的，`slots.inject` 的返回值
+   * 交给调用方的 effect 即可，多包一层只会在热替换时留下双份注册。
+   */
+  registerJetHubSidebarEntry(ctx, rpcCall)
 
   /**
    * 模型选择器旁的**用量徽标**（`conversation.input.right`）。
