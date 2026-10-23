@@ -1025,7 +1025,13 @@ export function gatewayAllowLanToggleNotice(status, nextAllowLan) {
     return '已恢复只绑定 127.0.0.1（网关当前未在监听）。'
   }
   if (status?.running) {
-    return '已改绑 0.0.0.0：其它设备用「这台电脑的局域网 IP:8326/v1」+ API Key 访问。'
+    // ⚠️ 端口不能写死 8326：它可被 `DSH_OPENAI_GATEWAY_PORT` 改过。写死会让用户
+    //    照抄一个连不上的地址（与本文件 `gatewayEndpoint` 立的纪律同源 —— 那边
+    //    也是因为这个原因才从状态里取端口，而不是拼常量）。
+    const port = status?.address?.port
+    return Number.isInteger(port)
+      ? `已改绑 0.0.0.0：其它设备用「这台电脑的局域网 IP:${port}/v1」+ API Key 访问。`
+      : '已改绑 0.0.0.0：其它设备用「这台电脑的局域网 IP + 网关状态页显示的端口」+ API Key 访问。'
   }
   return '已选择允许局域网访问，但网关当前没有在监听（先打开网关总开关）。'
 }

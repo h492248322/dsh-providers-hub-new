@@ -106,8 +106,16 @@ export async function fetchCodelyBalanceDetailed(
     return { balance: null, error: `Codely 积分查询失败：${reason}` }
   }
 
+  // ⚠️ 401 **不得**引导删号：删除账号会清掉凭据且**不可逆**，而 401 完全可能
+  //    只是令牌过期（重新登录即可恢复）。与推理路径 `codely-adapter.ts` 同一轮
+  //    A1 修复确立的纪律保持一致 —— 本文件原先漏改，导致用户在积分页和推理页
+  //    收到两条**互相矛盾**的处置指令（`zcode-adapter.ts` 记过同型缺陷）。
   if (response.status === 401) {
-    return { balance: null, error: 'Codely 访问令牌无效或已过期（HTTP 401），请删除该账号后重新「+ 新建账号」登录' }
+    return {
+      balance: null,
+      error: 'Codely 访问令牌无效或已过期（HTTP 401）。'
+        + '请先在账号卡上点「重测」确认；仍失败再重新登录 —— 无需删除账号（删除会清掉凭据且不可逆）',
+    }
   }
 
   const text = await response.text().catch(() => '')
