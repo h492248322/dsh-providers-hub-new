@@ -166,7 +166,9 @@ describe('modelAdapters 的键集合守卫（行为断言）', () => {
     //    真实的（目录来自实测 200 的 `/api/model-status`，`stream()` 显式报
     //    「推理通道尚未接通」），而 `channel: true` 会把「应有 auth / 应进聚合 /
     //    应可续期」三张守卫一起点燃，在推理与续期落地前那才是真要假桩的地方。
-    const EXTRA_KEYS = ['aggregate', 'codely']
+    // ⚠️ 2026-10-22（A6）：codely **已翻 `channel: true`** ⇒ 它由 `channelIds` 覆盖，
+    //    不得再留在例外名单里（下面的反向断言会直接变红）。
+    const EXTRA_KEYS = ['aggregate']
     const expected = [...channelIds, ...EXTRA_KEYS].sort()
     expect(
       keys,

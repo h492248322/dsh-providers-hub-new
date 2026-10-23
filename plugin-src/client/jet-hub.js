@@ -13,6 +13,12 @@ import {
   checkinProviders,
 } from './credits-capabilities.js';
 import { orderAfterDrop, dropPositionFromPointer } from './account-order.js';
+import {
+  setSidebarEntry,
+  sidebarEntryReadFailed,
+  sidebarEntryVisible,
+  subscribeSidebarEntry,
+} from './sidebar-entry-store.js';
 import { OpencodeKeyModal, OpencodeProxyModal, GeminiProxyModal } from './opencode-proxy-modal.js';
 // ⚠️ **本 fork 独有**（魔搭，2026-10-17 审计 P0 修复）：与 opencode 同属
 //    「不跳浏览器、手工粘贴 API Key」的 provider，故复用同一条自绘弹窗通路。
@@ -28,6 +34,8 @@ import {
   expirySplitParts,
   expiryBucketLabel,
   daysUntilExpiry,
+  exclusivePoolRemainingOf,
+  isExclusivePool,
 } from './credit-expiry.js';
 import {
   allModelsDisabled,
@@ -67,6 +75,14 @@ import {
   filterModels,
   isFilterActive,
 } from './model-filter.js';
+// 「供应商 → 模型列表」统一管理页的判定（跨供应商那一层：哪些分组该出现、
+// 未加载怎么算、总览怎么计）。模型级筛选仍复用上面的 model-filter.js。
+import {
+  centerBulkState,
+  centerPendingProviderIds,
+  centerTotals,
+  visibleCenterSections,
+} from './model-center.js';
 // 聚合面板的判定与文案（单测环境没有 react ⇒ 必须抽成纯函数才能覆盖）。
 import {
   candidateKeyOf,
@@ -474,6 +490,22 @@ function CreditBalanceRow({ balance, error, loading, windowDays, provider }) {
    * 是为了让 React 逐段设 `data-tone` —— 单个字符串只能整体一个颜色。
    */
   const expiryParts = expirySplitParts(split, formatForUnit, now);
+  /**
+   * **独立池**（如 AStudio 的星火积分）：服务端给的是两个互不相通的池，
+   * 那笔钱**不能**当通用积分用。分桶按金额聚合、天然丢池名 ⇒ 单独摘出来标注，
+   * 否则主行一句「永久 25000」会被读成「我有 25000 通用积分」。
+   *
+   * ⚠️ 数字与池名都来自 `balance.packages`（单一来源），不在这里重新算；
+   *    0 时不渲染（没有独立池的 provider 逐字不变）。
+   */
+  const exclusiveRemaining = exclusivePoolRemainingOf(all);
+  // ⚠ 同口径（与 `exclusivePoolRemainingOf` 逐格一致）：
+  // `active === true` 且 `remaining > 0`，不是 `active !== false`。
+  const exclusiveNames = all
+    .filter((pkg) => pkg && pkg.active === true && isExclusivePool(pkg)
+      && Number.isFinite(Number(pkg.remaining)) && Number(pkg.remaining) > 0)
+    .map((pkg) => pkg.name)
+    .join('、');
   // 明细放进 title，不占版面；账号卡片本身已经信息密集了
   const detail = [
     all.length > 1 ? `共 ${all.length} 个资源包，${activeCount} 个有效` : null,
@@ -606,6 +638,22 @@ function CreditBalanceRow({ balance, error, loading, windowDays, provider }) {
             ? [node]
             : [React.createElement('span', { key: `sep-${part.key}`, className: 'dim-jh-creditPoolSep' }, ' · '), node];
         }))
+      : null,
+    /**
+     * **独立池**提示（2026-10-21 用户报障「没标注星火专属」）。
+     *
+     * 为什么不塞进上面那行：三档分桶是按**金额**聚合的，塞进去就只能写成
+     * 「永久 25000」—— 而那正是误导的来源（用户会以为是通用积分）。
+     * 单独一行 + 「不计入」字样，才能既显示这笔钱存在、又说明它不能混用。
+     *
+     * ⚠️ `exclusiveRemaining === 0` 时不渲染 ⇒ 没有独立池的 provider
+     *    （现有全部）行为**逐字不变**。
+     */
+    exclusiveRemaining > 0
+      ? React.createElement('span', {
+          className: 'dim-jh-creditExclusive',
+          title: `${exclusiveNames}：服务端下发的独立池，与上方主池分开结算，不参与主池合计、也不能当通用积分消耗。`,
+        }, `另有 ${formatUnits(exclusiveRemaining, unit) ?? exclusiveRemaining} 专属（不计入）`)
       : null,
     // ⚠️ 配额单位（Gemini）下**不渲染**这句：它的两个「包」是 5 小时窗口与
     // 周窗口，不是资源包 —— 说「2/2 个资源包有效」既没信息量又误导
@@ -4704,7 +4752,16 @@ function ProviderPanel({ provider, rpcCall }) {
                 : React.createElement('div', null,
                     React.createElement('p', null, '尚未配置账号'),
                     React.createElement('p', null, '点击"+ 新建账号"进行浏览器登录。')))
-          : React.createElement('div', null,
+          : React.createElement('div', { className: 'dim-jh-accountList' },
+              // ⚠️ **必须有 className**（2026-10-21 修）：本行的父级是
+              // `.dim-jh-panelHead`（column flex），而它原先带 `align-items: flex-start`
+              // ⇒ 无类名的 div 作为 flex item 会**收缩到内容宽度** —— 只有单个账号时
+              // 卡片缩成 ~257px 的窄条（多账号时被那句排序提示撑宽，所以看起来正常）。
+              // `.dim-jh-accountList` 用 `align-self: stretch` 强制满宽，与账号数量无关。
+              // ⚠️ **根因已另修**（`jet-hub-styles.js` 的 `.dim-jh-panelHead` 去掉了
+              // `align-items: flex-start` ⇒ 全部子项 stretch）⇒ 本条规则现在是冗余兜底。
+              // ⚠️ 注释里原先写的「654px 长的排序提示」是**错的**（2026-10-21 实测：
+              // 那句是两段拼接、共 100 字符、12px 字号 ⇒ max-content **约 1200px**）。
               // ⚠️ opencode 专属策略提示：必须说清「多账号 ≠ 多额度」——
               // 匿名通道按出口 IP 限流，同一出口下的多个账号共用一份额度。
               // 不解释的话，用户加了 5 个号却只看到一份配额，会以为功能坏了。
@@ -5531,7 +5588,7 @@ function providerRowSummary(row) {
  * 传入；拖拽的视觉状态（正在拖哪行 / 落点在哪）是本组件的局部 UI 状态，drop 时
  * 通过 `onCommitOrder` 把新顺序交给页面层持久化。
  */
-function ProviderSwitchPanel({ providers, statuses, statusFailed, busyIds, onToggle, onReload, onClose, order, onCommitOrder, reordering, notice }) {
+function ProviderSwitchPanel({ providers, statuses, statusFailed, busyIds, onToggle, onReload, onClose, order, onCommitOrder, reordering, notice, rpcCall }) {
   // ESC 关闭：挂在 document 上而不是弹窗上 —— 焦点可能落在任意一个开关上，
   // 只监听弹窗自身的 keydown 会漏掉这些按键（与 ModelListPanel 同因）。
   React.useEffect(() => {
@@ -5546,6 +5603,19 @@ function ProviderSwitchPanel({ providers, statuses, statusFailed, busyIds, onTog
   const [draggingId, setDraggingId] = React.useState(null);
   const [dropTargetId, setDropTargetId] = React.useState(null);
   const [dropPosition, setDropPosition] = React.useState('before');
+
+  /**
+   * 视图切换：`switches`（本供应商的开关）/ `models`（跨供应商统一管模型）。
+   *
+   * ⚠️ 两屏**共用同一个弹窗**，而不是再挂一个全屏覆盖层 —— 本文件已有一份
+   * 全屏覆盖层互斥清单（供应商 / 网关 / Token 用量，同时开就会叠在一起，
+   * 而 ESC 只关掉后挂载的那一个，剩下一个挡住整个设置页）。给「模型列表」
+   * 再开一层等于把那条纪律又复制一遍，且层数变成三层。
+   *
+   * ⚠️ 视图状态是**局部 UI 状态**：关掉弹窗即不挂载、下次打开回到开关屏
+   * （用户点「供应商」时的默认意图是开关，不是模型管理）。
+   */
+  const [view, setView] = React.useState('switches');
 
   const rows = providerSwitchRows(providers, statuses, order);
   const summary = providerToggleSummary(providers, statuses);
@@ -5628,9 +5698,27 @@ function ProviderSwitchPanel({ providers, statuses, statusFailed, busyIds, onTog
   },
   React.createElement('div', { className: 'dim-jh-modalHead' },
     React.createElement('div', { className: 'dim-jh-modalTitle' },
-      React.createElement('strong', null, '供应商开关'),
-      React.createElement('span', { className: 'dim-jh-modelPanelCount' }, countText)),
+      React.createElement('strong', null, view === 'models' ? '供应商模型列表' : '供应商开关'),
+      React.createElement('span', { className: 'dim-jh-modelPanelCount' },
+        view === 'models' ? '跨供应商统一管理' : countText)),
     React.createElement('div', { className: 'dim-jh-modelPanelActions' },
+      // 两屏共用一个弹窗（见上面 `view` 的注释）。复用 `.dim-jh-modelStatusFilter`
+      // 那套 `[data-active="true"]` 高亮样式，不新增样式类。
+      React.createElement('div', {
+        className: 'dim-jh-modelStatusFilter',
+        role: 'group',
+        'aria-label': '弹窗视图',
+      },
+      [['switches', '开关'], ['models', '模型列表']].map(([value, label]) => React.createElement('button', {
+        key: value,
+        className: 'dim-jh-btn',
+        'data-active': view === value ? 'true' : 'false',
+        'aria-pressed': view === value ? 'true' : 'false',
+        title: value === 'models'
+          ? '在同一个弹窗里管理全部供应商的模型开关（按需读取目录，不一次拉全部）'
+          : '逐个打开/关闭供应商',
+        onClick: () => setView(value),
+      }, label))),
       React.createElement('button', {
         className: 'dim-jh-btn',
         title: '重新读取各供应商的模型数与账号数。',
@@ -5641,10 +5729,14 @@ function ProviderSwitchPanel({ providers, statuses, statusFailed, busyIds, onTog
         'data-kind': 'primary',
         onClick: onClose,
       }, '完成'))),
-  React.createElement('p', { className: 'dim-jh-modalHint' },
-    '关闭一个供应商 = 关闭它的全部模型（从对话框的模型选择里移除）并停用它的全部账号；'
-    + '打开则恢复。关闭前会再确认一次。没有可关闭模型的供应商会被禁用（服务端也会拒绝）。'
-    + '拖动已打开的行可自定义顺序（顺序只保存在本机）；已关闭的供应商仍按默认顺序显示在底部。'),
+  view === 'models'
+    // 模型列表屏有它自己的说明（在 ModelCenterPanel 里），这一条讲的是「关掉供应商」
+    // 的语义 —— 放在模型屏会误导（用户会以为关模型等于关供应商）。
+    ? null
+    : React.createElement('p', { className: 'dim-jh-modalHint' },
+        '关闭一个供应商 = 关闭它的全部模型（从对话框的模型选择里移除）并停用它的全部账号；'
+        + '打开则恢复。关闭前会再确认一次。没有可关闭模型的供应商会被禁用（服务端也会拒绝）。'
+        + '拖动已打开的行可自定义顺序（顺序只保存在本机）；已关闭的供应商仍按默认顺序显示在底部。'),
   // ⚠️ 供应商相关的提示必须在**这里**（弹窗内）显示，不能只挂在页面层：
   // 拖拽与开关切换都发生在弹窗打开期间，而弹窗遮罩是 fixed + z-index 3000，
   // 页面层的 notice 会被它整个盖住 —— 用户只会看到「操作没生效，却什么提示都没有」。
@@ -5660,7 +5752,9 @@ function ProviderSwitchPanel({ providers, statuses, statusFailed, busyIds, onTog
       }, React.createElement('div', null, notice.text))
     : null,
   React.createElement('div', { className: 'dim-jh-modalBody' },
-    React.createElement('div', { className: 'dim-jh-modelList' },
+    view === 'models'
+      ? React.createElement(ModelCenterPanel, { providers, rpcCall, statuses })
+      : React.createElement('div', { className: 'dim-jh-modelList' },
       rows.map(row => {
         const busy = busyIds.has(row.id);
         const action = row.checked ? '关闭' : '打开';
@@ -5707,6 +5801,383 @@ function ProviderSwitchPanel({ providers, statuses, statusFailed, busyIds, onTog
           onChange: () => void onToggle(row.id, !row.checked),
         }));
       })))));
+}
+
+/**
+ * 「供应商 → 模型列表」统一管理屏。
+ *
+ * ## 它解决的问题
+ * 此前模型开关只能从**某一家**供应商面板的「显示列表」进入（`ModelListPanel`），
+ * 想关掉五个供应商里的若干模型就要来回切换五次。这一屏把全部供应商放进同一棵树，
+ * 按需展开、统一搜索、逐家批量。
+ *
+ * ## 按需读取，不是一次全拉
+ * `model.list` 是**单 provider** 的接口（服务端没有跨全部供应商的批量端点），
+ * 而一次性并发拉二十来家会同时打二十多个上游目录请求（Cline / WorkBuddy 的
+ * 目录本身要访问远端），既可能触发限流，也让界面长时间没有任何反馈。因此：
+ * - 分组**折叠时不发请求**，展开才拉（懒加载的唯一触发点是下面那个 effect）；
+ * - 「加载全部」按并发 3 补齐，且**只补没就绪的**（`centerPendingProviderIds`）。
+ * 代价是「未加载」成为一等状态 —— 没有它就会把「还没读」谎报成「0 个模型」，
+ * 用户于是不会去展开那一家（`model-center.js` 里对此有单测）。
+ *
+ * ## 与 `ModelListPanel` 的分工
+ * 这一屏只做**跨供应商的批量动作**：逐项开关、整家全开/全关、恢复已下架模型。
+ * 单家内部的计费分组折叠（订阅 / 免费 / Cline Cloud / 按量计费）仍由
+ * `ModelListPanel` 负责 —— 在这一层再套分组会让树深到不可用（二十家 × 四组）。
+ *
+ * ## 约束（与 `ModelToggle` / `ProviderSwitchPanel` 同源）
+ * 行是 `<label>`，**每行只能有一个 checkbox** —— 开关一律交给 `ModelToggle` 渲染，
+ * 本组件不自己造 checkbox（插第二个会让「点行内文字」激活错的那个控件）。
+ * 本组件也刻意**不用 `createPortal`**（见 `ModelListPanel` 的注释：客户端模块表
+ * 由宿主注入，`react-dom` 可能不在其中，require 会抛「missed the module table」白屏）。
+ */
+function ModelCenterPanel({ providers, rpcCall, statuses }) {
+  // providerId -> { phase: 'idle'|'loading'|'ready'|'error', models, error }
+  const [states, setStates] = React.useState({});
+  const [query, setQuery] = React.useState('');
+  const [statusFilter, setStatusFilter] = React.useState('all');
+  // 用户显式动过的展开态（没动过的走 isOpen 的默认策略）
+  const [openIds, setOpenIds] = React.useState({});
+  // `${providerId}::${modelId}` -> true，只锁被点的那一行
+  const [busyIds, setBusyIds] = React.useState(() => new Set());
+  // 整家批量动作进行中的 providerId（与逐项 busy 分开：整家动作会让该家全部行变灰）
+  const [providerBusy, setProviderBusy] = React.useState(() => new Set());
+  const [toggleError, setToggleError] = React.useState('');
+  const [toggleWarnings, setToggleWarnings] = React.useState([]);
+  const [loadingAll, setLoadingAll] = React.useState(false);
+
+  // 卸载后不再 setState：一轮「加载全部」会跨多个 await，中途关掉弹窗会把状态
+  // 写进已卸载的组件（React 18 不警告，但白留一份闭包）。
+  //
+  // ⚠️⚠️ **挂载时必须复位 `mounted.current = true`**（2026-10-21 合并审计发现）：
+  // React 18 StrictMode 的双挂载序列是「mount → effect → cleanup → effect」，
+  // cleanup 把 `mounted.current` 置 `false`，**第二次 effect 若不复位**，
+  // 之后所有 `if (!mounted.current) return` 恒成立 ⇒ RPC 结果全被丢弃
+  // ⇒ 界面永远停在「正在读取该供应商的模型列表…」，且懒加载会因 state 不更新
+  // 而**再发一次** `model.list`。
+  //
+  // ⚠️ 本文件既有的 `ModelListPanel`（`:1110`）**有**这一行 ⇒ 同一个文件里
+  // 两套写法，本屏是漏掉的那套 ⇒ 按同构补齐。
+  // ⚠️ 可达性：宿主 web bundle 里 `StrictMode` 无实际使用点 ⇒ **当前不可达**
+  // （属「差一行复位」的脆弱绿，不是现行缺陷）。
+  const mounted = React.useRef(true);
+  React.useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
+
+  /**
+   * 读一家的目录。
+   *
+   * ⚠️ 已有数据时**不切回 loading** —— 整屏闪空再填回来比不刷新更糟，
+   * 而且「全开/全关」之后的重载会让刚点的那一行消失一瞬。
+   */
+  const loadProvider = React.useCallback(async (providerId) => {
+    setStates(prev => {
+      if (prev[providerId]?.phase === 'ready') return prev;
+      return { ...prev, [providerId]: { phase: 'loading', models: [], error: '' } };
+    });
+    try {
+      const result = await rpcCall('model.list', { provider: providerId });
+      if (!mounted.current) return;
+      setStates(prev => ({
+        ...prev,
+        [providerId]: {
+          phase: 'ready',
+          // 服务端下发的是**未过滤全量**（含被关掉的和已下架的），这里原样收下：
+          // 用过滤后的目录回填会让被关过的模型连开关一起消失（只能改 settings.yaml 才能救回）。
+          models: Array.isArray(result?.models) ? result.models : [],
+          error: '',
+        },
+      }));
+    } catch (error) {
+      if (!mounted.current) return;
+      setStates(prev => ({
+        ...prev,
+        [providerId]: { phase: 'error', models: [], error: error?.message || String(error) },
+      }));
+    }
+  }, [rpcCall]);
+
+  const filtering = isFilterActive({ query, status: statusFilter });
+  const sections = visibleCenterSections(providers, states, { query, status: statusFilter });
+  // ⚠ 注意：`centerTotals` 统计的是「**全部已加载的分组**」而不是「筛选后可见的」
+  // ⇒ 必须直接传 `providers` + `states`（否则搜索一不匹配就显示「已读取 0 / N 家」）。
+  const totals = centerTotals(providers, states);
+  const pending = centerPendingProviderIds(providers, states);
+  const providerCount = Array.isArray(providers) ? providers.length : 0;
+
+  /**
+   * 分组默认展开策略：
+   * - 用户点过的以显式值为准（与 `model-groups.js` 的 `groupExpanded` 同一条规则）；
+   * - 否则**有筛选时展开**（不然用户搜到命中项还要逐家点开，搜索等于白做）；
+   * - 无筛选时折叠（二十家全摊开会有上千行）。
+   *
+   * ⚠️ 筛选时的自动展开**只对已加载的分组生效**。展开会触发下面的懒加载
+   * effect —— 若把未加载的也自动展开，输入搜索词的瞬间就会同时发出二十个
+   * `model.list`（每家的目录都可能访问上游），与「加载全部」限并发 3 的
+   * 初衷直接冲突。未加载的保持折叠，计数位显示「未读取」，由「加载全部」补齐。
+   */
+  const isOpen = (providerId) => {
+    if (Object.prototype.hasOwnProperty.call(openIds, providerId)) return openIds[providerId] === true;
+    return filtering && states[providerId]?.phase === 'ready';
+  };
+
+  // 懒加载的唯一触发点：展开了但还没读过的分组立刻拉。
+  // ⚠️ 只认 `phase === 'idle'`：一旦拉过，phase 变 loading/ready/error，这个
+  // effect 再跑也不会重复发请求（否则 setStates 与 effect 会互相触发成死循环）。
+  React.useEffect(() => {
+    for (const section of sections) {
+      if (section.phase !== 'idle') continue;
+      if (!isOpen(section.id)) continue;
+      void loadProvider(section.id);
+    }
+  }, [sections, openIds, filtering, loadProvider, states]);
+
+  const busyKey = (providerId, modelId) => `${providerId}::${modelId}`;
+
+  const resetFilters = () => { setQuery(''); setStatusFilter('all'); };
+
+  const toggleSection = (providerId) => {
+    setOpenIds(prev => ({ ...prev, [providerId]: !isOpen(providerId) }));
+  };
+
+  const toggleModel = async (providerId, modelId, disabled) => {
+    setToggleError('');
+    setToggleWarnings([]);
+    const key = busyKey(providerId, modelId);
+    setBusyIds(prev => { const next = new Set(prev); next.add(key); return next; });
+    try {
+      const result = await rpcCall('model.setDisabled', { provider: providerId, modelId, disabled });
+      if (!mounted.current) return;
+      // 服务端会回「已下架模型被跳过」这类**成功但无实际效果**的提示（Issue IKJW33）——
+      // 单独一条通道展示，不能和错误混在一起（两者语气相反，混在一起用户无法判断有没有生效）。
+      setToggleWarnings(Array.isArray(result?.warnings) ? result.warnings : []);
+      // 就地翻，不整表重载：关掉一个模型就重拉一遍目录，在二十家的列表里是明显的卡顿。
+      setStates(prev => {
+        const state = prev[providerId];
+        if (state === undefined || state.phase !== 'ready') return prev;
+        return {
+          ...prev,
+          [providerId]: {
+            ...state,
+            models: state.models.map(model => (model.id === modelId ? { ...model, disabled } : model)),
+          },
+        };
+      });
+    } catch (error) {
+      if (mounted.current) setToggleError(`「${modelId}」切换失败：${error?.message || String(error)}`);
+    } finally {
+      if (mounted.current) {
+        setBusyIds(prev => { const next = new Set(prev); next.delete(key); return next; });
+      }
+    }
+  };
+
+  const restoreModel = async (providerId, modelId) => {
+    setToggleError('');
+    const key = busyKey(providerId, modelId);
+    setBusyIds(prev => { const next = new Set(prev); next.add(key); return next; });
+    try {
+      await rpcCall('model.clearDead', { provider: providerId, modelId });
+      // 必须整表重载：被补回来的条目只有裸 id，需要拿回展示名与计费分组。
+      await loadProvider(providerId);
+    } catch (error) {
+      if (mounted.current) setToggleError(`「${modelId}」恢复失败：${error?.message || String(error)}`);
+    } finally {
+      if (mounted.current) {
+        setBusyIds(prev => { const next = new Set(prev); next.delete(key); return next; });
+      }
+    }
+  };
+
+  /**
+   * 整家全开 / 全关。
+   *
+   * ⚠️ 用 `model.setAllDisabled`（整张黑名单），不是 `model.setDisabledMany` ——
+   * 「全开」的语义是连**历史**关闭记录一起清掉（服务端 `setAllDisabled(false)`
+   * 直接清空该家的黑名单），而 setDisabledMany 要传具体 id 列表、只能清当前在列的。
+   * 关闭方向必须确认：一次误点会让这家所有模型从对话框的模型选择里消失。
+   */
+  const setProviderAll = async (providerId, label, disabled) => {
+    if (disabled && !confirm(`确认关闭「${label}」的全部模型？它们会从对话框的模型选择里消失；取消则不做任何变更。`)) return;
+    setToggleError('');
+    setToggleWarnings([]);
+    setProviderBusy(prev => { const next = new Set(prev); next.add(providerId); return next; });
+    try {
+      // ⚠⚠⚠ **`closeProvider: false`**（2026-10-21 合并审计发现，阻断级）：
+      // 本屏是**模型级**管理，用户的意图是「关这家模型」，不是「关掉这个供应商」。
+      //
+      // ⚠⚠ 服务端默认 `closeProvider` 为 `true`（既有语义：「关闭全部模型」≡
+      // 「关闭该供应商」，与 `provider.setEnabled(false)` 同一条路径）⇒ 若不显式传
+      // `false`，点一次「全关」会把**整个供应商**也关掉：
+      // ① `provider.status` 报 `closed: true` ⇒ 左侧分组变成「已关闭」；
+      // ② 各适配器的 `listModels` 直接返回 `[]` ⇒ 该家在选择器里一个模型都没有；
+      // ③ **再打开任意一个模型，供应商被顺带打开**（打开方向会清意图）。
+      // ⇒ 两头都与用户意图相反，且**零提示**。
+      const result = await rpcCall('model.setAllDisabled', {
+        provider: providerId,
+        disabled,
+        closeProvider: false,
+      });
+      if (mounted.current) setToggleWarnings(Array.isArray(result?.warnings) ? result.warnings : []);
+      // 批量动作会改动整张黑名单，逐项翻不可靠 ⇒ 重载这一家。
+      await loadProvider(providerId);
+    } catch (error) {
+      if (mounted.current) setToggleError(`批量切换「${label}」失败：${error?.message || String(error)}`);
+    } finally {
+      if (mounted.current) {
+        setProviderBusy(prev => { const next = new Set(prev); next.delete(providerId); return next; });
+      }
+    }
+  };
+
+  const loadAll = async () => {
+    const queue = centerPendingProviderIds(providers, states);
+    if (queue.length === 0) return;
+    setLoadingAll(true);
+    // 并发 3：一次全发会同时打二十多个上游目录请求（Cline / WorkBuddy 的目录
+    // 本身要访问远端），既可能触发限流，也让界面长时间没有任何反馈。
+    const concurrency = 3;
+    let cursor = 0;
+    const worker = async () => {
+      while (cursor < queue.length) {
+        const providerId = queue[cursor];
+        cursor += 1;
+        await loadProvider(providerId);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(concurrency, queue.length) }, () => worker()));
+    if (mounted.current) setLoadingAll(false);
+  };
+
+  const renderSection = (section) => {
+    const opened = isOpen(section.id);
+    const sectionBusy = providerBusy.has(section.id);
+    // 供应商整体被关闭时它的模型必然全是关闭态；标出来，免得用户以为是模型级设置。
+    const providerClosed = statuses?.[section.id]?.closed === true;
+    const phrase = section.phase === 'error'
+      ? '读取失败'
+      : !section.loaded
+        ? (section.phase === 'loading' ? '正在读取…' : '未读取')
+        : `${section.summary.total} 个 · 已关闭 ${section.summary.disabled}`
+          + (section.summary.dead > 0 ? ` · 已下架 ${section.summary.dead}` : '');
+    const countText = providerClosed ? `${phrase}（该供应商已关闭）` : phrase;
+    // ⚠ ⚠ **判据走 `centerBulkState`**（排除 dead 条目）：
+    // 服务端的写入集不含 dead 模型（它们被 `withDeadModelPruning` 剔除）
+    // ⇒ 用含 dead 的 `summary.total` 做比较会让「全关」按钮永不禁用（点下去服务端走幂等短路、
+    // 界面上一个数字都不变 ⇒ 观感为「按钮坏了」）。
+    const bulk = centerBulkState(section.models);
+    const allDisabled = section.loaded && bulk.allDisabled;
+    const noneDisabled = section.loaded && bulk.noneDisabled;
+    return React.createElement('div', { key: section.id, className: 'dim-jh-modelGroup' },
+      React.createElement('div', { className: 'dim-jh-modelGroupHead' },
+        React.createElement('button', {
+          className: 'dim-jh-modelGroupToggle',
+          'aria-expanded': opened ? 'true' : 'false',
+          title: opened ? '收起该供应商的模型' : '展开并读取该供应商的模型列表',
+          onClick: () => toggleSection(section.id),
+        }, `${opened ? '▾' : '▸'} ${section.label}`),
+        React.createElement('span', { className: 'dim-jh-modelGroupCount' }, countText),
+        React.createElement('button', {
+          className: 'dim-jh-btn dim-jh-modelGroupBtn',
+          disabled: !section.loaded || sectionBusy || noneDisabled,
+          title: noneDisabled ? '该供应商没有已关闭的模型' : '打开该供应商的全部模型（含之前关闭的）',
+          onClick: () => void setProviderAll(section.id, section.label, false),
+        }, sectionBusy ? '处理中…' : '全开'),
+        React.createElement('button', {
+          className: 'dim-jh-btn dim-jh-modelGroupBtn',
+          disabled: !section.loaded || sectionBusy || allDisabled,
+          title: allDisabled ? '该供应商的模型已全部关闭' : '关闭该供应商的全部模型',
+          onClick: () => void setProviderAll(section.id, section.label, true),
+        }, sectionBusy ? '处理中…' : '全关')),
+      opened
+        ? React.createElement('div', { className: 'dim-jh-modelGroupBody' },
+            section.phase === 'error'
+              ? React.createElement('div', { className: 'dim-jh-empty' },
+                  React.createElement('p', null, states[section.id]?.error || '读取该供应商的模型列表失败。'),
+                  React.createElement('button', {
+                    className: 'dim-jh-btn',
+                    onClick: () => void loadProvider(section.id),
+                  }, '重新读取'))
+              : !section.loaded
+                ? React.createElement('p', { className: 'dim-jh-modalHint' }, '正在读取该供应商的模型列表…')
+                : section.summary.total === 0
+                  ? React.createElement('p', { className: 'dim-jh-modalHint' }, '该 Provider 当前没有可用的模型。')
+                  : section.models.length === 0
+                    ? React.createElement('div', { className: 'dim-jh-empty' },
+                        React.createElement('p', null, '没有符合当前搜索与筛选条件的模型。'),
+                        React.createElement('button', { className: 'dim-jh-btn', onClick: resetFilters }, '清空筛选'))
+                    : section.models.map(model => React.createElement(ModelToggle, {
+                        key: model.id,
+                        model,
+                        busy: sectionBusy || busyIds.has(busyKey(section.id, model.id)),
+                        onToggle: (modelId, disabled) => void toggleModel(section.id, modelId, disabled),
+                        onRestore: (modelId) => void restoreModel(section.id, modelId),
+                      })))
+        : null);
+  };
+
+  return React.createElement('div', null,
+    React.createElement('div', { className: 'dim-jh-modelFilterBar' },
+      React.createElement('input', {
+        type: 'search',
+        className: 'dim-jh-input dim-jh-modelSearch',
+        placeholder: '搜索供应商、模型名或 id…',
+        'aria-label': '搜索供应商或模型',
+        value: query,
+        onChange: (event) => setQuery(event.target.value),
+      }),
+      React.createElement('div', {
+        className: 'dim-jh-modelStatusFilter',
+        role: 'group',
+        'aria-label': '按模型开关状态筛选',
+      },
+      [['all', '全部'], ['enabled', '已打开'], ['disabled', '已关闭']].map(([value, label]) => React.createElement('button', {
+        key: value,
+        className: 'dim-jh-btn',
+        'data-active': statusFilter === value ? 'true' : 'false',
+        'aria-pressed': statusFilter === value ? 'true' : 'false',
+        onClick: () => setStatusFilter(value),
+      }, label))),
+      filtering
+        ? React.createElement('button', { className: 'dim-jh-btn', onClick: resetFilters }, '清空筛选')
+        : null,
+      React.createElement('button', {
+        className: 'dim-jh-btn',
+        title: '读取所有还没读过的供应商目录（并发 3 个，避免同时打爆上游）。',
+        disabled: loadingAll || pending.length === 0,
+        onClick: () => void loadAll(),
+      }, loadingAll ? '读取中…' : `加载全部${pending.length > 0 ? `（${pending.length}）` : ''}`)),
+    React.createElement('p', { className: 'dim-jh-modalHint' },
+      `已读取 ${totals.loaded} / ${providerCount} 家`
+      + (totals.loaded === 0
+          ? '。展开某一家，或点「加载全部」。'
+          : `：共 ${totals.total} 个模型，已关闭 ${totals.disabled} 个。`)
+      + '关闭开关后该模型不再出现在对话框的模型选择里；'
+      + '「已下架」的模型是上游移除的，可用「重新显示」恢复。'
+      + '未读取的供应商不参与搜索，点「加载全部」补齐。'),
+    toggleError
+      ? React.createElement('div', {
+          className: 'dim-jh-probeNotice',
+          'data-tone': 'error',
+          role: 'alert',
+        }, React.createElement('div', null, toggleError))
+      : null,
+    // `warn` 必须是这个拼写：写成 `warning` 会静默落成中性色（`data-tone` 是枚举）。
+    toggleWarnings.length > 0
+      ? React.createElement('div', {
+          className: 'dim-jh-probeNotice',
+          'data-tone': 'warn',
+          role: 'status',
+        }, React.createElement('div', null, toggleWarnings.join('；')))
+      : null,
+    React.createElement('div', { className: 'dim-jh-modelList' },
+      sections.length === 0
+        ? React.createElement('div', { className: 'dim-jh-empty' },
+            React.createElement('p', null, '没有符合当前搜索与筛选条件的供应商。'),
+            React.createElement('button', { className: 'dim-jh-btn', onClick: resetFilters }, '清空筛选'))
+        : sections.map(section => renderSection(section))));
 }
 
 /**
@@ -7867,6 +8338,46 @@ export function JetHubPage({ rpcCall }) {
 
   React.useEffect(() => { void loadNativeSearchStatus(); }, [loadNativeSearchStatus]);
 
+  /**
+   * 「侧栏」开关：主导航里显不显示 Jet Hub 入口。
+   *
+   * 与上面那个原生搜索开关的两点不同：
+   * 1. 它改的是**客户端自己的槽注册**（`sidebar.panellist` 那一行），立刻生效；
+   * 2. 偏好落盘在**宿主侧**（`sidebarEntry.setEnabled`）—— Web 端 origin 的端口
+   *    每次启动都变，浏览器本地存储留不住（理由见 `sidebar-entry-store.js`）。
+   *
+   * ⚠️ 与 `toggleGateway` 同取向：**不做乐观更新**，宿主回什么就显示什么 ——
+   * 本地先改会让界面显示「已隐藏」而侧栏其实还在。
+   */
+  const [sidebarEntryOn, setSidebarEntryOn] = React.useState(() => sidebarEntryVisible());
+  const [sidebarEntryBusy, setSidebarEntryBusy] = React.useState(false);
+  const [sidebarEntryFailed, setSidebarEntryFailed] = React.useState(() => sidebarEntryReadFailed());
+
+  // 与「侧栏行」共用同一份进程内状态：任何一侧改完，两侧的开关一起更新
+  // （主面板与设置页可能同时挂着两个 JetHubPage 实例）。
+  React.useEffect(() => subscribeSidebarEntry(() => {
+    setSidebarEntryOn(sidebarEntryVisible());
+    setSidebarEntryFailed(sidebarEntryReadFailed());
+  }), []);
+
+  const toggleSidebarEntry = React.useCallback(async (nextEnabled) => {
+    setSidebarEntryBusy(true);
+    try {
+      const value = await setSidebarEntry(rpcCall, nextEnabled);
+      if (!mounted.current) return;
+      setSidebarEntryOn(value);
+      setSidebarEntryFailed(false);
+    } catch (caught) {
+      console.error('[jet-hub] toggle sidebar entry failed:', caught);
+      if (!mounted.current) return;
+      // 保留宿主的实际状态：失败时把开关拉回进程内副本，别停在用户点出来的位置上。
+      setSidebarEntryOn(sidebarEntryVisible());
+      setSidebarEntryFailed(true);
+    } finally {
+      if (mounted.current) setSidebarEntryBusy(false);
+    }
+  }, [rpcCall]);
+
   return React.createElement('section', { className: 'dim-jh-page', 'aria-label': 'Jet Hub Provider 设置' },
     // ⚠️ 页头左侧的「Jet Hub」标题块已**整块删除**（用户 2026-10-07 要求：
     // 标题只占宽度、不带任何操作，空间全给按钮行）。这里先后删过两样东西，
@@ -7962,7 +8473,29 @@ export function JetHubPage({ rpcCall }) {
             disabled: nativeSearchBusy,
             onChange: (event) => void toggleNativeSearch(event.target.checked),
           }),
-          React.createElement('span', null, '渠道原生搜索')))),
+          React.createElement('span', null, '渠道原生搜索')),
+        // 「侧栏」开关：主导航里显不显示 Jet Hub 入口。
+        //
+        // 语义：开 = 主侧栏多一行「Jet Hub」，点它把本页渲染进中央主面板；
+        // 关 = 那一行消失，进入路径只剩「设置 → 插件 → Jet Hub」（本页仍在）。
+        // 与上面那个原生搜索开关同款外观，刻意并列在页头最右侧。
+        React.createElement('label', {
+          className: 'dim-jh-nativeSearch',
+          title: (sidebarEntryFailed
+            ? '⚠️ 侧栏开关状态读取失败，当前显示的是默认值（显示）。点击即可重新提交一次。'
+            : '侧栏入口：在左侧主导航里显示「Jet Hub」一行，点它直接在中央面板打开本页。'
+              + '关闭后该行消失，仍可从「设置 → 插件 → Jet Hub」进入，不影响任何功能。'),
+        },
+          React.createElement('input', {
+            type: 'checkbox',
+            className: 'dim-jh-switch',
+            checked: sidebarEntryOn,
+            // ⚠️ 与原生搜索开关同一取向：**只**因提交中而禁用；读取失败时不禁用，
+            //    否则一次抖动就让用户失去「点一下重新提交」的自救路径。
+            disabled: sidebarEntryBusy,
+            onChange: (event) => void toggleSidebarEntry(event.target.checked),
+          }),
+          React.createElement('span', null, '侧栏')))),
     // 签到结果放在页头下方横跨整宽：页头是 flex 且不换行，塞进去会挤压按钮。
     // `flex: none` 是必需的 —— `dim-jh-page` 是 column flex 且 `dim-jh-layout`
     // 带 `flex: 1`，不锁住的话提示条会被压扁（与 modal 内同款做法）。
@@ -8030,6 +8563,8 @@ export function JetHubPage({ rpcCall }) {
           onCommitOrder: commitProviderOrder,
           reordering: providerReordering,
           notice: providerNotice,
+          // 弹窗的「模型列表」视图要逐家调 `model.list`（服务端只有单 provider 端点）。
+          rpcCall,
         })
       : null,
     // 同款做法：网关开关也是覆盖层，且与「供应商开关」互斥 —— 两者都是

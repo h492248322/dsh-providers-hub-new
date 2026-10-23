@@ -68,8 +68,9 @@ import { AutoclawAdapter } from '../../src/autoclaw-adapter.js'
 import { AUTOCLAW_INTL } from '../../src/autoclaw-product.js'
 // ⚠️ **本 fork 独有**（modelscope，2026-10-16）。
 import { ModelscopeAdapter } from '../../src/modelscope-adapter.js'
+import { CodelyAdapter } from '../../src/codely-adapter.js'
 import { ClineAdapter } from '../../src/cline-adapter.js'
-import { CodeArtsAdapter } from '../../src/llm-adapter.js'
+import { CodeArtsAdapter, CODEARTS_FALLBACK_CONTEXT_WINDOW } from '../../src/llm-adapter.js'
 import { GeminiAdapter } from '../../src/gemini-adapter.js'
 import { OfficeAceAdapter } from '../../src/officeace-adapter.js'
 import { LobsteraiAdapter } from '../../src/lobsterai-adapter.js'
@@ -647,14 +648,30 @@ id: 'autoclaw',
         slots: async () => [{ id: 'modelscope', apiKey: 'ms-wire-test-key' }],
       } as never),
     },
+    // ⚠️ Codely（Unity，2026-10-22 A6）：`channel` 已翻 true ⇒ 必须进本表，
+    //    否则它不过本段任何对拍（目录 / 模态 / 窗口 / 档位全部零覆盖）。
+    {
+      id: 'codely',
+      make: () => new CodelyAdapter({
+        ...NO_CRED,
+        credentialProvider: async () => ({ access_token: 'COD', refresh_token: 'R' } as never),
+      } as never),
+    },
     {
       id: 'opencode',
       make: () => new OpencodeAdapter({
         ...NO_CRED,
-        // ⚠️ opencode 的目录不来自 `createModelCatalog`（5 处协议级差异），
-        //    它需要整个 `identitySlots` 序列与池的代理映射。
+        // ⚠️⚠️ 2026-10-23 迁移后 opencode **也走 `createModelCatalog`** 了
+        //    （用户要求「实体 provider 一律走共享骨架」）⇒ 它的 `accountPool`
+        //    必须实现骨架消费的 `disabledModelsFor` / `providerClosedFor`，
+        //    只给 `opencodeProxyFor` 会抛
+        //    `deps.accountPool?.disabledModelsFor is not a function`（实测）。
         identitySlots: async () => [{ refName: 'OPENCODE_A', slotId: 's1' }],
-        accountPool: { opencodeProxyFor: () => undefined } as never,
+        accountPool: {
+          opencodeProxyFor: () => undefined,
+          disabledModelsFor: () => new Set<string>(),
+          providerClosedFor: () => false,
+        } as never,
       } as never),
     },
     {
@@ -723,7 +740,8 @@ id: 'autoclaw',
     const { PROVIDER_REGISTRY } = await import('../../src/provider-registry.js')
     const channels = PROVIDER_REGISTRY.filter(d => d.channel).map(d => d.id).sort()
     expect(CASES.map(c => c.id).sort()).toEqual(channels)
-    expect(CASES).toHaveLength(21)
+    // ⚠️ 2026-10-22（A6）：codely 翻 `channel: true` ⇒ 进本表：21 → 22。
+    expect(CASES).toHaveLength(22)
   })
 
   it('★★ `catalog` 具备 `refresh` 的家，适配器上必须**存在** `refresh` 成员（转发接线）', () => {
@@ -869,8 +887,33 @@ id: 'autoclaw',
     // (g) 未知 id 不抛错（用户手填模型 id 是正常操作）
     const unknown = await adapter.resolveModel(id, 'no-such-model-xyz-2026')
     expect(unknown.name.length, `${id} 对未知 id 给了空名`).toBeGreaterThan(0)
-    // ⚠️ 且未知模型**不得**声明 context（不编造窗口）。
-    expect(unknown.context, `${id} 给未知 id 编造了 contextWindow`).toBeUndefined()
+    // ⚠️ 未知模型**默认不得**声明 context（不编造窗口）。
+    //
+    // ⚠️⚠️ **`codearts` 是刻意的具名例外**（2026-10-21 真实报障，见下）——
+    //    这是本不变式**唯一**的放行名单，`it.each` 逐家隔离保证其余各家仍然有牙
+    //    （历史上本条对 15 家全部有牙，见文件头注的反向验证表）。
+    //
+    //    为什么 codearts 例外：它的窗口**全部来自本地静态表**（上游两个目录端点
+    //    实测都不下发窗口），且「缺窗口」在本家的后果是**用户可见功能消失** ——
+    //    DSH 的 `contextOccupancy()` 只要 `contextWindow === undefined` 就返回
+    //    `null`，`ContextMeter` 随之 `return null` ⇒ 上下文占用条**整条不渲染**
+    //    （不是显示 0%）。用户手填模型 id 时同样会中招。
+    //    ⇒ 本家改用具名兜底 `CODEARTS_FALLBACK_CONTEXT_WINDOW`，理由与取证见
+    //    `src/llm-adapter.ts` 该常量的长注释。
+    //
+    //    ⚠️ **不得**把这条例外推广到别家：多数家的窗口来自**远端该模型的**配置，
+    //    对未知 id 编一个就是**假窗口**（分母错 ⇒ 占用比与自动压缩阈值一起错，
+    //    比「不显示」更难发现）。
+    //    ⚠️ 例外不是「跳过断言」，而是**改判据**：必须等于那个具名常量，
+    //    写成 `if (id !== 'codearts') expect(...)` 会让 codearts 这条完全无牙。
+    if (id === 'codearts') {
+      expect(
+        unknown.context,
+        `${id} 对未知 id 必须给具名兜底窗口（否则手填模型永远没有上下文占用条）`,
+      ).toEqual({ contextWindow: CODEARTS_FALLBACK_CONTEXT_WINDOW })
+    } else {
+      expect(unknown.context, `${id} 给未知 id 编造了 contextWindow`).toBeUndefined()
+    }
 
     // (h) **未知 id 的模态形态**必须与 `OMIT_UNKNOWN_MODALITIES` 一致。
     //     ⚠️ 这一条补的是一个**已登记的覆盖缺口**：`model-catalog.spec.ts` ⑬

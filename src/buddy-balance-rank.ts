@@ -46,7 +46,7 @@
  * ⚠️ 本模块是**纯函数**，不碰网络与凭据 —— 余额由调用方查好后传入。
  */
 
-import type { CreditBalance } from './credits.js'
+import { isExclusiveCreditPool, type CreditBalance } from './credits.js'
 
 /**
  * 「临时积分」的时间窗口：距扣费截止不足 **15 天**的积分算临时（会很快作废），
@@ -182,6 +182,24 @@ export function splitBuddyCreditsByExpiry(
     if (pkg.active !== true) continue
     const remaining = positiveOrZero(pkg.remaining)
     if (remaining <= 0) continue
+    /**
+     * ⚠️⚠️ **独立池不进任何一桶**（2026-10-21 合并审计发现，阻断级）。
+     *
+     * AStudio 的星火池是服务端下发的**独立池**（不参与主池合计、也不能当
+     * 通用积分消耗）。前端 `splitCreditsByExpiry`（PR !134）已把它从三档里
+     * 摘出，而这里原先**完全不看 `pkg.name`** ⇒ 两侧口径分叉：
+     * 同一份数据前端说「永久 0」、后端说「永久 25000」。
+     *
+     * ⇒ 用户可见症状：AStudio 账号只剩星火池时，面板显示「另有 25000 专属
+     * （不计入）」而三档不渲染（看起来「没积分」），但后端把 25000 算成
+     * **临期** ⇒ `buddyBalanceTier` 判 `expiring` ⇒ **锁定永久积分时该账号
+     * 仍被判「可用」** ⇒ 选号把请求发给一个只有专属池的账号 ⇒ 上游按主池
+     * 计费 ⇒ 请求失败。
+     *
+     * ⚠️ 判据用**宿主侧唯一持有点** `isExclusiveCreditPool`（`src/credits.ts`），
+     * 客户端那份由单测锁死一致 —— 两侧不共享模块图，靠那条同步锁防漂移。
+     */
+    if (isExclusiveCreditPool(pkg)) continue
     const endTime = pkg.deductionEndTime
     /**
      * ⚠️⚠️ **判据必须用 `Number()`，不能用 `typeof === 'number'`**

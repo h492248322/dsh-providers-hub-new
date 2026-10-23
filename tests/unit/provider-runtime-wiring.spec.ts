@@ -243,7 +243,43 @@ describe('★ index.ts 的能力注册表接线（行为断言，替代源码文
   it('注册表覆盖全部可续期 provider，且**不含** opencode / aggregate / auto', () => {
     applyOnce()
     const ids = registeredRuntimeIds().sort()
-    expect(ids).toEqual(AUTH_SERVICE_OF.map(([id]) => id).sort())
+    // ⚠️ **不是「恰好等于有 auth 的集合」**（2026-10-22 合并审计改）。
+    //
+    // 原判据隐含「**有 runtime ⇔ 有 auth**」这条假设，而 PR #3 引入了第一个反例：
+    // **codely 有 `probe` 与 `credits`、但没有 auth 服务**（`channel:false`，
+    // 登录/余额都是自由函数）。
+    //
+    // 为什么必须给它 runtime：`probe` 域**只**在「`for (const [id, auth] of registry)`
+    // 循环体内」被挂上（`...Object.hasOwn(probeById, id) ? { probe: probeById[id] } : {}`），
+    // 而 codely 不在那个数组里 ⇒ `runtimeOf('codely') === undefined` ⇒
+    // `adapterForProbe()` 抛「codely 没有探测适配器」⇒ 用户点「重测」**必报错**。
+    // ⚠️ 这与 `PROBE_EXEMPT` 文档里记的 `opencode` 那条**错误豁免**同型：
+    //    「它没有 `rateLimit: false` 豁免 ⇒ 客户端『重测』按钮会渲染 ⇒ 用户点了
+    //    必报『没有探测适配器』」⇒ 正确修法是**让 probe 可达**，
+    //    **不是**把 codely 塞进 `PROBE_EXEMPT`。
+    //
+    // ⇒ 判据：**有 auth 的必须有 runtime**（原意图不放宽）+ `probeById` 的那些也允许有；
+    //   `opencode` / `aggregate` / `auto` 仍不得有（下面三条不变）。
+    const authIds = AUTH_SERVICE_OF.map(([id]) => id).sort()
+    for (const id of authIds) {
+      expect(ids, `有 auth 的 ${id} 必须有 runtime`).toContain(id)
+    }
+    // ⚠️ **额外允许的、无 auth 但有 probe 的家**（本仓当前**只有 codely**）。
+    //
+    // 为什么必须给它 runtime：`probe` 域**只**在上面那个
+    // `for (const [id, auth] of registry)` 循环体内被挂上，而 codely 不在那个
+    // 数组里（`channel:false`、无 auth 服务）⇒ `runtimeOf('codely') === undefined`
+    // ⇒ `adapterForProbe()` 抛「codely 没有探测适配器」⇒ 用户点「重测」**必报错**。
+    //
+    // ⚠️ 这与 `PROBE_EXEMPT` 文档里记的 `opencode` 那条**错误豁免**同型
+    //   （「没有 `rateLimit: false` 豁免 ⇒ 『重测』按钮会渲染 ⇒ 用户点了必报
+    //   『没有探测适配器』」）⇒ 正确修法是**让 probe 可达**，不是塞进豁免表。
+    //
+    // ⚠️ **刻意不含 `opencode`**：它虽然也在 `probeById` 里且无 runtime，
+    //   但那是**存量缺陷**（master 上就如此），修它会牵动另一批守卫，不在本次
+    //   范围内 ⇒ 下面仍显式断言它不得有 runtime，把这条缺口**如实留在这里**。
+    const PROBE_ONLY_NO_AUTH = ['codely']
+    expect(ids).toEqual([...new Set([...authIds, ...PROBE_ONLY_NO_AUTH])].sort())
     // opencode 凭据是静态 API key，没有续期概念 ⇒ 刻意不注册（见设计文档 §3.3）。
     expect(ids).not.toContain('opencode')
     // aggregate / auto 是虚拟 provider，无账号无凭据。
@@ -376,12 +412,21 @@ describe('★ index.ts 的能力注册表接线（行为断言，替代源码文
     //    再加 astudio（本 fork 与上游各登记一次）⇒ 19 → 20 个真渠道，
     //    减去 AUTH_EXEMPT 两项（opencode / aggregate）⇒ 19 个 auth 键。
     // ⚠️ 2026-10-20 加 autoclawintl（AutoClaw 国际版）：19 → 20 个 auth 键。
-    expect(shouldRegister, 'channel 集合变了，请复核 opencode 豁免是否仍成立').toHaveLength(20)
+    // ⚠️ 2026-10-22（A6）：codely 翻 `channel: true`：20 → 21。
+    expect(shouldRegister, 'channel 集合变了，请复核 opencode 豁免是否仍成立').toHaveLength(21)
     expect(
       registeredRuntimeIds().sort(),
       'registry 里有账号的 provider 必须都注册进能力注册表（左侧多出 = 清单里多了僵尸项，' +
       '右侧多出 = registry 里有而清单漏登记）',
-    ).toEqual(shouldRegister)
+    // ⚠️ **`shouldRegister` 是「有 auth 的家」，而 codely 无 auth 却有 runtime**
+    //   （2026-10-22 合并审计修：`probe` 域只在那唯一一个循环里挂，codely 不在
+    //   那个 `registry` 数组里 ⇒ `runtimeOf('codely') === undefined` ⇒ 用户点
+    //   「重测」必报「codely 没有探测适配器」）。⇒ 反向断言同样要把它算进来，
+    //   否则「修好了」这件事本身会让本条变红。理由与上面那条用例同源。
+    // ⚠️ 2026-10-22（A6）：codely 现已翻 `channel: true` 并接入 auth ⇒ 它**已在**
+    //    `shouldRegister` 里，不得再额外加 `'codely'`（会重复。旧写法是它当时
+    //    无 auth 却有 runtime 的补丁；现在两者同源）。
+    ).toEqual([...shouldRegister].sort())
   })
 })
 

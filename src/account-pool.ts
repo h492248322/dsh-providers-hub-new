@@ -364,6 +364,16 @@ export class AccountPool {
    */
   private nativeWebSearchCache = true
   /**
+   * 「侧栏入口」开关的进程内副本（`false` = 主导航不显示 Jet Hub 入口）。
+   *
+   * 缺键语义是**显示**（与 {@link nativeWebSearchCache} 同一方向）：老文档没有
+   * 本键时保持入口可见，不会因一次读取失败而让用户以为这个功能被删掉了。
+   *
+   * ⚠️ 与 {@link gatewayEnabledCache} 同级、**不需要**独立文档：丢失本键的
+   * 唯一后果是入口回到默认显示，用户再关一次即可（可逆）。
+   */
+  private sidebarEntryCache = true
+  /**
    * 供应商自定义显示顺序（「供应商开关」弹窗拖拽排序）的进程内副本。
    *
    * ⚠️ 与 {@link gatewayEnabledCache} 同级、**不需要**独立文档：丢失本键的
@@ -480,6 +490,8 @@ export class AccountPool {
       this.gatewayAllowLanCache = state.gatewayAllowLan === true
       // 原生搜索总开关同理：老文档没有该键 → 保持默认启用。
       this.nativeWebSearchCache = state.nativeWebSearchEnabled !== false
+      // 侧栏入口开关同理：老文档没有该键 → 保持默认显示入口。
+      this.sidebarEntryCache = state.sidebarEntryEnabled !== false
       // 供应商顺序同理：老文档没有该键 → 空数组（未自定义）。
       this.providerOrderCache = state.providerOrder ?? []
       // MiniMax 国际站 XFF 同理：老文档没有该键 → `undefined`（不附头，
@@ -583,6 +595,10 @@ export class AccountPool {
         //    重启后静默回到只绑回环（用户会以为开关坏了）。
         gatewayAllowLan: this.gatewayAllowLanCache,
         nativeWebSearchEnabled: this.nativeWebSearchCache,
+        // ⚠️ **必须带上本键**（与 `nativeWebSearchEnabled` 同一个整体替换陷阱）：
+        //    漏键会让用户关掉的侧栏入口在**任何**一次账号/黑名单/网关/顺序写入时
+        //    被静默清掉，重启后入口又回来了。
+        sidebarEntryEnabled: this.sidebarEntryCache,
         providerOrder: this.providerOrderCache,
         // ⚠️ **必须带上本键**（同 `nativeWebSearchEnabled` 的坑）：
         //    `write` 是整体替换语义 ⇒ 漏键会让用户设的 XFF 在**任何**一次
@@ -1089,6 +1105,37 @@ export class AccountPool {
     this.loaded = true
     if (this.store.kind === 'memory') {
       this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，原生搜索开关仅本次会话有效')
+      return
+    }
+    await this.queueStoreSave()
+  }
+
+  /**
+   * 「侧栏入口」当前是否启用（`false` = 主导航不显示 Jet Hub 入口）。
+   *
+   * 缺键语义为**显示**（见 {@link sidebarEntryCache}）。
+   *
+   * ⚠️ 调用方（客户端在 `apply` 里注册侧栏行前）**必须每次现读**，不能缓存
+   * 返回值：用户随时可能在 Jet Hub 面板里切换，而客户端只在启动时读一次。
+   */
+  sidebarEntryEnabled(): boolean {
+    this.ensureLoaded()
+    return this.sidebarEntryCache
+  }
+
+  /**
+   * 打开/关闭「侧栏入口」并落盘。
+   *
+   * 关闭后主导航里不再有 Jet Hub 那一行，进入路径只剩「设置 → Jet Hub」；
+   * 不影响 Jet Hub 页面本身的任何功能（它仍在 `settings.section` 里注册）。
+   */
+  async setSidebarEntryEnabled(enabled: boolean): Promise<void> {
+    this.ensureLoaded()
+    if (this.sidebarEntryCache === enabled) return
+    this.sidebarEntryCache = enabled
+    this.loaded = true
+    if (this.store.kind === 'memory') {
+      this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，侧栏入口开关仅本次会话有效')
       return
     }
     await this.queueStoreSave()

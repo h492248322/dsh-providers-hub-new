@@ -11,8 +11,11 @@ import {
   collectCreditBalances,
   collectCreditsStatus,
   computeClaimSummary,
+  DEFAULT_CREDITS_STATUS_CONCURRENCY,
   JET_HUB_API_PATH,
+  MAX_CREDITS_STATUS_CONCURRENCY,
   registerJetHubRpc,
+  resolveCreditsStatusConcurrency,
 } from '../../src/jet-hub-rpc.js'
 import type { CreditsEndpointDeps } from '../../src/jet-hub-rpc.js'
 import { createProviderCredits } from '../../src/provider-credits.js'
@@ -251,6 +254,35 @@ function makeDeps(overrides: Partial<CreditsEndpointDeps> = {}): CreditsEndpoint
   }
 }
 
+describe('★ credits.status 的并发度解析（2026-10-22 审计打穿后补）', () => {
+  it('默认 3；`1` 恢复串行；非正整数一律回落默认', () => {
+    expect(DEFAULT_CREDITS_STATUS_CONCURRENCY).toBe(3)
+    expect(resolveCreditsStatusConcurrency(undefined, 10)).toBe(3)
+    expect(resolveCreditsStatusConcurrency(1, 10), '1 = 恢复旧的完全串行语义').toBe(1)
+    expect(resolveCreditsStatusConcurrency(4, 10)).toBe(4)
+    // ⚠️ 逐格：这些都不是「正整数」⇒ 回落默认（`0` 也是回落，**不是**串行 —— 这条
+    //    语义初版注释没写，审计点出来的空隙）。
+    for (const bad of [0, -1, Number.NaN, 1.5, Number.POSITIVE_INFINITY, '3', null, true]) {
+      expect(resolveCreditsStatusConcurrency(bad, 10), `${String(bad)} 应回落默认`).toBe(3)
+    }
+  })
+
+  it('★ 硬上界：`1e10` / `MAX_SAFE_INTEGER` 不得变成「全池并发」', () => {
+    // ⚠️⚠️ 初版上界是 `accounts.length` ⇒ `concurrency: 1e10` 时并发度 = 账号数
+    //    ⇒ 实测 31 个账号 = **31 个并发请求打同一上游**。本用例锁住硬顶。
+    expect(MAX_CREDITS_STATUS_CONCURRENCY).toBe(8)
+    expect(resolveCreditsStatusConcurrency(1e10, 31)).toBe(MAX_CREDITS_STATUS_CONCURRENCY)
+    expect(resolveCreditsStatusConcurrency(Number.MAX_SAFE_INTEGER, 31)).toBe(MAX_CREDITS_STATUS_CONCURRENCY)
+  })
+
+  it('账号数少于并发度时取账号数；0 个账号取 1（不能是 0）', () => {
+    expect(resolveCreditsStatusConcurrency(undefined, 2)).toBe(2)
+    // ⚠️ 0 会让 `Array.from({length: 0})` ⇒ `Promise.all([])` 立即 resolve
+    //    ⇒ `results` 保持全空洞（返回 `[undefined, …]`）。故下限是 1。
+    expect(resolveCreditsStatusConcurrency(undefined, 0)).toBe(1)
+  })
+})
+
 describe('credits.status 单账号异常隔离', () => {
   it('非法 credentialRef 只让该账号状态为 null，其余账号仍被查询', async () => {
     const accounts = [
@@ -299,13 +331,57 @@ describe('credits.status 单账号异常隔离', () => {
   })
 
   it('JSON 损坏与网络失败都只影响该账号', async () => {
-    const accounts = [makeEntry({ id: 'corrupt' }), makeEntry({ id: 'network-down' }), makeEntry({ id: 'ok' })]
-    let resolveCalls = 0
+    const accounts = [
+      makeEntry({ id: 'corrupt', credentialRef: 'WORKBUDDY_ACCOUNT_AAAA_CORRUPT' }),
+      makeEntry({ id: 'network-down', credentialRef: 'WORKBUDDY_ACCOUNT_AAAA_NETDOWN' }),
+      makeEntry({ id: 'ok', credentialRef: 'WORKBUDDY_ACCOUNT_AAAA_OK' }),
+    ]
+    /**
+     * ⚠️⚠️ **判据必须按账号身份，不能按调用序号**（2026-10-22 改，**语义变更登记**）。
+     *
+     * ## 为什么改
+     *
+     * 初版用「跨账号共享的可变计数器」来区分账号：
+     * ```ts
+     * let resolveCalls = 0
+     * resolve: async () => ({ value: resolveCalls++ === 0 ? '{ not json' : VALID })
+     * fetchStatus: async () => { if (resolveCalls === 2) throw … }
+     * ```
+     * 串行时「第 2 个账号」==「`resolveCalls === 2`」，两者**恰好同构**；
+     * `collectCreditsStatus` 改成有限并发（默认 3）后，`resolveCalls` 的递增顺序
+     * 与**账号下标**解耦 ⇒ 判据打空 ⇒ 本用例变红（实测 `concurrency=1` 绿、
+     * `concurrency=3` 红）。
+     *
+     * ## 为什么不是「测试写错了、改绿就行」
+     *
+     * 这条用例恰好是「**跨账号共享可变状态 + 并发**」这个形态的报警器。生产侧
+     * `deps` 目前没有共享可变状态（只有 `resolve` / `fetchStatus` / `warn`），
+     * 但一旦有人往 `deps` 里塞计数器 / 缓存 / 退避状态，并发下就会与账号下标解耦
+     * —— 那正是本用例原来在（无意中）守着的东西。
+     *
+     * ⇒ 改法是**把判据挪到账号身份上**（`credential.id`），它才是本用例真正想表达的
+     * 语义（「这个账号坏了」而不是「第 2 次调用坏了」），且与并发度**无关**。
+     * ⇒ 副作用：本用例**不再**覆盖「共享计数器」那一形态 —— 那由下面单独的
+     * `★ 并发下不得依赖跨账号调用序` 用例显式守（它断言的是**反面**：
+     * 每个账号都真的被处理了，与顺序无关）。
+     */
     const deps = makeDeps({
-      resolve: async () => ({ value: resolveCalls++ === 0 ? '{ not json' : VALID_CREDENTIAL_JSON }),
-      // 第二个账号（network-down）的状态请求抛网络错误
-      fetchStatus: async () => {
-        if (resolveCalls === 2) throw new Error('socket hang up')
+      resolve: async (ref) => {
+        // ⚠️ 按 **ref 名字**判「这是哪个账号」，而不是按调用序号。
+        //    ⇒ 三个账号必须各自有**不同的** ref（否则 `resolve` 无从区分）。
+        const name = String(ref)
+        if (name.endsWith('CORRUPT')) return { value: '{ not json' }
+        // `network-down` 的凭据里带一个标记，供 `fetchStatus` 认出它。
+        if (name.endsWith('NETDOWN')) {
+          return { value: JSON.stringify({ ...JSON.parse(VALID_CREDENTIAL_JSON), id: 'network-down' }) }
+        }
+        return { value: VALID_CREDENTIAL_JSON }
+      },
+      fetchStatus: async (credential) => {
+        // `network-down` 的状态请求抛网络错误（凭据里的 `id` 就是它的身份）。
+        if ((credential as { id?: string } | undefined)?.id === 'network-down') {
+          throw new Error('socket hang up')
+        }
         return makeStatus()
       },
     })
@@ -313,9 +389,45 @@ describe('credits.status 单账号异常隔离', () => {
     const results = await collectCreditsStatus(accounts, WORKBUDDY, deps)
 
     expect(results.map(r => r.accountId)).toEqual(['corrupt', 'network-down', 'ok'])
-    expect(results[0]?.status).toBeNull()
-    expect(results[1]?.status).toBeNull()
+    expect(results[0]?.status, 'JSON 损坏只影响它自己').toBeNull()
+    expect(results[1]?.status, '网络失败只影响它自己').toBeNull()
     expect(results[2]?.status).toEqual(makeStatus())
+  })
+
+  it('★ 并发下每个账号都被处理一次，且结果按原序（不依赖调用序）', async () => {
+    // ⚠️ 上一条用例的判据从「调用序号」改成了「账号身份」（见那里的长注释）。
+    //    本用例守的是那一步**没有把覆盖丢掉**：断言「每个账号恰好被处理一次」
+    //    与「结果顺序 = 输入顺序」，两者都与并发度无关 ⇒ 并发度调成 1 或 8 都绿。
+    //
+    // ⚠️⚠️ **夹具刻意用 `WORKBUDDY`，不是上游那版的 `LOBSTERAI`**（2026-10-22 移植时实测）：
+    //    `collectCreditsStatus` 在本仓库的泛型默认值是 **buddy 系**
+    //    （`<TCredential = BuddyCredential, TProduct = BuddyProduct>`），而上游那版是通用的
+    //    `ChannelCredential` / `ProviderProduct` ⇒ 换成 `LOBSTERAI` 后
+    //    `collectCreditsStatus(accounts, LOBSTERAI, makeDeps({…}))` 报
+    //    `TS2345: 'LobsteraiProduct' is not assignable to 'BuddyProduct'`
+    //    （实测：整份换成上游文件时该 spec 共 **52** 个类型错误）。
+    //    ⇒ 本仓库保留 `WORKBUDDY` 夹具；**判据与上游逐字一致**，只换夹具身份。
+    const accounts = Array.from({ length: 9 }, (_, index) => makeEntry({
+      id: `acc-${index}`,
+      // ⚠️ 每个账号**不同的 ref**：`resolve` 靠它区分身份（否则 `fetchStatus`
+      //    收到的凭据无法反查是哪个账号，`seen` 只会是一串 `?`）。
+      credentialRef: `WORKBUDDY_ACCOUNT_AAAA_ACC${index}`,
+    }))
+    const seen: string[] = []
+    const results = await collectCreditsStatus(accounts, WORKBUDDY, makeDeps({
+      resolve: async (ref) => {
+        const name = String(ref)
+        const index = name.slice(name.lastIndexOf('ACC') + 3)
+        return { value: JSON.stringify({ ...JSON.parse(VALID_CREDENTIAL_JSON), id: `acc-${index}` }) }
+      },
+      fetchStatus: async (credential) => {
+        seen.push((credential as { id?: string }).id ?? '?')
+        await new Promise(resolve => setTimeout(resolve, 5))
+        return makeStatus()
+      },
+    }))
+    expect(results.map(r => r.accountId), '结果必须按 accounts 原序').toEqual(accounts.map(a => a.id))
+    expect([...seen].sort(), '每个账号恰好处理一次，不得重复也不得漏').toEqual(accounts.map(a => a.id).sort())
   })
 
   it('停用账号同样处理（停用与签到无关），异常出口收到告警', async () => {
@@ -2137,6 +2249,39 @@ describe('model.list / model.setDisabled 端点', () => {
     /** 取出 warnings（缺省为空数组，便于直接 join 断言）。 */
     const warningsOf = (result: unknown): string[] =>
       ((result as { value?: { warnings?: string[] } }).value?.warnings) ?? []
+
+    /**
+     * ⚠️⚠️ **批量端点的 `warnings` 恒为空，这是正确的**（2026-10-21 合并审计定论）。
+     *
+     * ⚠️ 合并审计最初判这条是「重要缺陷」（`model.setAllDisabled` 不调
+     * `catalogWarnings` ⇒ 客户端的提示通道恒空）。**实测证明那是误判**：
+     * `catalogWarnings` 的判据是「`ids` 里不在 `known` 的」，而批量端点传的
+     * `ids` 本就是 `catalog.ids`，而 `readableCatalogIds` 的 `known` 是
+     * `new Set(catalog.ids)` **并回黑名单** ⇒ `known ⊇ catalog.ids` **恒成立**
+     * ⇒ `missing` 恒为空。
+     *
+     * ⇒ 而这正是**语义正确**的：批量关闭的对象是「目录里的全部模型」—— 它们
+     * **本来就在目录里**，不存在「关了但没有效果」的那个 id（那是**逐条开关**
+     * 的语义）。所以批量路径**无事可警告**。
+     *
+     * ⚠️ 本用例把这条**钉住**：将来若有人给批量路径加上 `catalogWarnings`（看起来
+     * 「补齐提示通道」），它会**恒空** ⇒ 本条会红 ⇒ 提醒他那是死代码。
+     */
+    it('★ 批量端点的 warnings 恒为空（批量关闭的对象本就在目录里 ⇒ 无事可警告）', async () => {
+      const { call } = registerEndpoints({
+        models: MODELS,
+        modelAdapters: { buddy: { listAllModels: () => CATALOG } },
+        disabledModels: { buddy: { 'gone-model': true } },
+      })
+
+      const result = await call('model.setAllDisabled', { provider: 'buddy', disabled: true })
+
+      expect(result.ok).toBe(true)
+      expect(
+        warningsOf(result),
+        '★ 批量路径的 warnings 应恒空（`known ⊇ catalog.ids` ⇒ missing 恒空）',
+      ).toEqual([])
+    })
 
     it('关闭一个不在目录里的 id → 仍写入黑名单，但 warnings 点名说明它不在目录', async () => {
       const { call, storedValue } = registerEndpoints({
@@ -4249,6 +4394,84 @@ describe('provider.status / provider.setEnabled 端点', () => {
         '★★ 「关闭全部模型」没落意图 ⇒ 目录变长后翻回「已打开」（IKP8OF 第二入口）',
       ).toBe(true)
     })
+
+    /**
+     * ★★ **模型级的「全关」不得落「供应商整体关闭」意图**（2026-10-21 合并审计发现，阻断级）。
+     *
+     * ## 问题
+     *
+     * PR !120 新增的「供应商 → 模型列表」统一管理屏，它的「全关」调
+     * `model.setAllDisabled(true)` —— 而该端点原本**无条件落「供应商整体关闭意图」**
+     * （与 `provider.setEnabled(false)` 同一条路径）。
+     *
+     * ⇒ 意图的三个后果：
+     * ① `provider.status` 报 `closed: true` ⇒ 左侧分组变成「已关闭」；
+     * ② 各适配器的 `listModels` 直接返回 `[]` ⇒ 该家模型在选择器里**一个都没有**；
+     * ③ **打开任意一个模型会顺带把整个供应商打开**（打开方向会清意图）。
+     *
+     * ⇒ 两头都与用户意图相反，且**零提示**。
+     *
+     * ## ⚠️⚠️ 判据**不是** `provider.status` 的 `closed`（这里踩过一次）
+     *
+     * `closed` 有**两条腿**（`jet-hub-rpc.ts` 的 `provider.status` 分支）：
+     * ① **派生**：`total > 0 && disabled === total`（用户把该家的模型**逐条关光**也算关闭）
+     * ② **意图**：`providerClosedFor(provider)`（持久化，抗目录增长）
+     *
+     * ⇒ 「全关模型」之后，派生腿**本来就为真** ⇒ `closed` 必然是 `true`，
+     * **无论有没有落意图**。故拿 `closed` 判这条是**测不出差别**的
+     * （第一次写这条用例时就是这么写错的，当场变红）。
+     *
+     * ## 真正的差别：**目录增长之后**
+     *
+     * - 落了意图 ⇒ 派生腿翻回 false 时，意图腿仍把它按住 ⇒ 仍报「已关闭」；
+     * - 没落意图 ⇒ 目录一长，新 id 不在黑名单里 ⇒ 派生腿翻回 false
+     *   ⇒ 回到「已打开」、新模型**仍可选**（= 模型级语义，用户预期如此）。
+     *
+     * ⚠️ 这正是 IKP8OF 的两条腿：意图腿是**供应商级**按钮的语义，
+     * 模型级的「全关」**不该**继承它。
+     */
+    it('★★ 模型级「全关」（closeProvider: false）不落供应商关闭意图 ⇒ 目录变长后回到「已打开」', async () => {
+      const catalog = [...CATALOG]
+      const { call } = setup({ catalog })
+      const shut = await call('model.setAllDisabled', {
+        provider: 'buddy',
+        disabled: true,
+        closeProvider: false,
+      })
+      expect(shut.ok).toBe(true)
+
+      // 目录异步补齐（模拟上游新增模型）—— 派生腿在此翻回 false。
+      catalog.push(LATE_MODEL)
+
+      const after = (await call('provider.status', { providers: ['buddy'] }))
+        .value as { statuses: Record<string, { closed: boolean }> }
+      expect(
+        after.statuses.buddy.closed,
+        '★★ 模型级「全关」不该落供应商关闭意图（否则目录一变长就永久关闭，用户只想关模型）',
+      ).toBe(false)
+    })
+
+    /**
+     * ★★ **反向对照**：**供应商级**的「关闭全部模型」**仍要**落意图。
+     *
+     * ⚠️ 缺省 `closeProvider` 为 `true`（保持既有语义）⇒ 上面的新参数**不能**
+     * 把 IKP8OF 的第二入口（目录变长后翻回「已打开」）重新打开。
+     */
+    it('★★ 反向对照：缺省（不传 closeProvider）仍落意图 ⇒ 目录变长后仍为「已关闭」', async () => {
+      const catalog = [...CATALOG]
+      const { call } = setup({ catalog })
+      await call('model.setAllDisabled', { provider: 'buddy', disabled: true })
+
+      catalog.push(LATE_MODEL)
+
+      const after = (await call('provider.status', { providers: ['buddy'] }))
+        .value as { statuses: Record<string, { closed: boolean }> }
+      expect(
+        after.statuses.buddy.closed,
+        '★★ 缺省语义不得变（IKP8OF 第二入口）',
+      ).toBe(true)
+    })
+
 
     /**
      * ⚠️ **「逐条关光」这条既有语义不得被新判据挤掉**。

@@ -55,16 +55,18 @@
  *    说明服务端认的是**逐字符的字面量**，**不能**把它泛化成正则/关键词。
  *
  * ⚠️⚠️ **但「逐字符的精确字面量」不等于「每条指纹的锚点相同」**（2026-10-14，
- * 登记 Claude Code 那条时实测出来）。三条已登记指纹的**位置语义并不一致**：
+ * 登记 Claude Code 那条时实测出来）。四条已登记指纹的**位置语义并不一致**：
  *
  * | 指纹 | 位置语义 | 依据（**探针实测**，不是推断） |
  * |---|---|---|
  * | ZCode gitStatus 句 | **位置无关**（句中/段中被夹住仍拦） | 上表「句中 / 段中被别的句子夹住」 |
  * | Claude Code 身份句 | **行首锚定**（前接任意一个字符即放行） | 前接空格 / 换行 / 中文前言 / 双换行**均 200**；裸串、后接句点均 400 |
  * | Claude Code 反馈句 | **位置无关**（前接前言仍拦） | 裸串、前接 `Note: `、前接行首 `  - `、后接换行正文**均 400/11128** |
+ * | DSH 身份首句（第 4 条） | **行首锚定**（前接任意前缀即放行） | 前接 `You are a helpful assistant.\n\n` **200**；裸串 400；带句点 / 后接正文仍 400 |
  *
- * ⚠️ 三行里第 2、3 行**互为反面** ⇒ 「位置语义」这张表**必须逐条实测**，
- * 拿任一条的结论推给新指纹就是踩中本文件下面那条纪律。
+ * ⚠️ 表里第 2、4 行（**行首锚定**）与第 1、3 行（**位置无关**）**互为反面** ⇒
+ * 「位置语义」这张表**必须逐条实测**，拿任一条的结论推给新指纹就是踩中本文件
+ * 下面那条纪律。
  *
  * ⚠️ 而「`find` 该写多长」**也不统一** —— 那取决于**该条指纹的最小充分串**，
  * 而最小充分串**只能逐条实测**（IKLYCT 那条实测：砍掉前半或后半都放行 ⇒ 必须写整句；
@@ -274,13 +276,119 @@ const CONTENT_FINGERPRINTS: readonly ContentFingerprint[] = [
     //    2026-09-28 的会话，其 system 首行即本句且当时可正常使用 ⇒ 该句**一直**
     //    在行首，是腾讯网关后续才把它纳入拦截名单，不是本机配置变更所致。
     //
+    // ## 2026-10-21：`replace` 从「语义等义改写」换成**官方同形形态**（用户要求）
+    //
+    // 起因是做了一次对照取证 —— 不是读源码推的，而是**拿 CodeBuddy 客户端自己的
+    // 一条真实会话**（标题「AI编程助手介绍」，id `8c9dbeb10e2846d7b0fa569b14aa4335`）。
+    // 该会话落盘里 assistant 的 reasoning 逐字复述了自己的 system：
+    //   「系统提示说我是 "an AI coding assistant, powered by Hy4 preview model"」；
+    // 客户端提示词**资产**（`extensions/genie/product.json` 的 `craft-agent-prompt`）
+    // 首行是 `You are an AI coding assistant,{{ ModelNamePrompt }}.`，而该变量渲染成
+    // `" powered by <模型展示名> model"` ⇒ 两条独立来源拼出的字节一致：
+    //
+    //   `You are an AI coding assistant, powered by Hy4 preview model.`
+    //
+    // ⇒ 与我们那句**结构完全同形**：`You are <名词> powered by <Y>`。差别只在
+    //   **Y 填什么** —— 官方填**模型展示名**，我们填**harness 名**。
+    //   而原来的等义改写把 `DeepSeek Harness` 这个 token **原样留着**，属于
+    //   「只躲开了字面量、没解决身份」：上游一旦把名单从「整句逐字符」放宽成
+    //   关键词/正则，这一条立刻失效。
+    //
+    // 故 `replace` 改为官方**原生兜底**措辞（模型名缺失时官方发出来的就是这个形态）：
+    //   `You are an AI coding assistant, powered by a large language model`
+    // 三条取舍：
+    //   ① 出站 `system` 里**彻底不再出现 `DeepSeek Harness`**——这是本条的真正收益；
+    //   ② 措辞取自官方资产而**不是自造** ⇒ 与官方首帧同形，不是新的可疑信号；
+    //   ③ **刻意不带具体模型名**：那要把 model 透传进本函数（7 处调用点），
+    //      而我们的目录展示名与官方展示名不一定一致，多一处信号反而多一处不一致。
+    //
+    // ⚠️ **改这一行必须跑 e2e**：凭据 =
+    //    `tests/e2e/buddy-fingerprint-roles.e2e.spec.ts` 的第 4 节
+    //    （跑法：`pnpm test:e2e:buddy-fingerprint`，双闸门已绑好）。
+    //    ✅ **2026-10-21 已实发验收**（`deepseek-v4.1-flash`）：新措辞在 buddy 站
+    //    拿到干净的 200；该文件 §4 两站全绿。
+    //
+    // ⚠️⚠️ **本句是端点相关的**（2026-10-21 两站对照实测；登记时**只测过
+    //    `copilot.tencent.com`**）：
+    //
+    //    | 站点 | `step-5-preview` | `deepseek-v4.1-flash` |
+    //    |---|---|---|
+    //    | `copilot.tencent.com`（buddy） | ❌ 400/11128 | ❌ 400/11128 |
+    //    | `www.workbuddy.ai`（workbuddy） | ✅ 200 | ✅ 200 |
+    //
+    //    两个模型都测过 ⇒ **站点差异**、不是模型差异。表中对 `workbuddy` **仍保留**
+    //    这条改写：措辞语义等义、对该站无害，国际站哪天也上名单时它就是现成的防线。
+    //    ⚠️ 别把「workbuddy 没被拦」读成「这条登记是多余的」—— 它挡的是 buddy 站
+    //    每轮必带的首句，而那一站是真的会被拦。
+    //
+    // ⚠️ **别把本条读成「封号」判据**：本仓库实测到的通道门控是**按账号 + 三个请求头**
+    //    （IKM7SG），而 11128 的内容级那一支是**字面量黑名单**、不读语义。
+    //    换措辞的已验证收益只有「不再命中那条字面量、出站不带自家 token」这两条。
+    //
     // `find` 刻意不带尾句点：一条同时覆盖带句点与不带句点两种形态。
     find: 'You are an AI agent powered by DeepSeek Harness',
-    // 语义等价：仍是「构建在 DeepSeek Harness 运行时之上的 AI 智能体」，
-    // 只是不再使用被风控逐字符匹配的那个措辞。
-    replace: 'You are an AI agent built on the DeepSeek Harness runtime',
+    // 见上方「2026-10-21」一节：官方同形 + 官方原生兜底措辞。
+    replace: 'You are an AI coding assistant, powered by a large language model',
     note: '本机 2026-10-20 对 copilot.tencent.com 实测：system 绝对行首 400/11128，'
-      + '前接任意字符放行，改写后放行（含整段真实 system 8683 字符）',
+      + '前接任意字符放行；2026-10-21 换成官方同形措辞后**实测放行**（buddy 站 / '
+      + 'deepseek-v4.1-flash），另实测该句在 www.workbuddy.ai 两模型**均不拦**（站点相关）',
+  },
+  {
+    // **DSH Web 运行面的开头两句** —— 来自 DSH 的 `@deepseek-ai/dsh-harness-dev-context`
+    // 插件的 `WEB_SURFACE_PROMPT`。该插件**只在 Web 运行时挂载**（其 README 原话：
+    // 「`--help` 与非 Web 组合从不挂载」）⇒ CLI / 桌面面的会话 system 里没有这句，
+    // 这也是它长期没被发现的原因（见下面「两次没测到」）。
+    //
+    // ## 现象（2026-10-21 真实报障：「buddy: 请求被拦截，请重新发送」）
+    //
+    // 真实会话的 system（5,780 字符）里 `DeepSeek Harness` 出现 **3 次**：
+    // 第 1 行（身份句，第 4 条）、第 33 行（`HARNESS_SOURCE_PROMPT`）、第 35 行（本句所在行）。
+    // 前四条只覆盖第 1 行 ⇒ **修复前插件发出的形态仍被整轮 400/11128**。
+    //
+    // ## 逐格实测（2026-10-21；`copilot.tencent.com` + `deepseek-v4.1-flash`；
+    //    载荷逐字节取自本机会话落盘的真实 system；另用**三个不同账号**复测，结论一致）
+    //
+    // | 载荷 | 结果 |
+    // |---|---|
+    // | 真实整段（3 处都在） | ❌ 400/11128 |
+    // | 真实整段 + **只改第 1 行**（= 修复前插件发出的形态） | ❌ **400/11128** |
+    // | 真实整段 + 三处全改 | ✅ 200 |
+    // | **只发第 33 行那句**（`HARNESS_SOURCE_PROMPT`） | ✅ 200 ⇒ **不登记它** |
+    // | 正向：整个 system 就是 `DeepSeek Harness` 两个词 | ✅ 200 ⇒ **不是「认 token」** |
+    // | 本行**前 220 字符**前缀 | ✅ 200 |
+    // | 本行**前 221 字符**前缀 | ❌ 400/11128 ⇒ **字面量 = 前两句（本 `find`）** |
+    // | 去掉行首 38 字符后再发 | ✅ 200 ⇒ 字面量**从行首开始** |
+    // | 中性前言 + 本字面量 | ❌ 400/11128 ⇒ **位置无关**（与第 4 条的行首锚定**相反**） |
+    // | 本字面量放 **assistant 正文** | ❌ 400/11128 ⇒ 现有改写范围（system + assistant）已覆盖 |
+    // | `www.workbuddy.ai` 站同一载荷 | ✅ 200 ⇒ **站点相关**（与第 4 条同型） |
+    // | 旧版形态 `…Web GUI at http://127.0.0.1:3080.` | ✅ 200 ⇒ **刻意不登记** |
+    // | 真实整段 + 第 1 行改写 + **只把本句的品牌串去掉** | ✅ **200**（本 `replace` 的来历） |
+    //
+    // ## ⚠️⚠️ `find` 为什么是 221 字符、不能更短
+    //
+    // 前缀二分给出 **220 放行 / 221 拦**；而把这一行**按句切开**后，
+    // 前一句（107 字符）与后七句（894 字符）**各自都放行** ⇒ 触发串**跨了句边界**，
+    // 它是**前两句的并集**。切开任何一半都会**空跑**（症状：登记了却仍每轮 400）。
+    // 这正是本仓库那条纪律的又一例：**非单调现象只能逐格实测，不能凭直觉切**。
+    //
+    // ## ⚠️ 本条的**脆弱性**（如实登记）
+    //
+    // 上游认的是**逐字符**的长字面量 ⇒ DSH 哪天改动这两句里的任一字符，本规则会
+    // **静默停止匹配**（症状 = 该渠道整轮 400 复发，且行为与「完全没登记」同形）。
+    // 现阶段的守卫是 `tests/e2e/buddy-fingerprint-roles.e2e.spec.ts` 第 5 节
+    // （发的是**同形载荷**，不读 DSH 源码 ⇒ 它锁得住「换了措辞会被拦」，
+    // **锁不住**「DSH 改了措辞而本 `find` 没跟上」）。要做真漂移检测得上
+    // 「出站 system 里若仍出现 `DeepSeek Harness` 就报警」那类运行时闸门，**尚未实现**。
+    find: 'You are interacting with the user through the DeepSeek Harness Web GUI '
+      + 'whose URL the runtime context names. When the user refers to "this page", "this GUI", '
+      + 'or "this app" without naming another target, they mean this GUI.',
+    // 只去掉品牌串，语义不变：仍是「你在一个 Web GUI 里，它的 URL 由 runtime context 给出」。
+    replace: 'You are interacting with the user through the harness Web GUI '
+      + 'whose URL the runtime context names. When the user refers to "this page", "this GUI", '
+      + 'or "this app" without naming another target, they mean this GUI.',
+    note: '真实报障 2026-10-21（修复前插件形态在 buddy 站整轮 400/11128）；本机逐格实测：'
+      + '221 字符字面量被拦、220 前缀放行、位置无关、assistant 正文同样被拦、'
+      + 'www.workbuddy.ai 不拦、旧版 `at <url>` 形态不拦；去掉品牌串后真实整段 200',
   },
 ]
 

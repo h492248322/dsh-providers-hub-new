@@ -146,6 +146,127 @@ describe('QoderAdapter 模型目录', () => {
       expect(resolved.context).toEqual({ contextWindow: 1_000_000 })
     })
 
+    /**
+     * `isFreeModel` 的判据（`src/qoder-adapter.ts`）。
+     *
+     * ⚠️ 这一组与 `qoder-free-model-lock.spec.ts` **各守一层**，缺一不可：
+     * - 那里把适配器的方法**钉成桩**，验的是「接线传到了编排」（装配层）；
+     * - 这里验判据本身（目录读取 + `isFree` 语义），不桩任何东西。
+     *
+     * 如果只有前者，判据里写 `return true` / 忘了 `await ensureRemoteModels()`
+     * 这类缺陷**全部无牙**（变异实测：6 条里有 4 条打不响）。
+     */
+    describe('isFreeModel（免费判据）', () => {
+      it('远端 `isFree` ⇒ true（免费模型不该被「锁定永久积分」拦下）', async () => {
+        const adapter = makeAdapter({ fetchRemoteModels: async () => [remoteDfmodel, remoteFast] })
+        await expect(adapter.isFreeModel('dfmodel')).resolves.toBe(true)
+      })
+
+      it('⚠️ 免费但倍率非 0 也必须是 true（`qmodel_38max` 的形态）', async () => {
+        // 国际版 `qmodel_38max`：`isFree: true` + `priceFactor: 0.2`。
+        // 变异：判据改成「`priceFactor === 0` 即免费」⇒ 本条红（漏判成付费）。
+        const adapter = makeAdapter({
+          fetchRemoteModels: async () => [{
+            id: 'qmodel_38max', name: 'Qwen3.8-Max', contextWindow: 1_000_000,
+            isFree: true, priceFactor: 0.2,
+          }],
+        })
+        await expect(adapter.isFreeModel('qmodel_38max')).resolves.toBe(true)
+      })
+
+      it('倍率 0 但未标 `isFree` ⇒ false（保守方向：宁可多查一次余额）', async () => {
+        // 变异：判据改成「`priceFactor === 0` 即免费」⇒ 本条红。
+        // 反向失效（把付费判成免费）会**真烧永久积分且不可撤回**，故必须保守。
+        const adapter = makeAdapter({
+          fetchRemoteModels: async () => [{
+            id: 'paid-but-zero-rate', name: 'Paid', contextWindow: 200_000, priceFactor: 0,
+          }],
+        })
+        await expect(adapter.isFreeModel('paid-but-zero-rate')).resolves.toBe(false)
+      })
+
+      it('付费模型 ⇒ false（最危险的失效方向：误判免费会绕开锁定烧钱）', async () => {
+        const adapter = makeAdapter({ fetchRemoteModels: async () => [remoteDfmodel, remoteFast] })
+        await expect(adapter.isFreeModel('fast')).resolves.toBe(false)
+        await expect(adapter.isFreeModel('dmodel')).resolves.toBe(false)
+      })
+
+      it('未知模型 / 空入参 ⇒ false', async () => {
+        const adapter = makeAdapter({ fetchRemoteModels: async () => [remoteFast] })
+        await expect(adapter.isFreeModel('nope')).resolves.toBe(false)
+        await expect(adapter.isFreeModel('')).resolves.toBe(false)
+        await expect(adapter.isFreeModel(undefined)).resolves.toBe(false)
+      })
+
+      it('未接线远端目录 ⇒ 退用兜底表，兜底表里的免费模型仍判得出', async () => {
+        // 兜底表与远端条目**同源**（都读 `isFree`）⇒ 纯插件用户也能享受免费短路。
+        const adapter = makeAdapter()
+        await expect(adapter.isFreeModel('qfmodel')).resolves.toBe(true)
+        await expect(adapter.isFreeModel('dmodel')).resolves.toBe(false)
+      })
+
+      /**
+       * ★★ **远端目录「按账号收缩」时，静态表里的免费模型仍必须判免费**
+       * （2026-10-21 合并审计发现，!137 引入的回归）。
+       *
+       * ## 真实场景
+       *
+       * 远端目录是**按账号**下发的：免费额度号上游**只给 2 条**
+       * （`qfmodel` + `dfmodel`，见 `docs/agent-notes/providers-qoder.md`），
+       * 其余 17 条不在远端目录里。
+       *
+       * ## 缺陷
+       *
+       * 判据原写成 `this.catalogSource().find(...)`，而 `catalogSource()` 是
+       * `remoteModels ?? fallbackModels` —— **远端一旦落地就把静态表整体顶掉**
+       * ⇒ 静态表里标了 `isFree: true` 的 `qmodel_38max` 被判成「未知 ⇒ 非免费」
+       * ⇒ 跳过 `credential-resolver.ts` 的「免费模型不受锁定约束」短路
+       * ⇒ 锁定永久积分时被 `allowPermanent=false` 拦下、报出「额度都属于永久」
+       * 这类**与事实相反**的错误 —— 本家 2026-10-21 真实报障**原地复发**，零日志。
+       *
+       * ⚠️ 同文件 `catalogModel()` 的注释**逐字记过同一个反模式**
+       * （「第一版把它写成 `catalogSource().find(...)`，被独立审计打穿」）——
+       * 能力/元数据判据早已改用并集，**免费判据当时漏了**。
+       *
+       * ⚠️ 与上一条「未接线远端」的区别：那格 `remoteModels` 仍是 `undefined`，
+       * `catalogSource()` 恰好等于静态表 ⇒ **测不出**本条缺陷
+       * （实测：本缺陷存在时本条红、那条绿）。
+       *
+       * 变异：判据改回 `this.catalogSource().find(...)` ⇒ 本条红
+       * （实测：修前 `isFreeModel('qmodel_38max') = false`）。
+       */
+      it('★★ 远端目录按账号收缩时，静态表里的免费模型仍判免费（不许只查远端）', async () => {
+        const shrunk: QoderFallbackModel[] = [
+          { id: 'fast', name: 'Fast', contextWindow: 200_000, isFree: false },
+        ]
+        const adapter = makeAdapter({ fetchRemoteModels: async () => shrunk })
+        // ⚠️ **必须先让远端真的落地**，否则测的是「未接线」那一格（那格恰好全绿）。
+        await adapter.listModels('qoder')
+
+        await expect(
+          adapter.isFreeModel('qmodel_38max'),
+          '★★ 静态表标了 isFree:true ⇒ 远端收缩时仍须判免费（否则免费模型撞锁定闸门，报出「额度都属于永久」）',
+        ).resolves.toBe(true)
+        await expect(adapter.isFreeModel('qfmodel')).resolves.toBe(true)
+        // ⚠️ **反向必须同时存在**：并集不得把真付费模型判成免费
+        //（那个方向会绕开锁定**真烧永久积分**，不可逆）。
+        await expect(adapter.isFreeModel('dmodel')).resolves.toBe(false)
+        await expect(adapter.isFreeModel('fast')).resolves.toBe(false)
+      })
+
+      it('⚠️ 必须 await 远端目录加载（否则「直接进会话」路径判据静默失效）', async () => {
+        // 变异：删掉判据里的 `await this.ensureRemoteModels()` ⇒ 远端尚未加载，
+        // 落到兜底表 ⇒ `remote-only-free` 查不到 ⇒ 返回 false ⇒ 本条红。
+        const fetchRemoteModels = vi.fn(async () => [{
+          id: 'remote-only-free', name: 'RemoteFree', contextWindow: 200_000, isFree: true,
+        }])
+        const adapter = makeAdapter({ fetchRemoteModels })
+        // ⚠️ 不先调 listModels：直接问免费判据（模拟「直接进会话」）。
+        await expect(adapter.isFreeModel('remote-only-free')).resolves.toBe(true)
+        expect(fetchRemoteModels, '判据内部必须先拉一次目录').toHaveBeenCalledTimes(1)
+      })
+    })
+
     it('⚠️ 远端目录按账号收缩后，静态表里的模型能力/元数据**不得**退化（审计缺陷 1）', async () => {
       // 实景：国际版有个免费额度号，上游只给它 2 条（qfmodel + dfmodel），
       // 而目录缓存就是「上次成功那个账号的目录」。改造前 `catalogModel()` 只查

@@ -3055,3 +3055,60 @@ PR #102 合并后跑了对抗性审计，它用 **5 条 `if (false)` 型变异**
 **仍未覆盖（如实登记）**：`onDragEnd` 那类「保留方法名、函数体改成 no-op」的变异
 **无法用文本判据区分**（`onDragEnd: ` 后面接 `() => {}` 与接真实现，正则都命中）
 —— 要覆盖它需要 AST 或真 react 渲染，本期不做。
+
+---
+
+## 原生侧栏入口：一个入口要三处 id 同名（2026-10-21）
+
+Jet Hub 之前只有 `settings.section` 一个入口。加成主导航一行之后，**同一个页面**有
+两条入口路径（设置弹层 / 中央主面板），组件与 `rpcCall` 都只有一份。
+
+### ⚠️ 1. `sidebar.panellist.id` == `main.key` == `settings.section.id`
+
+宿主按「侧栏行的 id」去 `main` 槽里查 key（`layout.selectPanel(id)`）。三者不一致时
+界面看起来**完全正常**，只有点下去才会发现「面板没换」—— 而且 `selectPanel` 对未注册
+的 key 是**抛错**，被兜底成「什么都不发生」。本实现统一用
+`JET_HUB_PANEL_KEY = 'jet-hub'`（`plugin-src/client/sidebar-entry-store.js`）。
+
+### ⚠️ 2. 偏好必须落宿主，不能落浏览器存储
+
+Web 端 origin 是 `http://127.0.0.1:<随机端口>`（每次启动都变）⇒ 浏览器存储随旧
+origin 一起被抛弃，症状是「关掉的入口下次启动又回来了」。故走
+`sidebarEntry.getEnabled` / `setEnabled` + `AccountPool` 的内存副本 + **两个**持久化
+后端。⚠️ `SettingsStore.save` 是**整体替换白名单**：漏掉本键时，任何一次账号/黑名单/
+顺序写入都会把它从文档里删掉（与拒绝表、原生搜索开关同型的历史缺陷）。
+
+### ⚠️ 3. 关掉入口时若面板正停在本插件上，要主动 `selectPanel(null)`
+
+否则布局里留着一个再也没有入口的 `activePanelId`。`layout` **不在**插件的 `inject`
+声明里（那是硬依赖，缺了整个插件不激活），用 `ctx.inject(['layout'], scoped => …)`
+拿作用域副本。
+
+### ⚠️⚠️ 4. 单账号卡片不占满：`column flex + align-items: flex-start` 的收缩
+
+`.dim-jh-panelHead` 原是 `display:flex; flex-direction:column; align-items:flex-start`，
+账号列表容器是它的 flex item ⇒ 宽度 = **max-content**。多账号时那句排序提示把容器撑宽，
+所以缺陷**只在单账号**暴露成 ~257px 窄条。
+
+⚠️ **那提示的实际长度**（2026-10-21 实测）：它是 `jet-hub.js` 里**两段拼接**的文案、
+共 **100 字符**，而 `.dim-jh-orderHint` 是 `font-size:12px` ⇒ max-content **约 1200px**
+（初版注释写的「654px」**是错的**，已订正）。⇒「只有单账号暴露」是**有条件**的：
+列表宽 = `min(约1200px, 面板可用宽)`，面板宽超过约 1200px 时多账号同样是窄条（只是没那么夸张）。
+
+修复**不是**给卡片加 `width:100%` —— 那只是等于父容器的 max-content，量出来仍是 257。
+先给容器拉伸（原 PR 的点补丁）：
+
+```css
+.dim-jh-accountList { align-self: stretch; min-width: 0; }
+```
+
+⇒ 教训：flex item 上的 `width:100%` 不是万能药，**先量「谁决定了宽度」**（用
+`document.title`/DOM 覆层把 `offsetWidth` 打出来比猜 CSS 快得多）。
+
+### 5. 客户端状态模块必须无 React
+
+客户端单测是 `environment: 'node'` 且 devDependencies **没有 react** ⇒ 任何 import
+react 的客户端模块都**无法单测**。故把偏好状态拆成 `sidebar-entry-store.js`
+（无 React，可单测），React 组件与槽注册留在 `sidebar-entry.js`；`jet-hub.js` 只
+import store。顺带避免了 `sidebar-entry.js → jet-hub.js → sidebar-entry.js` 的循环。
+

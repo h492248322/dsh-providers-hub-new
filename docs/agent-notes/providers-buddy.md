@@ -218,7 +218,7 @@ UI 表现为 `TraeAdapter.reasoningFor` 返回 `undefined` → 不声明 `reason
 
 要点：
 
-- ⚠️ **两种输入都收敛到同一形态，因此幂等**：完整 11 位（`13011111100`，
+- ⚠️ **两种输入都收敛到同一形态，因此幂等**：完整 11 位（`13999991100`，
   `profile-summary` 返回的就是完整号码）与已脱敏的露 4 位形态，输出都是
   `130******00`。幂等意味着老账号无需重新登录、重复运行不产生新写入
 - ⚠️ **判据只认「像手机号」的形态**：`/^1\d{10}$/`（完整）或
@@ -237,7 +237,7 @@ UI 表现为 `TraeAdapter.reasoningFor` 返回 `undefined` → 不声明 `reason
 排查 / 验证：
 
 - `scripts/probe-lobsterai-profile.mjs` —— 打印 `profile-summary` 的完整响应
-  （**发现 `nickname` 在这里是完整号码 `13011111100`**，与登录响应的脱敏形态不同）
+  （**发现 `nickname` 在这里是完整号码 `13999991100`**，与登录响应的脱敏形态不同）
 - `scripts/verify-lobsterai-nickname.mjs` —— 用真实账号跑一遍
   `repairAccountNicknames` 并打印修复前后昵称（⚠️ **会写真实账号池昵称**）
 - `tests/unit/lobsterai.spec.ts` 的「手机号掩码（只露末 2 位）」段（8 条，
@@ -1340,6 +1340,206 @@ review.`（**11128 各子原因共用/漂移 `displayMsg` 本仓已有先例**�
 —— 它锁的恰恰是缺陷本身。已改为断言**零冷却**，并补一格「msg 是其它 11128 子原因」
 来保住该组原本要验的「渠道校验判据不得靠 `displayTips` 认领」。
 
+### ⚠️⚠️ 第四条指纹：**DSH 自己的身份首句**（2026-10-20 登记；2026-10-21 换措辞）
+
+**与前三条的本质差别**：ZCode / Claude 那三条都是**别的客户端**往 system 里注的
+模板句（换会话、清历史可绕）；这一条是 DSH `base` 段**每轮必带的首句** ⇒ **绕不掉**，
+只能靠 `src/openai-gateway/tencent-fingerprint.ts` 那张表。
+
+| 项 | 值 |
+|---|---|
+| `find` | `You are an AI agent powered by DeepSeek Harness`（刻意不带尾句点，一条覆盖带/不带句点两种形态） |
+| 锚点 | **行首锚定**（与 Claude 身份句同族，与 ZCode / 反馈句**相反**） |
+| 位置 | system 的**绝对首行**（`base` 段）——DSH 每轮必带 |
+
+**2026-10-20 本机对 `copilot.tencent.com` 逐格实测**（判据来自当时的 `replace`）：
+
+| 形态 | 结果 |
+|---|---|
+| 裸串作整个 system（绝对行首） | ❌ 400/11128 |
+| 前接任意前缀（`You are a helpful assistant.\n\n` + 裸串） | ✅ 200 |
+| 改写后裸串（无句点 / 带句点 / 后接正文） | ✅ 200 |
+| 整段真实 system（首句改写，8683 字符） | ✅ 200 |
+| 整段真实 system（首句删除，8624 字符） | ✅ 200 |
+| 时序对照：同一工作区 2026-09-28 的会话，system 首行即本句且当时可用 | ⇒ 该句**一直在行首**，是上游后续才把它纳入名单，不是本机配置变更所致 |
+
+#### 2026-10-21：`replace` 换成**官方同形形态**（用户要求；取证自 CodeBuddy 自己的会话）
+
+**取证路径**（不是读源码推的）：CodeBuddy 中国版的会话落盘在两处 ——
+元数据 `%APPDATA%\CodeBuddy CN\codebuddy-sessions.vscdb`（SQLite，`ItemTable` 的
+`session:<id>` 键），正文
+`%LOCALAPPDATA%\CodeBuddyExtension\Data\<userId>\CodeBuddyIDE\<userId>\history\<工作区 hash>\<会话 id>\messages\*.json`
+（⚠️ `globalStorage\...\genie-history\...\conversations\<id>\` 是**空目录**，
+system 提示词本身**不落盘**）。取用户截图里那条（标题「AI编程助手介绍」，
+id `8c9dbeb10e2846d7b0fa569b14aa4335`）：
+
+- 该会话 assistant 的 **reasoning 逐字复述了自己的 system**：
+  「系统提示说我是 "an AI coding assistant, powered by Hy4 preview model"」；
+- 客户端提示词**资产** `extensions/genie/product.json` 的 `craft-agent-prompt` 首行是
+  `You are an AI coding assistant,{{ ModelNamePrompt }}.`，而该变量渲染成
+  `" powered by <模型展示名> model"`。
+
+两条**独立**来源拼出的字节一致 ⇒ 官方首句是：
+
+```
+You are an AI coding assistant, powered by Hy4 preview model.
+```
+
+**⇒ 与我们那句结构完全同形**，差别只在 **Y 填什么**：
+
+| | 首句 |
+|---|---|
+| DSH（本插件每轮必带） | `You are an AI agent powered by DeepSeek Harness.` |
+| CodeBuddy 官方 | `You are an AI coding assistant, powered by <模型展示名> model.` |
+
+**为什么要改**：旧的 `replace` 是 `You are an AI agent built on the DeepSeek Harness
+runtime` —— 它是「等义改写」，把 `DeepSeek Harness` 这个 token **原样留着**，
+属于「只躲开了字面量、没解决身份」：上游一旦把名单从「整句逐字符」放宽成关键词/正则，
+这一条立刻失效。
+
+**改成了什么**：官方**原生兜底**措辞（模型名缺失时官方发出来的就是这个形态）
+
+```
+You are an AI coding assistant, powered by a large language model
+```
+
+三条取舍：① 出站 system 里**彻底不再出现 `DeepSeek Harness`**（本条的真正收益）；
+② 措辞取自官方资产而**不是自造**；③ **刻意不带具体模型名** —— 那要把 model 透传进
+`rewriteTencentContentFingerprints`（7 处调用点），且我们的目录展示名与官方展示名
+不一定一致，多一处信号反而多一处**不一致**。
+
+✅ **2026-10-21 实发验收通过**（模型 `deepseek-v4.1-flash`，两站各测一次）：
+`buddy` 站裸串仍 `400/11128`、换成新措辞后拿到**干净的 200**；
+`workbuddy` 站本来就放行（见下）。
+
+跑法：`pnpm test:e2e:buddy-fingerprint`（双闸门已绑好）；
+指定模型：`DSH_BUDDY_FINGERPRINT_MODEL=deepseek-v4.1-flash pnpm test:e2e:buddy-fingerprint`。
+其中「当前 `replace` 的措辞实测放行」那一格就是换措辞的**验收条件**，
+它红了要改**措辞**、不是改断言。
+
+#### ⚠️⚠️ 本条是**端点相关**的（登记时只测过 `copilot.tencent.com`）
+
+2026-10-21 两站对照实测（两站都跑满两轮，结果可重复）：
+
+| 站点 | 裸串 + `step-5-preview` | 裸串 + `deepseek-v4.1-flash` |
+|---|---|---|
+| `copilot.tencent.com`（buddy） | ❌ `400/11128` | ❌ `400/11128` |
+| `www.workbuddy.ai`（workbuddy） | ✅ 200 | ✅ 200 |
+
+两个模型都测过 ⇒ **站点差异、不是模型差异**。登记表对 `workbuddy` **仍保留**这条
+改写（措辞语义等义、对该站无害，国际站哪天也上名单时它就是现成的防线），
+但别把「国际站没拦」读成「这条登记多余」—— 它挡的是 buddy 站**每轮必带**的首句。
+
+⚠️ 这条差异是本次实测**新发现的**：那条 2026-10-20 的登记注释只写了
+`copilot.tencent.com + 账号 A`，而 e2e 第 4 节第一版照抄了邻节的「两站都测」写法，
+把**从没测过**的那一格当成已知 ⇒ 实测当场红。**教训：「照抄邻节的站点矩阵」不等于
+「那一格测过」**，与「锚点结论不可跨条推用」是同一条纪律的另一面。
+
+#### ⚠️ 跑这一节时暴露的**四个 e2e 探针缺陷**（都已修，2026-10-21）
+
+它们都会让「跑不通」看起来像「指纹结论」——正是本文件反复警告的那类误判：
+
+| # | 缺陷 | 症状 | 修法 |
+|---|---|---|---|
+| ① | 两站共用**同一个** `BUDDY_*` 账号 | `workbuddy` 恒 **HTTP 401** | 按站点取凭据（`WORKBUDDY_*` / `BUDDY_*`） |
+| ② | 按行正则解析 `.credentials.yaml` | 报「磁盘上没有 workbuddy 凭据」（**明明有 5 个**） | 复用 `image-probe-shared.ts` 的 `credentialFor()`（YAML 单引号标量会**折行**：workbuddy 那条 2,165 字符） |
+| ③ | 两站硬编码同一套 CodeBuddy 头值 | `workbuddy` 恒 `400/11128/msg=request illegal`（**渠道校验**，不是内容级） | 头全部由 `src/product.ts` 现算：`X-IDE-Name`/`X-Product` 是 `attributionName`（`CodeBuddy` vs `WorkBuddy`）、UA 按模型族、另补三枚 `X-Conversation-*` 与 `X-Agent-Purpose` |
+| ④ | 固定用**第一个**账号 | 第一个 workbuddy 账号恰好**被限流** ⇒ 每条断言都红在 `429/code 6004` | 落地本文件一直声明的「**先筛基线放行的账号再固定用它**」（基线 = 中性 system 拿到干净 200；全部不可用则**抛出并逐条列出原因**，不静默跳过） |
+
+⚠️ 另有**一条既有夹具缺陷**（与本轮改动无关、但同批修掉）：`loadTriggerLine()` 取的
+文档那一行现在带 `` `$Js="…"` `` 的双引号与行尾 `\r`，直接拼进 JSON 文本会抛
+`Expected ',' or '}' after property value` ⇒ 角色矩阵里 `reasoning_content` /
+`tool_calls` 两条用例根本**跑不起来**。修法是替换**JSON 转义后**的形态。
+
+**结果**：`pnpm test:e2e:buddy-fingerprint` 全文件 **45/45 通过**（`deepseek-v4.1-flash`，
+连续两轮一致）。
+
+⚠️⚠️ **别把本条读成「封号」判据**：本仓库实测到的通道门控是**按账号 + 三个请求头**
+（IKM7SG），而 11128 的内容级那一支是**字面量黑名单**、不读语义。换措辞的已验证收益
+只有「不再命中那条字面量、出站不带自家 token」这两条；「被上游识别成第三方客户端
+并封号」这一层，**目前没有任何证据**。同理，若将来要「更像官方」，收益最大的不是
+这一句，而是**整体一致性**（官方把 `<user_info>` / `<rules>` / `<project_context>` /
+`<system_reminder>` / `<user_query>` 那套包裹发在 **user 消息**里，见上文的会话落盘）。
+
+⚠️ **本条在 2026-10-21 之前零用例**：`tests/unit/openai-gateway-tencent-fingerprint.spec.ts`
+已补一节（锁「改谁、改成什么、出站不许残留 `DeepSeek Harness`」），但单测**锁不住**
+「新措辞在上游是否放行」—— 那只有 e2e 能验。
+
+⚠️⚠️ **但上面那条「实发验收通过」只覆盖「身份句单独」的情形**。同一天（2026-10-21）晚上
+又发现：真实 system 里 `DeepSeek Harness` **另有**一处能单独拦、且**只改第 1 行不够** ——
+见下一节。**两条必须同时改才放行。**
+
+### ⚠️⚠️⚠️ 第五条指纹：**DSH Web 运行面的开头两句**（2026-10-21 真实报障）
+
+**现象**（用户转来的报障）：「本轮运行失败 `buddy: 请求被拦截，请重新发送
+Illegal API invocation from an unapproved channel`」。报障者的诊断是「黑名单认的是
+`DeepSeek Harness` 这个 token，DSH 的 system 里它出现 3 次，插件只改第 1 行」。
+
+**核对结论：方向对、机制错。**
+
+| 他的说法 | 实测 |
+|---|---|
+| system 里 `DeepSeek Harness` 共 3 次 | ✅ 对（真实 system 5,780 字符：第 **1** 行、第 **33** 行、第 **35** 行；他说的 78/80 只是行数不同） |
+| 只改第 1 行 ⇒ 照样被拦 | ✅ 对，且**已复现** |
+| 「认的是 token 本身」 | ❌ 错：整个 system 只发 `DeepSeek Harness` 两个词 ⇒ **200**；第 33 行那句单独 ⇒ **200** |
+
+**真凶是第 35 行那句** —— `@deepseek-ai/dsh-harness-dev-context` 的 `WEB_SURFACE_PROMPT`
+**前两句**（221 字符）。它**单独就能拦**，且**位置无关**。
+
+#### 逐格实测（2026-10-21；`copilot.tencent.com` + `deepseek-v4.1-flash`；载荷**逐字节**取自本机会话落盘的真实 system；另用**三个不同账号**复测一致）
+
+| 载荷 | 结果 |
+|---|---|
+| 真实整段（3 处都在） | ❌ 400/11128 |
+| 真实整段 + **只改第 1 行**（= 修复前插件发出的形态） | ❌ **400/11128** ← 报障现场 |
+| 真实整段 + 两处都改 | ✅ 200 |
+| 只发第 33 行那句（`HARNESS_SOURCE_PROMPT`） | ✅ 200 ⇒ **不登记它** |
+| 整个 system 只有 `DeepSeek Harness` 两个词 | ✅ 200 ⇒ **不是「认 token」** |
+| 第 35 行**整行**（1,002 字符） | ❌ 400/11128 |
+| 该行**前 220 字符** | ✅ 200 |
+| 该行**前 221 字符** | ❌ 400/11128 ⇒ **字面量 = 前两句** |
+| 切句后的**两半各自**（前一句 107 / 后七句 894） | ✅ 都放行 ⇒ 触发串**跨句边界**，切开会**空跑** |
+| 去掉行首 38 字符 | ✅ 200 ⇒ 字面量**从行首开始** |
+| 中性前言 + 该字面量 | ❌ 400/11128 ⇒ **位置无关** |
+| 该字面量放 **assistant 正文** | ❌ 400/11128 ⇒ 现有改写范围已覆盖 |
+| `www.workbuddy.ai` 站同一载荷 | ✅ 200 ⇒ **站点相关**（与第 4 条同型） |
+| 旧版形态 `…Web GUI at http://127.0.0.1:3080.` | ✅ 200 ⇒ **刻意不登记** |
+
+#### ⚠️⚠️ 为什么我们**连续两次**没抓到这一格（两条同型失误，都值得记）
+
+1. **2026-10-20 那条「整段真实 system（首句改写）✅ 200」用的是不含这两句的载荷**：
+   `dsh-harness-dev-context` **只在 Web 运行时挂载**（它 README 原话：`--help` 与非 Web
+   组合**从不挂载**）⇒ 任何取自 CLI / 桌面面的「真实整段」**天然不含** Web 运行面那句，
+   测出来必然是 200。
+2. **2026-10-21 新写的 e2e 第 4 节又踩了同一个坑**：那格「整段形态」用
+   `'padding. '.repeat(200)` 冒充「长正文」，里面根本没有另外两处 ⇒ 同一格**连续两次**
+   没测到。报障者那句「**只测单句的用例永远抓不到这一格**」说到了根上。
+
+⇒ 可推广：**「真实整段」必须逐字节取自真实落盘的 system**，用填充字符串冒充 = 空跑；
+且**哪个运行面**决定了 prompt 里有没有这句（Web / CLI / 桌面各不同）。
+
+#### 修法与守卫（2026-10-21）
+
+- `src/openai-gateway/tencent-fingerprint.ts` 新增第 5 条：`find` = 该 221 字符字面量，
+  `replace` = 去掉品牌串的等义形态（212 字符），锚点**不做行首正则**（实测位置无关）。
+- 单测 9 条：**两份独立誊写**（源码拼接 / 测试单行）+ 长度断言（221/212）、
+  **前 220 字符必须逐字节不动**（`find` 写短了就红）、**切句两半都不许被改**、
+  大小写、位置无关、assistant、五条互不干扰、幂等。
+- e2e 第 5 节（`pnpm test:e2e:buddy-fingerprint`）：两站各测「拦 / 改写后 200」、
+  220 前缀放行、位置无关、assistant 正文、旧形态**反向断言**、以及
+  **`★★` 多出现位置那一格**（只改第 1 行 ⇒ 仍被拦；两处都改 ⇒ 放行）—— 报障者的原话那一格。
+
+#### ⚠️ 尚未解决的**漂移风险**（如实登记）
+
+上游认的是**逐字符的长字面量** ⇒ DSH 哪天改动这两句里的**任一字符**，第 5 条的 `find`
+会**静默**停止匹配（症状与「完全没登记」**同形**：该渠道整轮 400 复发）。
+当前守卫是单测里那条**读本机会话落盘**的漂移用例（本仓库**唯一**一条读用户目录的单测：
+只读、不打印正文、读不到就自行退回、CI 上会 skip；已做变异验证 —— 往 `find` 里注入
+一个空格，它**精确变红**并指出是哪台/哪个 session 文件）。它**只在本机有效**。
+要不要再加一道**运行时**闸门（例如出站 system 里若仍残留 `DeepSeek Harness` 就告警，
+或干脆按 token 做去标识化），**留待用户决定** —— 后者更抗漂移，但属于「泛化改写」，
+与本文件「表驱动、逐条实测」的纪律相冲突。
+
 ## 模型计费倍率与同名模型（必须写进 `name`，不是 `description`）
 
 **倍率必须拼进 `name`。** 这是被用户报障纠正过的结论：
@@ -1557,7 +1757,7 @@ UI 表现为 `TraeAdapter.reasoningFor` 返回 `undefined` → 不声明 `reason
 
 要点：
 
-- ⚠️ **两种输入都收敛到同一形态，因此幂等**：完整 11 位（`13011111100`，
+- ⚠️ **两种输入都收敛到同一形态，因此幂等**：完整 11 位（`13999991100`，
   `profile-summary` 返回的就是完整号码）与已脱敏的露 4 位形态，输出都是
   `130******00`。幂等意味着老账号无需重新登录、重复运行不产生新写入
 - ⚠️ **判据只认「像手机号」的形态**：`/^1\d{10}$/`（完整）或
@@ -1576,7 +1776,7 @@ UI 表现为 `TraeAdapter.reasoningFor` 返回 `undefined` → 不声明 `reason
 排查 / 验证：
 
 - `scripts/probe-lobsterai-profile.mjs` —— 打印 `profile-summary` 的完整响应
-  （**发现 `nickname` 在这里是完整号码 `13011111100`**，与登录响应的脱敏形态不同）
+  （**发现 `nickname` 在这里是完整号码 `13999991100`**，与登录响应的脱敏形态不同）
 - `scripts/verify-lobsterai-nickname.mjs` —— 用真实账号跑一遍
   `repairAccountNicknames` 并打印修复前后昵称（⚠️ **会写真实账号池昵称**）
 - `tests/unit/lobsterai.spec.ts` 的「手机号掩码（只露末 2 位）」段（8 条，

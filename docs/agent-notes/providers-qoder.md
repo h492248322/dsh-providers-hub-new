@@ -451,3 +451,66 @@ modalities=["text","image"] context={"contextWindow":1000000}`；远端只有 `f
 3. **变异脚本的锚点必须先自证**：CRLF 上 `replace` 会静默不生效；本轮另有两条锚点
    因「把 `await` 移进 `try` 后缩进变了」而失配 ⇒ 必须报 `PATCH-NOT-APPLIED`
    而不是当成「无牙」。
+
+---
+
+## ⚠️⚠️ 审计补记（2026-10-21，!136 / !137 合并后 5 路 subagent 审计）
+
+完整报告：`docs/audit/pr135-138-merge-audit.md`。这里只留与本家直接相关的。
+
+### ① 真缺陷（**已修**）：`isFreeModel` 只查远端 ⇒ 免费模型被判收费
+
+`QoderAdapter.isFreeModel` 原写成 `this.catalogSource().find(...)`，
+而 `catalogSource()` = `remoteModels ?? fallbackModels` —— **远端一落地就把静态表顶掉**。
+本家目录是**按账号**下发的（免费额度号只给 `qfmodel` + `dfmodel`，见本文件上一节）
+⇒ 静态表里标了 `isFree: true` 的模型被判「未知 ⇒ 非免费」
+⇒ 跳过「免费模型不受锁定约束」的短路 ⇒ 锁定永久积分时被 `allowPermanent=false`
+拦下、报出「额度都属于永久」这类**与事实相反**的错误 ⇒ **本家 2026-10-21 报障原地复发**。
+
+实测（`lib/` 重建后真跑）：
+
+```
+①远端收缩目录（无免费） isFreeModel(qmodel_38max) = false   ★ 应为 true
+②远端只含 qmodel_38max isFreeModel(qfmodel)       = false   ★ 应为 true
+③未接线远端            isFreeModel(qmodel_38max) = true    ✓
+```
+
+⚠️⚠️ **同一文件的 `catalogModel()` 注释逐字记过这个反模式**
+（「第一版把它写成 `catalogSource().find(...)`，被独立审计打穿」）——
+能力判据当时改对了，**免费判据又写回了它**。⇒ 改任何「按 id 查目录」的判据前，
+**先看 `catalogModel()` 的注释**，用它、别用 `catalogSource()`。
+
+⚠️ **判据方向不对称**（为什么必须保守）：判**收费**只是用不上（可恢复）；
+判**免费**会绕过锁定**真烧永久积分**（不可逆）。
+
+### ② 真缺陷（**已修**）：`fetchQoderBalanceDetailed` 会抛 ⇒ 并发批量隔离失效
+
+`creditsHeaders` 原本在 try **之外**（!136 把串行 `for` 改成 `Promise.all` 时漏了它）
+⇒ 凭据形状异常（如解码出 `null`）时它抛 ⇒ `Promise.all` reject
+⇒ **整批** `credits.balances` 变 `ok:false` ⇒ 客户端把同一句 message 盖到
+**每一个**账号卡片上。⇒ 已包进 try，返回 `{balance:null, error:'…（凭据不可用）'}`。
+
+### ③ 文案（**已修**）：`remedy` 不得写死站点、不得断言机制
+
+原写死「Qoder **国际版**端点在本机被阻断（TCP 能连通、TLS 握手被丢）」，
+而该分支被 `isQoderFamily` **两站共用** ⇒ 中国版用户读到与同一句里主机名
+自相矛盾的结论；且对 `ENOTFOUND`（DNS）说「TCP 能连通」是事实性错误。
+⇒ 只留出路（站点由 `subject` 主机名点名）。
+
+### ④ **未修**（已登记，**需真机才能定稿**）：兜底表 `dfmodel` 无 `isFree`
+
+两站 `dfmodel` 都没有 `isFree`（`priceFactor: 0.1`），而本文件记着上游它是
+`price_factor = 0` + `is_free`（0.1 是被划掉的原价）
+⇒ 远端不可用时（兜底路径）`isFreeModel('dfmodel') = false`，而 !137 的 spec
+头注释把 `DeepSeek-Flash` 当免费模型之一。
+
+⚠️ **为什么不直接补 `isFree: true`**：若上游的 `is_free` 是**按账号**下发的，
+把它写进**静态**兜底表会让**付费账号**被判免费 ⇒ **绕过锁定烧永久积分**（不可逆）。
+⇒ 需先真机确认「付费账号下 `dfmodel` 是否仍 `is_free`」。
+
+### ⑤ 前端还差一格收窄（**未修**，前向防御）
+
+后端 `splitBuddyCreditsByExpiry` 已把 `deductionEndTime` 的判据**收窄**为
+「只接受 `number` 或数字字符串」（挡住了 `true → 1` 与 `[ms] → 单元素数组`
+这两格），而**前端 `packageExpiryMs` 仍是裸 `Number()`** ⇒ 同样两格两站分叉。
+可达性低（写入方都同时给 `deductionEndTime`）⇒ 登记为前向防御缺口。

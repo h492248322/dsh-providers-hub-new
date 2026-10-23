@@ -634,7 +634,7 @@ mode  = CFB, padding = NoPadding
 因为 `100002 params_invalid_error: param phone invalid` **无法区分**
 「号码格式错」与「该区号不支持」，不做未验证的猜测。
 
-### 11. ⚠️ `tags` 里的 `vision` **不是**图片能力契约（真实缺陷，用户 2026-10-03 报障）
+### 11. ⚠️ 图片能力：**默认支持**，只禁真正的纯文本模型（2026-10-03 / 10-21 两次漏判）
 
 **症状**：给 `sn-deepseek-v4-1-flash`（DeepSeek-V4.1-Flash）发图，模型回
 「无法读取图片 / 不支持图片」。
@@ -672,18 +672,35 @@ mode  = CFB, padding = NoPadding
 | `sn-kimi-k3` | ✅ | ✅ 1/1 |
 | `sn-glm-5-3` | ✅ | ⚠️ **1/3**（provider 侧节点不一致，见下） |
 
-⇒ **6 个可见模型全部能读图**。`tags` 的真实用途是**客户端「Raccoon-Auto 选模」的
+⇒ **6 个兜底可见模型全部能读图**（2026-10-21 远端新增的
+`sn-deepseek-v4-1-flash-1017` 同样实测 200 / 四色全对，见下）。`tags` 的真实用途是**客户端「Raccoon-Auto 选模」的
 偏好标签**（`TASK_TAG_PATTERNS` 给消息打 vision 标记后挑一个带 `vision` 的模型），
 它回答的是「该模型适不适合处理这类任务」，**不是**「能不能吃图」。
 
-**修法**（与 `buddy-adapter.ts` 的 `IMAGE_CAPABILITY_OVERRIDES` 同构）：
-`RACCOON_IMAGE_CAPABILITY_OVERRIDES` 白名单 + `raccoonSupportsImage(id, tags)`，
+**修法（2026-10-21 策略翻转：默认支持 + 纯文本黑名单）**：
+判据是 `raccoonSupportsImage(modelId)` —— **默认返回 `true`**（声明
+`['text','image']`），只把实测确认的纯文本模型登记到 `RACCOON_TEXT_ONLY_MODELS`
+里**显式禁掉**；判定内核 `raccoonSupportsImageWith(textOnly, id)` 入参化，
+否则空集合下「纯文本被禁」那条分支永远测不到。
 **两条路径都要改** —— 远端解析（`raccoon-auth.ts`）与本地兜底表（`raccoon-product.ts`）。
-⚠️ 兜底表与远端判定是**两个真相源**，用单测「兜底表的图片能力与远端实测 tags 判定
-逐条一致」锁死，防它们悄悄分叉（同 Qoder「两处等待逻辑必须共用同一实现」的教训）。
+⚠️ 兜底表与远端判定是**两个真相源**，用单测「兜底表的图片能力与远端判定逐条一致」
+锁死，防它们悄悄分叉（同 Qoder「两处等待逻辑必须共用同一实现」的教训）。
 
-⚠️ **别改成「该家恒支持图片」**：白名单只覆盖**实测确认**的个案，将来上架纯文本
-模型时，恒 true 会把图放行、让上游回一个更难懂的 400 —— 错误更晚、更难排查。
+**为什么从白名单翻转为黑名单**（两次漏判）：
+
+1. 2026-10-03：`tags` 不含 `vision` 的 `sn-deepseek-v4-1-flash` 被判 text
+   —— 当时用「精确 id 白名单」修；
+2. 2026-10-21：远端上架同族新版本 `sn-deepseek-v4-1-flash-1017`（`tags` 逐字
+   相同、仍无 `vision`）⇒ 精确 id 查不到 ⇒ 又被打回 text。实测该 id 带图 200、
+   四象限色 `红/绿/蓝/白` 全对（与无后缀版一致）。
+⇒ 白名单式判据**必然腐坏**（远端每次滚版本都要补一次静态表），故改为
+「默认 image + 纯文本黑名单」；黑名单同样按**基础 id**（剥末尾 `-NNNN`）命中，
+否则纯文本模型滚版本后也会漏禁。
+
+⚠️ **代价（必须知道）**：若远端上线**真正的纯文本模型**而没及时登记，DSH 会放行
+图片、上游则可能**静默忽略**（不是报错）⇒ 模型凭文字幻觉作答（accio 的 GLM 5.1
+实测同型）。⇒ 黑名单是唯一刹车，新增条目必须先实测「带图被**明确拒绝**」，
+而不是「200 但答非所问」。
 
 ⚠️ **实测时的两个坑**（否则会得到假的「不支持」）：
 
@@ -703,9 +720,11 @@ fallback 组（`raccoon-4eb26a` / `raccoon-0c119c` / `raccoon-ecc5fd`），
 排查脚本（只读、gitignored）：`scripts/probe-raccoon-vision.mjs`（打远端原始
 条目）、`scripts/probe-raccoon-vision-real.mjs`（真实发图，支持 `PROBE_MODELS`
 与 `NO_THINKING=1`）、`scripts/probe-raccoon-catalog-fields.mjs`（穷举键并集）。
-回归用例在 `tests/unit/raccoon-product.spec.ts` 的「图片能力判定（tags 不是能力
-契约）」段与 `tests/unit/raccoon-adapter.spec.ts` 的两条 ⚠️ 用例。
-⚠️ 已做**反向验证**：白名单清空 → 4 条变红；兜底表改回 `false` → 2 条变红。
+回归用例在 `tests/unit/raccoon-product.spec.ts` 的「图片能力判定（默认支持，
+纯文本模型显式禁掉）」段，与 `tests/unit/raccoon-adapter.spec.ts` 的三条 ⚠️ 用例
+（默认 image / 未知新模型 image / 纯文本集合 text，均含版本后缀形态）。
+⚠️ 已做**反向验证**：短路「基础 id 命中黑名单」那两行 → 2 条变红；把默认
+`return true` 改成 `false` → 7 条变红。
 
 ### e2e 探针
 

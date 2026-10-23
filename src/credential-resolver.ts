@@ -196,6 +196,28 @@ export interface LoomySelectorLike {
 }
 
 /**
+ * 显式声明「**本家没有免费模型概念**」的 `isFreeModel` 实现。
+ *
+ * ## 为什么需要这个常量（而不是让字段可选）
+ *
+ * `isFreeModel` 曾经是**可选**字段。于是新增一家 `balance: { kind: 'buddy' }`
+ * 装配时，漏传它 **既没有编译报错、也没有运行时报错** —— 只是静默地让该家的
+ * 免费模型走付费路径，被「锁定永久积分」拦住，报出「额度都属于永久」这种与
+ * 事实相反的文案，并把用户推向「解锁永久积分」（不可逆烧钱）。
+ *
+ * 这正是 Qoder 的实际事故：`src/qoder-adapter.ts` 的兜底表早在 `isFree: true`
+ * 上标好了 4 个免费模型，`toCatalogEntry` 也把 `isFree` 透出给了 UI，唯独
+ * 装配层漏了这三个字。同类缺陷此前在 buddy / workbuddy / trae 已经复发过一轮。
+ *
+ * ⇒ 把它改成**必填**后，新增渠道时漏写是**编译错误**。确实没有免费模型的渠道
+ * 用本常量显式表态，语义比裸写 `() => false` 清楚得多（后者读起来像「忘了实现」）。
+ *
+ * ⚠️ 只有**核实过**该家确实不存在模型级免费概念时才可以用它。判据是「产品/
+ * 兜底表里没有任何 `isFree: true`，且上游目录不返回 `is_free`」，不是「懒得查」。
+ */
+export const NO_FREE_MODEL = (): false => false
+
+/**
  * **buddy 协议**的余额分档计划（buddy / workbuddy / lobsterai / trae 四家共用）。
  *
  * 编排本身直接复用 `pickBuddyAccount`（**已导出的共享实现**），本模块不再手写
@@ -215,11 +237,14 @@ export interface BuddyBalancePlan {
   /**
    * 本次请求的模型是否**免费**（消耗 0 积分）。免费时**跳过**余额分档。
    *
+   * ⚠️ **必填**（原为可选，见 {@link NO_FREE_MODEL} 的事故说明）。没有免费
+   * 模型概念的渠道请用 `NO_FREE_MODEL`，不要删字段。
+   *
    * ⚠️ 必须是**已确认**的免费：`true` 会跳过余额分档（即不受锁定约束），
    * 误判成免费会让付费模型绕开锁定、真烧掉永久积分。故判据在适配器里，
    * 只在能确认 0 积分时才返回 true。
    */
-  readonly isFreeModel?: (modelId?: string) => Promise<boolean> | boolean
+  readonly isFreeModel: (modelId?: string) => Promise<boolean> | boolean
   /**
    * 分档**选中账号**时是否回报 `reportAccount`。缺省 `true`。
    *
@@ -353,7 +378,9 @@ export function createCredentialResolver<TCredential>(
       // ⚠️ `isFreeModel` **先于**候选构造求值：与旧闭包「在 options 字面量里
       //    await」的时序一致（它可能触发远端目录拉取，放到候选之后会把
       //    「先拉目录、再筛候选」这个顺序反过来）。
-      const free = plan.isFreeModel === undefined ? false : await plan.isFreeModel(modelId)
+      // ⚠️ 字段现为**必填**（`NO_FREE_MODEL` 是「本家无免费模型」的显式表态），
+      //    故不再需要 `=== undefined` 兜底 —— 那种兜底正是 Qoder 漏接三周的遮掩。
+      const free = await plan.isFreeModel(modelId)
       const candidates = candidatesOf(deps.pool, providerId, modelId)
 
       // ① 免费模型（消耗 0 积分）不受「锁定永久积分」约束：锁定要保护的是

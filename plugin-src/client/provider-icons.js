@@ -311,10 +311,15 @@ export const PROVIDER_ICONS = {
   autoclawintl: AUTOCLAW_ICON,
   modelscope: MODELSCOPE_ICON,
   aggregate: AGGREGATE_ICON,
-autoclaw: AUTOCLAW_ICON,
-modelscope: MODELSCOPE_ICON,
-// ⚠️ Codely（Unity）：UI 先行阶段（registry 里 channel:false），但图标键集合
-//    守卫按**全量** registry 比对 —— 漏加这行会红（而非渲染空白图标）。
-codely: CODELY_ICON,
-aggregate: AGGREGATE_ICON,
+  // ⚠️ Codely（Unity，本 fork 独有）：UI 先行阶段（registry 里 channel:false），
+  //    但图标键集合守卫按**全量** registry 比对 —— 漏加这行会红（而非渲染空白图标）。
+  //
+  //    ⚠️⚠️ **本行必须留在 `}` 之前、且不得与上面的键重复**（2026-10-22 合并审计）：
+  //    PR #1 的 `b69e6736 feat(codely)` 在追加本行时，把 `autoclaw` / `modelscope` /
+  //    `aggregate` 三个键**又抄了一遍**（缩进也丢了）。重复键在 JS 里是「后者胜」，
+  //    键集合不变 ⇒ **上面那条 `Object.keys()` 守卫照样全绿**，只有 esbuild 的
+  //    `duplicate-object-key` 警告能发现它。三个值恰好相同所以当时没有功能后果，
+  //    但「守卫全绿 + 有警告」这种组合正是本仓库记过的「假绿」形态：
+  //    一旦哪天两处值不同，就会变成静默用错图标而无人报警。
+  codely: CODELY_ICON,
 };

@@ -69,9 +69,11 @@
 
 import { roundCredits, type CheckinStatus, type ClaimOutcome, type CreditBalance, type CreditPackage } from './credits.js'
 import { QODER_BILLING_UTC_OFFSET_MS } from './model-queue.js'
+import { networkBlockedHint } from './network-hint.js'
 import { withQoderMachineHeadersAsync } from './qoder-machine.js'
 import { qoderBearerToken, type QoderCredential } from './qoder.js'
 import type { QoderProduct } from './qoder-product.js'
+import type { ProviderBalanceDetail } from './provider-runtime.js'
 
 /** 用量接口路径（挂 `openApiBase`）。 */
 export const QODER_USAGE_PATH = '/sash/api/v2/me/usage'
@@ -585,42 +587,175 @@ export async function fetchQoderCreditBalance(
   product: QoderProduct,
   fetcher: typeof fetch = fetch,
 ): Promise<CreditBalance | null> {
-  let response: Response
+  const detailed = await fetchQoderBalanceDetailed(credential, product, { fetcher })
+  return detailed.balance
+}
+
+/** {@link fetchQoderBalanceDetailed} 的可选项。 */
+export interface QoderBalanceOptions {
+  /** 注入 fetcher（测试用；生产用全局 `fetch`）。 */
+  fetcher?: typeof fetch
+  /**
+   * 单次请求超时（毫秒）。默认 {@link QODER_CREDITS_TIMEOUT_MS}。
+   *
+   * ⚠️ 面板**并发**查询所有账号（2026-10-21 起），故 N 个账号的最坏总耗时
+   *    约等于**单账号**的耗时，不再线性叠加。但单账号本身仍可能耗满本值：
+   *    国际版被 SNI 阻断时实测 10.7s（undici 自己的 connect timeout 先于
+   *    本值触发）⇒ 调小本值**不会**让墙外的失败更快返回，只能调大。
+   */
+  timeoutMs?: number
+}
+
+/**
+ * 查询 Qoder 账号积分余额，**失败时带上可读原因**（Jet Hub 面板用）。
+ *
+ * ## 为什么需要这个并列函数（而不是改造上面那个）
+ *
+ * `fetchQoderCreditBalance` 的契约是「查不到就 `null`」—— 它服务于
+ * `BuddyBalanceSelector`（选号/分档，只关心金额）与 `sharedPackageExpiry`
+ * （折算到期，只关心日期）。那两处**不需要**原因，硬塞原因会让 20 多处
+ * `balance!.total` 断言全破。
+ *
+ * 但**面板**需要原因：原实现的报障形态是「一直读取中」，最终只落到一句
+ * 「积分查询失败（凭据失效或响应异常）」—— 这句话把**网络不通**、**401**、
+ * **响应变形**、**企业版无数字**四种完全不同的处境压成同一句，用户无法据此
+ * 做任何事。实测本机 Qoder 国际版：`openapi.qoder.sh` 的 TCP 443 能连通
+ * （93ms），但 **TLS ClientHello 被丢**（12s 无响应），故 `fetch` 必在 10.7s
+ * 后报 `UND_ERR_CONNECT_TIMEOUT` —— 这是**环境问题**，不是凭据问题。
+ *
+ * ## 判据分层（与 `astudio-credits.ts` 的 `fetchAstudioBalanceDetailed` 同款）
+ *
+ * 1. **传输层**：`aborted` / 错误码命中「出不去」⇒ 点名实际主机 + 出路。
+ * 2. **HTTP 层**：401/403 = 凭据；其它非 2xx = 服务端（带状态码）。
+ * 3. **形状层**：非 JSON / 非对象 / 缺 `qoderUsage` / 一个包都没解析出来。
+ * 4. **企业版**：`displayMode === 'enterprise'` ⇒ 上游本就不给数字（不是故障）。
+ *
+ * @returns 成功时 `{ balance }`；失败时 `{ balance: null, error }`。
+ *   ⚠️ 永远返回 `balance` 字段（共享骨架靠 `balance` 判定成败，
+ *   `error` 只影响文案 —— 见 `provider-runtime.ts` 的 `ProviderBalanceDetail`）。
+ */
+export async function fetchQoderBalanceDetailed(
+  credential: QoderCredential,
+  product: QoderProduct,
+  options: QoderBalanceOptions = {},
+): Promise<ProviderBalanceDetail> {
+  const fetcher = options.fetcher ?? fetch
+  const timeoutMs = options.timeoutMs ?? QODER_CREDITS_TIMEOUT_MS
+  const url = `${product.openApiBase}${QODER_USAGE_PATH}`
+  /**
+   * ⚠️⚠️ **构造请求头必须在 try 内**（2026-10-21 合并审计发现，!136 引入的回归）。
+   *
+   * `creditsHeaders` 会抛（凭据形状异常等），而本函数的契约是「**本身不抛**」——
+   * 它一抛，`src/jet-hub-rpc.ts` 的 `Promise.all` 失败隔离就失效：
+   * 一个坏账号让**整批** `credits.balances` 变成 `ok:false`，客户端把同一句
+   * message 盖到该 provider 的**每一个**账号卡片上 —— 按账号给原因的能力
+   * 在异常路径上一次性全丢。
+   *
+   * ⚠️ 并发改造**之前**是串行 `for` + 每格自己的错误分支，所以那时抛不出去；
+   *    改成 `Promise.all` 时必须把这条腿一起包进来。实测对照：
+   *    BASE（改动前）同一路径返回 `null`，HEAD 抛出 ⇒ 隔离确实被打破。
+   *
+   * ⚠️ 文案**不要**复用下面那条「网络异常」——凭据构造失败不是网络问题，
+   *    照实说「凭据不可用」并带上根因（别吞 message）。
+   */
+  let headers: Record<string, string>
   try {
-    response = await fetcher(`${product.openApiBase}${QODER_USAGE_PATH}`, {
-      method: 'GET',
-      headers: await creditsHeaders(credential, product),
-      signal: AbortSignal.timeout(QODER_CREDITS_TIMEOUT_MS),
-    })
-  } catch {
-    // 网络失败：返回 null（与其它 provider 同语义），不抛错。
-    return null
+    headers = await creditsHeaders(credential, product)
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error)
+    return { balance: null, error: `积分查询失败（凭据不可用）：${reason}` }
   }
 
-  // 401/403 是凭据问题，其它非 2xx 是服务端问题 —— 两者都返回 null，
-  // 由调用方统一显示「查询失败」原因。
-  if (!response.ok) return null
+  let response: Response
+  // 自己 arm 的超时是否真的触发 —— `AbortSignal.timeout()` 超时**不带** `UND_ERR_*`
+  // 错误码（IKLTZ2 审计 P2-2 的实际教训），只能靠读 `signal.aborted` 判断。
+  // ⚠️ 这里**必须**自己持有 controller 才能读到；用 `AbortSignal.timeout()` 的
+  //    返回值虽然也是 AbortSignal，但它在 catch 时才 aborted，语义等价 ——
+  //    故仍直接用它，只是要在 catch 里读一次 `.aborted`。
+  const timeoutSignal = AbortSignal.timeout(timeoutMs)
+  try {
+    response = await fetcher(url, { method: 'GET', headers, signal: timeoutSignal })
+  } catch (error) {
+    const hint = networkBlockedHint({
+      error,
+      aborted: timeoutSignal.aborted,
+      subject: product.openApiBase,
+      /**
+       * ⚠️ **只给出路，不断言机制**（2026-10-21 合并审计发现）。
+       *
+       * 旧文案写死「Qoder **国际版**端点在本机被阻断（TCP 能连通、TLS 握手被丢）」，
+       * 两处都错：
+       * ① 本分支被 `isQoderFamily` **两站共用** ⇒ 中国版用户在自己公司网络里失败时，
+       *    会读到与同一句里打印的主机名（`product.openApiBase`）**自相矛盾**的结论；
+       * ② `remedy` 是常量 ⇒ 不论命中哪个码照发，而对 `ENOTFOUND`（DNS 解析不到）
+       *    说「TCP 能连通」是**事实性错误**。
+       * ⇒ 站点已由 `subject`（主机名）点名，机制留给用户自己看码；
+       *    这里只保证**出路**是可操作的（本插件目前**没有**按账号配代理的按钮，
+       *    故只能说「换网络 / 启动前导出 HTTPS_PROXY」）。
+       */
+      remedy: '插件进程不走系统代理；请在能直接访问该地址的网络下使用，'
+        + '或为插件进程配置出口代理后在启动 DSH 前导出 HTTPS_PROXY。',
+    })
+    if (hint !== undefined) return { balance: null, error: hint }
+    // 不是「出不去」⇒ 老实说清楚是什么（含 message，别吞）。
+    const reason = error instanceof Error ? error.message : String(error)
+    return { balance: null, error: `积分查询失败（网络异常）：${reason}` }
+  }
+
+  // 401/403 是凭据问题，其它非 2xx 是服务端问题 —— 两者原因不同，不能混。
+  if (!response.ok) {
+    const status = response.status
+    if (status === 401 || status === 403) {
+      return {
+        balance: null,
+        error: `积分查询失败（HTTP ${status}，登录已失效）：请删除该账号后重新登录 Qoder`,
+      }
+    }
+    return { balance: null, error: `积分查询失败（HTTP ${status}）` }
+  }
 
   let body: unknown
   try {
     body = await response.json()
   } catch {
-    return null
+    return { balance: null, error: '积分查询失败（响应不是 JSON）' }
   }
 
-  if (typeof body !== 'object' || body === null || Array.isArray(body)) return null
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+    return { balance: null, error: '积分查询失败（响应不是对象）' }
+  }
   const root = body as Record<string, unknown>
 
-  // 企业版：无额度数字，只有外部链接。返回 null 而非 0（见函数注释）。
-  if (root.displayMode === 'enterprise') return null
+  // 企业版：无额度数字，只有外部链接。这不是故障 ⇒ 原因写清「上游不给数字」。
+  if (root.displayMode === 'enterprise') {
+    return {
+      balance: null,
+      error: '企业版账号不提供额度数字（上游只给网页版用量链接），请在 Qoder 网页端查看',
+    }
+  }
 
   const usage = root.qoderUsage
-  if (typeof usage !== 'object' || usage === null) return null
+  if (typeof usage !== 'object' || usage === null) {
+    return { balance: null, error: '积分查询失败（响应缺少 qoderUsage 字段）' }
+  }
 
+  const parsed = parseQoderUsage(usage as Record<string, unknown>)
+  if (parsed === null) {
+    return { balance: null, error: '积分查询失败（响应未包含任何额度包）' }
+  }
+  return { balance: parsed }
+}
+
+/**
+ * 从 `qoderUsage` 对象解析出余额（纯函数，`fetchQoderCreditBalance` 与
+ * `fetchQoderBalanceDetailed` 共用**同一份**解析 —— 红线：同一语义只留一处）。
+ *
+ * @returns 解析不出任何包时 `null`（= 查不到，而非余额 0）。
+ */
+function parseQoderUsage(qoderUsage: Record<string, unknown>): CreditBalance | null {
   const packages: CreditPackage[] = []
   // 顺序即展示顺序：套餐额度 → 赠送/资源包 → 专用资源包（⚠️ 顺序与「一个包都
   // 解析不出来就返回 null」这两条是**既有的、本次不动**）。
-  const qoderUsage = usage as Record<string, unknown>
   // ⚠️ `usage.expiresAt`（数字毫秒）**只传给 `userQuota` 那一条** ——
   //    它的语义归属就是套餐额度，不是 `addOnQuota`（那一层只给聚合标量、
   //    连日期字段都没有），也不是任何逐包到期（那些走各自的 `expiredTime`）。

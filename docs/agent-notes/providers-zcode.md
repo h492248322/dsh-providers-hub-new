@@ -2248,6 +2248,343 @@ for (const account of accounts) {              ← jet-hub-rpc.ts 的逐账号�
    撞到 3012 时拿到的就是**上游能查日志的凭据** —— 归因从「猜」变成「可查」；
 3. 脚本**已就位**（在 `scripts/`，被 gitignore），下次直接跑即可。
 
+---
+
+## ⚠️⚠️ 营销投放（1024 程序员节）与**客户端版本门控**（用户报障，2026-10-23）
+
+**用户报障原文**：
+
+> 「我在 scoop 中装了 zcode 最新版 3.16.3，其中有 1024 程序员节送的 5 亿 token，
+>  （截图）**把这个领取功能集成在每日签到中一并领取**，只有 zcode 中国版有，
+> 国际版好像没有」
+
+### 一、先钉住结论：这不是「多一个活动」，而是**签到漏了一个来源**
+
+| | 端点 | 实测（本机 4 个账号，全部一致） |
+|---|---|---|
+| 每日赠送 | `GET /api/v1/zcode-plan/billing/preview` | `data.plans` 里有 `…start-plan-trust-…`（有投放时） |
+| **营销投放** | `GET /api/v1/marketing/touch` | **1024 活动只在这里** |
+| 余额桶 | `GET /api/v1/zcode-plan/billing/balance` | `balances: []`（活动未领前为空） |
+
+**决定性判据**：领取 1024 的账号，`preview.plans` 与 `balance.balances`
+**都是空数组**，而 `marketing/touch` 里明明有横幅。
+⇒ 只查 preview 的签到，**与「今天没有活动」在 wire 上完全同形**
+（都是 `plans: []`），永远不会去领它。这就是「官方客户端有、插件借不到」的全部原因。
+
+### 二、逆向取证（scoop 安装版 `resources/app.asar`，341 MB）
+
+⚠ 本机实际是 **3.16.2**（`3.16.3` 是用户口述的版本；活动是**按请求头**版本门控的，
+与本机安装版本无关，见第三节）。读取方法与 §7.1 同（asar 头 + JSON 表尾部填充）。
+
+| 事实 | 出处（asar 内路径 + 符号） |
+|---|---|
+| 投放查询与回执 | `out/host/index.js` 的 `createMarketingTouchService`：`GET /api/v1/marketing/touch?seq=<n>`、`POST /api/v1/marketing/touch/action` |
+| 请求头只有**四个** | 同上：`X-Device-Mid` / `X-Client-Language` / `X-ZCode-App-Version` /（可选）`Authorization` |
+| 投放 schema | `out/renderer/assets/src-oukR4Y1K.js`：`resource_position` = `banner` \| `popup`，按钮 action ∈ `close` / `open_url` / **`claim_zcode_plan{plan_id}`** / `navigate` / `copy_text` |
+| **点击后走哪** | `out/host/index.js` 的 `claimManualPlan(planId)` → **`POST /api/v1/zcode-plan/billing/claim`**，body `{plan_id}`，带 `Authorization` + **captcha 头** |
+| 成功后回执 | `out/renderer/assets/styles-n-UNIiNg.js`：动作成功后立刻 `p(delivery, 'confirm')` |
+| 需要 captcha 的旁证 | i18n `manualClaimPlan.claim.failure.captcha`＝「Captcha verification failed.」（`out/renderer/assets/IntlProvider-C2IbGUkl.js`） |
+
+**★ 最关键的一条**：`claimManualPlan` 用的**就是我们既有签到用的同一个 claim 端点、同一套 captcha**
+⇒ 集成只需要「多一个 plan 来源 + 一次回执」，**不需要**新协议、新验证机制。
+
+### 三、⚠️⚠️ 版本门控：同一个账号、同一套头，**只改一个字段**结果完全不同
+
+本机只读实测（`scripts/probe-zcode-marketing-touch.mjs`，4 个账号，只发 GET）：
+
+| `X-ZCode-App-Version` | `marketing/touch` 的 `data.deliveries` |
+|---|---|
+| `3.14.3`（**插件凭据里记的版本**） | **`[]`（空）** |
+| `3.16.3` | `[{campaign_id:"2113475573403824128", …}]` ★ |
+
+且「完整头集」与「官方最小头集」**结果相同** ⇒ 判据只有版本这一个变量。
+
+官方文案也印证：`manualClaimPlan.claim.failure.ineligible`
+＝「当前账号或**客户端版本**不满足领取条件」。
+
+⚠ **因此必须按请求覆盖版本**（`ZCODE_VERSION_GATED_MIN_APP_VERSION`），
+而**不能**去改凭据里的 `app_version`、也**不能**全局抬
+`ZCODE_APP_VERSION_FALLBACK`：推理 / 额度 / 领取三条路径的既有实测结论
+（含 §「3012 的消融矩阵」那一整表）都是在 3.14.3 上取到的，
+无证据地整体抬版本会把这些结论一起作废。
+落地形态：`buildZcodeHeaders` 新增可选的 `appVersion` 覆盖，**只有营销请求**传它。
+
+⚠ **下限未二分**：只测了 `3.14.3` 空 / `3.16.3` 有，中间档没测。
+取值即「与用户官方客户端同版本」，**不声称 3.16.3 是最低下限**。
+
+#### 3.1 ⚠️⚠️ **领取端点（claim）也受同一个门控** —— 只抬投放的版本会「看得到、领不到」
+
+**这条是真机一发定音**（`scripts/probe-zcode-claim-version-gate.mjs`，同一账号、
+**其余头完全相同**，只改 `X-ZCode-App-Version`）：
+
+| 版本 | `POST /zcode-plan/billing/claim` |
+|---|---|
+| `3.14.3`（凭据里的） | **`400 / code 1004 "no permission"`** ← 官方文案 `ineligible`＝「当前账号或**客户端版本**不满足领取条件」 |
+| `3.16.2` | **`200 / code 0`** + `data.plan.{user_plan_id, status:"active", entitlements:[3 亿 + 2 亿]}` ★ |
+
+⚠⚠ **形态极具误导性**：`1004` 读起来像「这个账号没资格」，而真实原因是
+**我们报的版本号旧了**。第一次用生产路径（`claimDailyFor`）跑就是这个结果 ——
+「活动查得到、却领不到，且理由看起来像账号问题」。
+
+⚠ 官方客户端 claim 同样报自己的版本：`app.asar` → `out/host/index.js` 的
+`claimManualPlan` 用 `'X-ZCode-App-Version': Ir`，而本机 `Ir` 即客户端版本
+`3.16.2`（同文件 `var Vu="3.16.2"`）⇒ **报 3.14.3 的一直是我们**。
+
+⚠ **顺带纠正一条逆向读法**：官方 `claimManualPlan` 的**显式** headers 里
+**没有** `X-Device-Mid`，但**照抄它会回 `3001 parameter error`** ——
+因为那层公共头由 `Fa(this.apiClient, …)` 注入，**在片段里看不见**。
+⇒ 照抄「显式 headers」时，必须把「封装层注入的公共头」一起算上。
+
+⚠ **两个端点必须同抬**：`fetchZcodeMarketingPlans` 与 `claimZcodePlan`
+都过 `zcodeVersionGatedAppVersion()`（同一份实现，不许各写一份）。
+**每日赠送 plan 的领取在抬高版本下的表现未单独实测**，但官方客户端
+（3.16.2）自己也在领它 ⇒ 风险低（如实登记）。
+
+### 四、1024 活动的实际形状（实测原文，测试 fixture 逐字取自它）
+
+```json
+{ "campaign_id": "2113475573403824128", "resource_position": "banner", "priority": 50,
+  "banner": {
+    "buttons": [ { "action": { "type": "close" } },
+                 { "action": { "type": "claim_zcode_plan",
+                               "args": { "plan_id": "zcode-v3-start-plan-1024" } } } ],
+    "background": { "args": { "zcode_plan": {
+      "plan_id": "zcode-v3-start-plan-1024", "name": "ZCode 1024 Dev Day", "priority": 101,
+      "starts_at": 1792756800, "ends_at": 1792976400,
+      "entitlements": [
+        { "show_name": "GLM-5.3-Flash", "unit_type": "token", "grant_units": 300000000 },
+        { "show_name": "GLM-5.3",       "unit_type": "token", "grant_units": 200000000 } ] } } } } } }
+```
+
+⇒ **3 亿 + 2 亿 = 5 亿**，正是用户截图那行「5 亿 TOKENS」。
+
+⚠⚠ **额度必须**求和**，不能只取 `entitlements[0]`**：`fetchZcodeClaimablePlans`
+（preview 那条）历来只取第一条 —— 那条路径实测每个 plan 只有一条 entitlement，
+**故刻意不动它**；营销这条一个 plan 有多条（按模型分），只取第一条会**少报 2 亿**。
+两条路径各有实测依据，**分开实现、分别钉住**。
+
+⚠ 同一份 `zcode_plan` 元数据被服务端**镜像**到多个资产位
+（`banner.background.args` 与 `success_popup.hero.args` 各一份，实测如此）
+⇒ 解析必须**递归找** `plan_id` 而不是写死路径（但有深度上限，
+服务端下发的任意 JSON 必须有界扫描）。
+
+### 五、落地形态（三处）
+
+1. `src/zcode-upstream.ts`：`fetchZcodeMarketingPlans()`（只读，失败一律降级 `[]`）、
+   `claimablePlansFromMarketingDeliveries()`（纯函数，便于测）、
+   `reportZcodeMarketingAction()`（`confirm` 回执，只有 `{code:0}` 算成功）、
+   `mergeZcodeClaimablePlans()`（去重 + priority 降序，preview 优先但**补** `campaignId`）。
+2. `src/zcode-auth.ts`：新增 `fetchAllClaimablePlans()`（两个来源合并），
+   **`claimDailyWith` 与 `fetchCheckinStatus` 都改用它** ——
+   后者也要改，否则面板显示「今日已领取」而 1024 其实没领（自相矛盾）。
+3. `claimOnePlan`：领取成功/已领取后发一次 `confirm`。
+
+⚠ **`confirm` 的门控是「只在成功时发」**：失败时发等于告诉服务端「别再给我看了」，
+用户**白丢一次机会**（`cancel` 语义更明确，本实现**从不**发送）。
+⚠ **`confirm` 必须 `await` 而不是 fire-and-forget**：它只有一跳，而领取流程结束后
+宿主可能很快关掉浏览器/进程，「发出去但没到」等于没发。
+⚠ `confirm` **不参与** `noteZcodeRequest*` 埋点：那套统计的是推理/领取端点的
+风控画像，营销端点不是风控对象，混进去会污染画像。
+
+### 六、回归与反向验证（`tests/unit/zcode-marketing-touch.spec.ts`，26 条）
+
+六个变异逐条实跑（每个都先打印「变异已注入 ✓」自证，跑完自动还原）：
+
+| 变异 | 结果 |
+|---|---|
+| 删掉 `fetchAllClaimablePlans` 里的 marketing 那一行 | **红 7 条**（含接线、confirm、状态灯） |
+| `buildZcodeHeaders` 的 `appVersion` 覆盖失效 | **红 1 条**（版本门控那条） |
+| 去掉 `confirm` 的 `outcome.ok` 门控 | **红 1 条**（「失败绝不发 confirm」） |
+| 去掉 `action.type !== 'claim_zcode_plan'` 判据 | 第一版**全绿（无牙！）** → 见下 |
+| `units += value` → 只取第一条 | **红 2 条**（5 亿那条 + 单位不混加那条） |
+| **claim 的版本覆盖失效**（改成 `credential.app_version`） | **红 1 条**（「claim 也必须带门控版本」） |
+
+⚠⚠ **「无牙」的那一条值得单独记**：第一版用例里 `close` 按钮的 `args` 是 `null`
+（实测原样），于是它**碰巧**被「`args.plan_id` 必须是非空字符串」那条腿挡住了 ——
+把 `type` 判据整行删掉，用例**仍然全绿**。
+⇒ 修法是**补一条独立用例**：构造「非领取动作**也带了** `plan_id`」的畸形投放
+（服务端数据不可信，将来完全可能），断言 `[]`。
+补后该变异**变红**。
+⇒ 可推广：**「某条判据」的用例，必须让其它腿都不足以挡住它** ——
+否则你测的是「另一条腿」，而这条判据可以整条消失。
+
+#### 6.1 ★★ 真机验收（走生产路径，非另写等价实现）
+
+`scripts/verify-zcode-marketing-claim-live.mjs` —— 用**插件自己的凭据** +
+`lib/` 里的**生产代码**（`ZcodeAuth.claimDailyFor` + `ZcodeAuth.mintCaptcha`）：
+
+```
+账号 zcode-7314e232  app_version=3.14.3（凭据里的）
+① marketing plans = 1
+   {"planId":"zcode-v3-start-plan-1024","priority":101,"name":"ZCode 1024 Dev Day",
+    "grantUnits":500000000,"unitType":"token","marketingCampaignId":"2113475573403824128"}
+② preview plans = 0                    ← 1024 活动**不在** preview（本改动的全部理由）
+③ 真实领取（生产路径）
+   {"kind":"claimed","credit":500000000,"streakDays":0,"isStreakDay":false,"unit":"token"}  ★★
+```
+
+⇒ **`credit: 500000000` + `unit: "token"` = 用户截图里的「5 亿 TOKENS」，领取成功。**
+
+⚠ 领取后 `balance` 仍显示 0 —— **不是失败**：活动的 `effective_at`
+（`1792767600` = 2026-10-23 23:00 UTC+8）**尚未到**，官方 `success_popup`
+的文案也是「将于 … 生效」。判据要看 claim 的 `code 0` / 本行的 `claimed`。
+
+⚠ 另一个账号（`zcode-eb16e1cd`）在**第一次领取成功后再查投放**得到
+`deliveries = []` ⇒ **服务端在用户领过之后会自己撤下该 campaign**。
+这也意味着：**「领取后再查为 0」不能当成 `confirm` 生效的证据**
+（两者在这一格上同形，见 §七）。
+
+### 七、仍未做 / 已知边界
+
+- **面板的「可领」展示（`fetchZcodeBalance` 的 `claimablePlans`）不含营销投放** ——
+  它只读 preview。即：签到能领到，但余额徽标里的「可领」条目看不到它。
+  要接需在 `fetchZcodeBalance` 里也并一次营销查询（多一跳只读请求），
+  **本次刻意不做**（用户诉求是「签到一并领取」；改动面越小越好）。
+- **活动结束后**：`deliveries` 自然变空，签到回到原状（无需清理逻辑）。
+- **国际版（`zai`）**：用户说「国际版好像没有」。本次**不做渠道特判** ——
+  投放由服务端按账号/渠道决定，国际账号自然拿不到（与「不猜上游」的既有纪律一致）。
+- **`confirm` 的实际效果未做对照实验**（是否真的让服务端停止重复投放）。
+  依据是官方 renderer 的行为与「已领过的 plan 会被反复投放」这一实测现象；
+  若将来发现仍重复投放，这里是第一嫌疑人。
+  ⚠ **别拿「领取后投放变 0」当证据**：服务端在用户领过之后**自己**也会撤下该
+  campaign（本机两个账号都观察到），两者在这一格上**同形**（见 §6.1 末）。
+- **`data.plan` 未被解析利用**：claim 成功响应里有权威的
+  `user_plan_id` / `status` / `starts_at` / `ends_at` / `entitlements[].effective_at`
+  （官方 `claimManualPlan` 正是读它做「领取成功」弹窗）。我们只用
+  `plan.grantUnits`（来自投放里的镜像元数据）做展示 —— 够用，但少了一份
+  「上游回执」的交叉校验。
+- **`seq` 参数**固定传 `0`（官方是自增计数）。实测 `0` 能拿到投放；
+  未验证自增值是否改变投放集合。
+
+### 八、可复现的探针（都在 `scripts/`，只读或「一次性写」且写明副作用）
+
+```bash
+# ① 只读：投放 + preview + balance（版本/头集矩阵写在脚本里）
+node scripts/probe-zcode-marketing-touch.mjs          # 只扫 enabled 账号
+node scripts/probe-zcode-marketing-touch.mjs --all    # 含停用账号（本机 4 个 zcode 账号全停用）
+
+# ② 一次性**写**：claim 的版本门控（默认官方头集；--ours-version 只改版本）
+node scripts/probe-zcode-claim-version-gate.mjs [账号id] [--ours-version]
+
+# ③ 端到端**写**：走生产路径真实领取（领取成功后打 confirm）
+node scripts/verify-zcode-marketing-claim-live.mjs [账号id]
+```
+
+⚠ 三者与既有探针同规矩：**不循环、不重试、不对真实凭据做续期**
+（zcode 无 refresh 端点）。②③ 会真实领取额度，且每发消耗一个**设备级**
+captcha 配额 —— 别当只读工具反复跑。
+
+---
+
+## ⚠️⚠️ 领取后「额度仍是 0」的真相：**已领但还没到生效时刻**（2026-10-23 21:19）
+
+**用户报障原文**：
+
+> 「我重启后用 zcode 领取显示 2 个成功 2 个已领取，**但是我查询额度后还是 0**」
+
+截图里 ZCode 两行都是「**+500.00MToken 领取成功**」，而额度查询是 0。
+
+### 一、结论：**不是缺陷**，是上游的 `effective_at`
+
+上游 `billing/balance` 对「已领未生效」的账号返回（**实测原文**）：
+
+```json
+{ "balances": [],                                  ← 桶是空的 ⇒ 「剩余 0」
+  "plans": [{ "plan_id": "zcode-v3-start-plan-1024", "status": "active",
+              "entitlements": [
+                { "show_name": "GLM-5.3-Flash", "unit_type": "token",
+                  "grant_units": 300000000, "effective_at": 1792767600 },
+                { "show_name": "GLM-5.3",       "unit_type": "token",
+                  "grant_units": 200000000, "effective_at": 1792767600 } ] }] }
+```
+
+`1792767600` = **2026-10-23 23:00 UTC+8**（报障时是 21:19 ⇒ 还差 83 分钟）。
+
+⇒ 额度**已锁定在 `plans` 里**，但 `balances` 桶**要等 23:00 才建**。
+官方成功弹窗的文案也正是「**将于 … 生效**」（实测 `description` 里是
+「… 将于 … 生效」）。
+
+⚠ **判据**：上游 `data.plan.status === 'active'` + `entitlements[].effective_at`
+**晚于现在** ⇒ 就是「已领未生效」。**这不是「领取失败」**，更不是「白领了」。
+
+### 二、⚠️⚠️ 由此暴露的**真缺口**：插件**没有把这个中间态显示出来**
+
+用户只能看到「领取成功」+「额度 0」⇒ **看起来像白领了**。
+
+⇒ 修法（**两个字段，两个入口**）：
+
+| 位置 | 改动 | 为什么 |
+|---|---|---|
+| `src/zcode-upstream.ts` | `ZcodeBalanceResult` 新增 `pendingPlans`；`fetchZcodeBalance` 用 `pendingPlansOf(data.plans)` 填充 | 「已领、等生效」是**独立于桶**的一态 |
+| `src/provider-credits.ts` | `buildZcodeBalance` 把它做成**独立包**，`remaining/total` 都给 **0**，`cycleStartTime` 携带**生效时刻**，`active: false` | 见下 |
+
+⚠⚠ **绝不能把它并进 `remaining` / `total`**（`total` 是折算层的判据）：
+
+`aggregate-expiry.ts` 的 `zcodeExpiry` 判据是 **`balance.remaining > 0`**
+（`aggregate-expiry.ts` 的注释明写「判据是 `remaining`（**已拥有**的余额）」）
+⇒ 并进去 ⇒ 折算判成「有额度」⇒ **在 23:00 之前就把 zcode 派发出去**
+（必然失败：额度还不存在）。
+⇒ 故：**桶 = 现在能用；`pendingPlans` = 已领、等生效**；`zcodeExpiry` **不读**它
+（实测 `zcodeExpiry` 源码里 `pendingPlans` 命中 **0** 处）。
+
+### 三、⚠️⚠️ 国际版（`zai`）**同样能领**——「只有中国版有」是**界面/入口**差异
+
+**用户追问**：「2 个旅行者账号应该是国际版账号，但我看有个旅行者账号也领取成功了，
+应该只有中国版才有」。
+
+**实测（`scripts/probe-zcode-account-channel.mjs` + `probe-zcode-intl-vs-cn-activity.mjs`）**：
+
+| 账号 | 渠道（凭据字段） | `billing/balance` 的 1024 plan |
+|---|---|---|
+| sysenxde / xrbwohf3 | 中国版 `bigmodel`（`user_channel=WECHAT_OPEN`） | `status: active` |
+| **旅行者9665 / 旅行者6665** | **国际版 `zai`**（只有 `zai_access_token`） | **`status: active`** ★ |
+
+⇒ **服务端在额度层面完全不按 OAuth 渠道区分**：两个国际版账号拿到的是**同一个**
+`zcode-v3-start-plan-1024`（3 亿 + 2 亿）。
+
+⚠ 补一条**反直觉**的实测：用**渠道专属 token**（`zai_access_token` /
+`bigmodel_access_token`）当 Bearer 查 `billing/balance` ⇒ **HTTP 401**；
+只有 `zcode_jwt` 能用 ⇒ 该端点**只认 `zcode_jwt`**，与渠道无关。
+
+⚠ `X-Client-Language` 取 `zh-CN` / `en-US` **不影响**投放（两组都是 `code 0`、
+`deliveries` 相同）。
+
+⇒ 「只有中国版有」的观感来自**官方客户端的界面**：
+官方「奖励中心」页是**分站**的 —— `isTrustedRewardsUrl` 的判据是
+`/^\/(cn|en)\/rewards\/?$/`（`app.asar` → `out/main/chunk-XYX2CJ3H.js`），
+且 marketing touch 的 `baseUrl` **恒为 `zcode.z.ai`**（中国版域）。
+⇒ **国际版用户看不到那个入口，但额度本身拿得到**（实测两个旅行者账号都拿到了）。
+
+⚠ **本仓库不做渠道特判**：投放由服务端决定，我们只按实测拿到的 plan 领取
+（与「不猜上游」的既有纪律一致）。
+
+### 四、回归与反向验证（`tests/unit/zcode-pending-effective.spec.ts`，11 条）
+
+三个变异逐条实跑（`scripts/mutate-zcode-guard.mjs`，每个都自证「变异已注入 ✓」、
+跑完自动还原）：
+
+| 变异 | 结果 |
+|---|---|
+| 把待生效额度**并进 `total`** | **红 1 条**（「总量不含待生效」那格） |
+| pending 包的 `active` 改成 `true` | **红 1 条** |
+| 「已到生效时刻」的也计入 `pendingPlans` | **红 2 条** |
+
+⚠ 其中「总量不含待生效」那一格是**最关键的**：它是「23:00 之前不派发 zcode」
+这条不变式的**唯一**守卫（折算层只读 `total`/`remaining`）。
+
+### 五、可复现的探针（本轮新增）
+
+```bash
+# 只读：领取后上游到底返回什么（桶 / 计划 / 生效时刻）
+node scripts/probe-zcode-post-claim-balance.mjs
+
+# 只读：每个账号是中国版（bigmodel）还是国际版（zai）
+node scripts/probe-zcode-account-channel.mjs
+
+# 只读：同一端点用「渠道 token」与「zcode_jwt」的差异 + 语言变量
+node scripts/probe-zcode-intl-vs-cn-activity.mjs
+```
+
 
 
 

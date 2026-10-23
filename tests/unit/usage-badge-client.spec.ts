@@ -1198,3 +1198,96 @@ describe('单位归一：宿主与客户端同一口径', () => {
     }
   })
 })
+
+/**
+ * ★★ **同一语义的两处渲染必须同时改**（2026-10-21 真实缺陷）。
+ *
+ * 设置页账号卡片（`jet-hub.js` 的 `CreditBalanceRow`）与**本徽标弹窗**
+ * （`usage-badge.js` 的 `splitParts`）是**两套独立渲染代码** —— 6d7f47a 只改了
+ * 前者，于是用户看到「设置页有「另有 25000 专属」、弹窗没有」。
+ *
+ * ⇒ 这里用源码级断言把**两处都锁住**：任一侧漏改都会红，而不是静默漂移。
+ *    ⚠️ 判据用 `isExclusivePool`（`credit-expiry.js` 单一持有）而不是各自的
+ *    文案 —— 只断言文案会让「改了文案但删了逻辑」这种改法溜过去。
+ */
+describe('独立池（AStudio 星火积分）：设置页与徽标弹窗两处渲染同步', () => {
+  // ⚠⚠ 断言必须基于 **`codeOf`（剥掉注释）**。
+  //
+  // ⚠⚠⚠ **为什么（合并审计发现，B4）**：本文件原先的断言用的是 **`read()`
+  // 的原始文本**（未剥注释）⇒ 字面量在**注释里也存在** ⇒ 把真条件改成
+  // `false && …`（死分支短路，本仓已记录过 6 次同型复发）依然全绿。
+  //
+  // 实测（变异验证）：
+  // - `usage-badge.js` 的 `if (false && exclusive > 0)` → 76 条全绿；
+  // - `jet-hub.js` 的 `false && exclusiveRemaining > 0` → 76 条全绿。
+  //
+  // ⚠ 同一文件的 `codeOf` helper 就在第 33 行，**新用例却没用它**。
+  const badge = codeOf(read('plugin-src/client/usage-badge.js'))
+  const jetHub = codeOf(read('plugin-src/client/jet-hub.js'))
+
+  it('徽标弹窗的 splitParts 追加独立池段（无色 muted）', () => {
+    // 必须走**唯一的判据函数**（与 credit-expiry.js 同一份），不能各写一套
+    expect(badge).toContain('exclusivePoolRemainingOf')
+    // 追加的是**分段**，故 key 与 tone 都要对（tone 用 muted：不是告警，是事实说明）
+    expect(badge).toContain("key: 'exclusive'")
+    expect(badge).toContain("tone: 'muted'")
+  })
+
+  it('设置页的 CreditBalanceRow 同样渲染独立池提示', () => {
+    expect(jetHub).toContain('exclusivePoolRemainingOf')
+    expect(jetHub).toContain('exclusiveRemaining > 0')
+  })
+
+  it('两处都**调用**同一个纯函数（不是只 import 了它）', () => {
+    // ⚠ 两处都必须**调函数**（而不只是 import 名字）—— 只坐实「import 了它」
+    // 未就等于「用了它」。
+    expect(badge).toContain('exclusivePoolRemainingOf(')
+    expect(jetHub).toContain('exclusivePoolRemainingOf(')
+  })
+
+  it('两处共用同一个 isExclusivePool 判据（不是各写一套）', async () => {
+    // 单一真相源：两处都从 credit-expiry.js import，而不是各自实现「独立池」匹配。
+    const { isExclusivePool } = await import('../../plugin-src/client/credit-expiry.js')
+    expect(isExclusivePool({ name: '星火积分（独立池，不参与主池合计）' })).toBe(true)
+    expect(isExclusivePool({ name: '赠送积分' })).toBe(false)
+    // 没有 name / name 不是字符串 ⇒ false（不抛，避免渲染整行崩掉）
+    expect(isExclusivePool({})).toBe(false)
+    expect(isExclusivePool(undefined)).toBe(false)
+  })
+})
+
+/**
+ * ⚠️⚠️ **徽标 tooltip 的「最早作废」标题不得对短语再拼后缀**
+ * （2026-10-21 合并审计发现，!135 引入的回归）。
+ *
+ * ## 缺陷
+ *
+ * !135 把 `expirySplitParts` 的 `countdown` 从「裸时长」改成「**可能是完整短语**」
+ * （倒计时只覆盖其中一批时为 `其中 500 于 6 天 0 小时后到期`），而**消费方**这一行
+ * 仍无条件拼 `后` ⇒ 实测残句：
+ *
+ * ```
+ * 最早作废：其中 500 于 6 天 0 小时后到期后
+ * ```
+ *
+ * ⚠️ 本处此前**零用例**：把整条 title 换成垃圾串，全量测试**零新增失败**。
+ *
+ * ## 判据为什么是源码级
+ *
+ * title 拼在 `renderSplitNote` 的 JSX 字面量里，没有可独立调用的纯函数。
+ * ⇒ 沿用本文件既有的 `codeOf`（**剥注释**）口径 —— 否则新增的解释性注释里若
+ * 提到 `countdown}后`（本文档上面就提到了一次）会把断言判成违规。
+ * ⚠️ 抽查那条 `\${part.countdown}` 的**正**断言同时存在，避免「只要不含 A」被
+ *    改写成删掉整条 title 也全绿。
+ */
+describe('徽标 tooltip 标题：短语不得再拼后缀（!135 回归的守卫）', () => {
+  const badge = codeOf(read('plugin-src/client/usage-badge.js'))
+
+  it('title 直接用 countdown，不再拼「后」', () => {
+    // 正：title 由 countdown 直接构成
+    expect(badge, 'title 必须来自 part.countdown').toContain('最早作废：${part.countdown}')
+    // 反：不得出现「拼了后缀」的形态
+    expect(badge, '不得对 countdown 再拼「后」（混合批次时它是完整短语）')
+      .not.toContain('${part.countdown}后')
+  })
+})

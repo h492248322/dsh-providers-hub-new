@@ -129,3 +129,132 @@ request/context:  {"provider":"codearts","model":"glm-5.3"}                     
 现为「**默认禁止 + codearts 具名例外**」；例外**改判据**（必须等于具名常量），
 **不是** `if (id !== 'codearts')` 跳过断言 —— 后者会让 codearts 这条完全无牙。
 ⚠️ 该不变式此前对 **15 家全部有牙**（文件头注有反向验证记录），改它时要保住这一点。
+=======
+
+## ⚠️⚠️ 图片输入：只有 VL 模型能收图，且 DSH 会按模态把图**投影成文字**
+
+### 报障与结论（2026-10-21）
+
+用户：「codearts 发送图片后端模型不支持图片，发送带图的信息会直接跳出提示阻止发送，
+但 CodeArts IDE 发送识图任务是支持识图的」。
+
+**结论：IDE 不是让文本模型收图，而是两段式** —— 先用 VL 模型看图、把结果变成文字，
+再交给主模型。判据来自本机 IDE 内核日志：
+
+```
+builtin-model-service  "[fetchMultimodalModelId] Response: {...8 个模型...}"
+builtin-model-service  "[fetchMultimodalModelId] Success, selected multimodal model: kimi-k2.6-vl,
+                        candidates: kimi-k2.6-vl, Qwen3-VL-235B"     ← 11 次采样恒定选它
+provider-models-plugin "global config multimodalModels:" 0=... 2=kimi-k2.6-vl
+```
+
+`analyzeImage` 是 IDE 的一个**工具**（描述原文：*Analyse image or images by ID, file path,
+or base64 data and extract information such as OCR text, objects, layout, colors…*；
+参数 `imageId`/`imagePath`/`imageBase64` 三选一，*Data is processed in memory only*）。
+
+### 谁能收图（`/v1/model/builtin` 的 `supports_images`，8 条逐条实测）
+
+| 模型 | `supports_images` | `model_category` |
+|---|---|---|
+| `kimi-k2.6-vl` / `Qwen3-VL-235B` | **true** | **图片理解** |
+| `glm-5.3` / `GLM-5.2` / `glm-5.2-sft-harmony` / `openpangu-2.0-flash` / `-pro` / `deepseek-v4.1-flash` | false | 文本生成 |
+
+### ⚠️⚠️ wire 形态**四选一**，只有一种被接受（实测）
+
+对两个 VL 模型各发一张 8×8 纯色 PNG、问颜色：
+
+| 形态 | 结果 |
+|---|---|
+| **`{type:'image_url', image_url:{url:'data:…'}}`** | **200，答对颜色** ✅ |
+| `{type:'image_url', image_url:'data:…'}`（字符串） | 406 `InferHub.001001046` |
+| `{type:'image', source:{type:'base64',…}}` | 400 `ModelArts.81001` unsupported content type |
+| `{type:'input_image', image_url:…}` | 406 `InferHub.001001046` |
+
+反向对照：同一形态发给 `glm-5.3` 得
+`InferHub.001001020.406 The request model is not multimodal` ⇒ 判据有判别力。
+
+⚠️ 本机 IDE 日志里 `image_url` **零命中** —— IDE 走自家内部通道，没留下 wire 形态，
+所以这一格**只能实测**，不能从日志抄。
+
+### ⚠️⚠️ DSH 侧：模态声明是**唯一开关**，它决定图会不会被换成文字
+
+`dsh-llm/lib/index.js:2337`（dispatch 前）：
+
+```js
+if (modelInfo.inputModalities !== void 0
+    && !modelInfo.inputModalities.includes('image')
+    && projectedMessages.some(m => contentHasImage(m.content)))
+  projectedMessages = projectImagesForTextModel(projectedMessages)
+// → 每张图被替换成 textOnlyImageText(ref)：
+//   "[image omitted because this model accepts text only; attachment sha256:…]"
+```
+
+⇒ **声明里没有 `image`，图根本到不了适配器**（在宿主就被换成一行占位文字）。
+官方 `read_image` 的 `assertImageCapableRoute` 用的也是同一个判据。
+
+### 三条接线（本次改动）
+
+1. `CODEARTS_VL_MODELS` + `codeartsAcceptsImage()`：**逐模型**判能力（大小写不敏感）；
+2. `toCatalogEntry` 与 **`unknownModelInputModalities(modelId)`** 都要按 id 判 ——
+   ⚠️⚠️ VL 模型**刻意不在对话目录里**（上下文小、不支持工具调用），所以
+   `resolveModel('kimi-k2.6-vl')` 走的是**「目录外」分支**，只有后者生效。
+   第一版只改了 `toCatalogEntry`，实测恒红（真缺陷，见守卫 ①）；
+3. `serializeMessages` 改用共享实现（`openai-compat.ts`），配 `readImage` 桥接 +
+   `codeartsImagePart()` 产出唯一被接受的形态。
+
+### ⚠️ 两条踩过的坑
+
+1. **`prepareCall` 里原有一行硬覆盖**：`{ ...await resolveModel(...), inputModalities: ['text'] }`
+   ⇒ 只要目录开始按模型区分模态，这行就**静默抹平**它。症状是「VL 模型明明声明了
+   image，发图仍被拒」，且两处代码各自看都对。守卫 ④ 钉住「两者必须一致」。
+2. **本家原有一份只处理文本的私有 `serializeMessages`**（注释还写着「图片被丢弃」）。
+   在它上面加图片腿 = 同一语义两套实现 ⇒ 改为复用共享实现，并**删掉**原来那条
+   「CodeArts 与 openai-compat 互相对拍」的用例（合并后 `f(x)===f(x)` 恒真，
+   属同义反复，本仓纪律不允许留着充数）。
+
+### 验证
+
+- 单测：`codearts-image-input.spec.ts` 7 条（模态正/反向、VL 不在目录、prepareCall
+  一致、大小写、wire 形态、识图模型选择）；变异验证两处均精确变红（回调恒 false →
+  ① 红；prepareCall 加回硬覆盖 → ④ 红）。
+- 真实端到端（2026-10-21，第三个账号）：发**蓝色** 8×8 PNG 给 `kimi-k2.6-vl`，
+  回答「蓝色（我实际看到的是一张1x1像素的纯蓝色图片，RGB值为(0,0,255)）」⇒
+  图真的到了上游。
+- ⚠️ 排查时的坑：反复开流式会话却不消费完响应体会**占满并发槽**，后续请求回
+  `TM.00001041 并发会话数已达上限(3个)`（甚至以 404 形式出现）—— 那不是代码缺陷，
+  **等槽位释放或换账号**即可。
+
+### ⚠️⚠️ `analyzeImage` 真机验收抓出的真缺陷：已拼好的 `image_url` 被**静默丢弃**
+
+**症状**（极具误导性）：`analyzeImage` 工具返回「我无法看到您提到的图片」。
+HTTP 200、正文正常、上游零报错 —— 因为**图根本没发出去**。
+
+**成因（两处同因的门禁，必须同修）**：
+
+1. `openai-compat.ts` 的 `userContentParts()` **只认 harness 原生**
+   `{type:'image', attachment}`（拿 `imageUrls` 表查字节），对
+   **已拼好的** `{type:'image_url', image_url:{url}}` **零命中** ⇒ 该块被丢弃。
+   ⚠️ 而 `analyzeImage` 的识图请求是**插件自己构造**的（不是 harness 派生历史），
+   它正是把图直接拼成目标形态后交给 `adapter.stream()`。
+2. `serializeMessages()` 里 `imageUrls === undefined` 时**整段跳过**
+   `userContentParts` ⇒ 即使第 1 条修好，识图请求（**不传** `imageUrls`）
+   也走不到那里。⇒ 判据改成「有映射表 **或** 内容里本来就带 `image_url` 块」。
+
+**为什么原有用例没抓到**：它们只测 `{type:'image', attachment}` 那条路
+（配 `imageUrls` 表）。「已拼好的块」是**另一条入口**，零断言 ⇒ 从缝里漏过。
+守卫 ⑪~⑬（`codearts-analyze-image.spec.ts`）补上，两处改动**各自都有牙**
+（分别撤掉任一处，⑪ 都精确变红）。
+
+**⚠️ 排查过程里的两个坑（都真实踩到）**：
+
+1. **`fetchImpl: async () => new Response('nope', {status: 404})` 会把所有请求拦掉**
+   —— 我的 e2e 脚本里留了这个桩，于是看到「HTTP 404」并误以为是上游问题，
+   还据此怀疑过并发槽。**桩必须在真机验收时移除**，否则验的是桩。
+2. **变异验证「全绿」先怀疑变异没注入**（本仓已登记过同款）：该文件是 **CRLF**，
+   而我的脚本用 LF 匹配多行锚点 ⇒ `replace` 静默不生效 ⇒ 误判「改动无判别力」。
+   ⚠️ **跨行锚点在 CRLF 文件上必须用单行锚点或做行尾归一**，并且**先打印
+   `锚点存在: True/False` 自证**，未命中要报「未注入」而不是「无牙」。
+
+**真机验收（2026-10-22）**：16×16 纯绿 PNG，`glm-5.3`（文本模型）经工具识图，
+返回「整个画面为**亮绿色**（近似荧光绿，RGB 可能接近 #00FF00）… 图片中没有任何文字」
+⇒ 图真的到了上游，且描述准确。

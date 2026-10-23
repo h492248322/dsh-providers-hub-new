@@ -1346,6 +1346,33 @@ export interface RpcModelClearDeadResponse {
 export interface RpcModelSetAllDisabledRequest {
   provider: string
   disabled: boolean
+  /**
+   * 是否**同时**落「供应商整体关闭」意图（默认 `true`，保持既有语义）。
+   *
+   * ## ⚠️⚠️ 为什么需要这个开关（2026-10-21 合并审计发现，阻断级）
+   *
+   * 关闭方向原本**无条件**落意图（`writeModelsWithProviderClosed(…, true)`），
+   * 而意图的三个后果是：
+   * ① `provider.status` 报 `closed: true` ⇒ 左侧分组变成「已关闭」；
+   * ② 各适配器的 `listModels` 直接返回 `[]` ⇒ 该家模型在选择器里**一个都没有**；
+   * ③ **打开任意一个模型会顺带把整个供应商打开**（`setModelDisabled` 的打开
+   * 方向会清意图）。
+   *
+   * ⇒ 用户在「模型列表」屏点一次「全关」（只想关这家模型），
+   * 却把**整个供应商**也关了；再打开**任意一个**模型，供应商又被顺带打开。
+   * 两头都与用户的意图相反，且**零提示**。
+   *
+   * ## 两个方向的取值
+   *
+   * - `true`（默认）：维持既有语义 —— 「关闭全部模型」**等价于**「关闭该供应商」
+   *   （既有供应商级开关 `provider.setEnabled(false)` 走的是同一条路径）。
+   * - `false`：**只**改模型黑名单，**不**落意图 ⇒ 供应商仍「已打开」、账号仍可用、
+   *   只是这些模型从选择器里消失。
+   *
+   * ⚠️ **缺省即 `true`**：既有调用方（`provider.setEnabled(false)` 与既有的
+   * 「模型列表」屏的「关闭全部」）的语义**逐字不变**。
+   */
+  closeProvider?: boolean
 }
 
 /** RPC: 批量打开/关闭响应（回传写入后的完整黑名单，与单条端点同结构） */
@@ -1649,6 +1676,36 @@ export interface RpcNativeSearchSetEnabledRequest {
  * 同取向：客户端一律以后端回传为准，不做乐观更新。
  */
 export interface RpcNativeSearchSetEnabledResponse {
+  enabled: boolean
+}
+
+/**
+ * RPC: 「侧栏入口」开关的读取响应（Jet Hub 页头的「侧栏」开关）。
+ *
+ * 语义：`true` = 在**主导航**里显示「Jet Hub」入口（点它把 Jet Hub 页渲染进
+ * 中央主面板）；`false` = 只保留「设置 → Jet Hub」这一条进入路径。
+ *
+ * ⚠️ 为什么这个偏好住**宿主**（`state.json`）而不是浏览器 `localStorage`：
+ * 本插件的三条进入路径（Web / 桌面 / headless）共用同一份 `~/.dsh` 状态，
+ * 而 Web 侧的 origin 是 `127.0.0.1:<随机端口>` —— **每次启动端口都变**，
+ * `localStorage` 会随旧 origin 一起被抛弃，表现为「关掉的入口下次启动又回来了」。
+ */
+export interface RpcSidebarEntryGetEnabledResponse {
+  enabled: boolean
+}
+
+/** RPC: 「侧栏入口」开关写入请求。 */
+export interface RpcSidebarEntrySetEnabledRequest {
+  enabled: boolean
+}
+
+/**
+ * RPC: 「侧栏入口」开关写入响应。
+ *
+ * ⚠️ 与 `nativeSearch.setEnabled` 同取向：回传的是**落盘后重读的值**，
+ * 客户端一律以后端回传为准，不做乐观更新（宿主侧可能因为脏文档把值归一）。
+ */
+export interface RpcSidebarEntrySetEnabledResponse {
   enabled: boolean
 }
 

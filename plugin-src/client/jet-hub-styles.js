@@ -4,6 +4,11 @@
 
 const STYLES = `
 .dim-jh-page { display: flex; flex-direction: column; height: 100%; }
+/* 「侧栏」面板的宿主（main 槽）：中央面板自己不留白，只给顶部一条 28px 的
+   标题带（插件市场页同款）。设置页里的 .dim-jh-page 则由 SettingsRoot 缩进，
+   两条入口共用同一个组件、靠这一层补丁拉开差别。 */
+.dim-jh-panelHost { box-sizing: border-box; height: 100%; min-height: 0; display: flex; flex-direction: column; padding: calc(28px + var(--dsh-frame-top-clearance, 0px)) 24px 24px; }
+.dim-jh-panelHost > .dim-jh-page { flex: 1 1 auto; min-height: 0; }
 /* ⚠️ 左右 padding 为 0（2026-10-14）：宿主 SettingsRoot 已经把整个 section
    内容区按 padding 0 24px 24px 缩进了一层（类名 .wCInkW_options，见
    @deepseek-ai/dsh-client-ui-settings-general/SettingsRoot.module.css）。
@@ -181,6 +186,10 @@ const STYLES = `
 .dim-jh-creditPoolSep { font-size: 11px; color: var(--dsw-alias-label-tertiary, #8f959e); }
 /* 已失效额度：弱化的橙色提示，与主数值的蓝色明确区分 */
 .dim-jh-creditExpired { font-size: 11px; color: #b45309; }
+/* 独立池（AStudio 星火积分等）：与上方三档分桶并列的事实标注。
+   用中性灰而**不是** warn 橙 —— 它不是「快过期」的告警，而是「这笔钱不能混用」
+   的说明；用橙色会与临期档抢注意力。 */
+.dim-jh-creditExclusive { font-size: 11px; color: var(--dsw-alias-label-tertiary, #8f959e); }
 
 /* 限额重置徽章行 */
 .dim-jh-rateLimits { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 8px; }
@@ -213,8 +222,39 @@ const STYLES = `
 .dim-jh-ttlBadge { display: inline-block; padding: 1px 8px; border-radius: 999px; background: rgb(227 116 0 / 10%); color: #b45309; font-size: 11px; line-height: 17px; font-weight: 500; }
 
 /* 面板标题区：标题独占一行，操作按钮另起一行。
-   此前用单行 space-between 把标题与 5 个按钮挤在一起，面板一窄就溢出被裁掉。 */
-.dim-jh-panelHead { display: flex; flex-direction: column; align-items: flex-start; gap: 10px; margin-bottom: 16px; }
+   此前用单行 space-between 把标题与 5 个按钮挤在一起，面板一窄就溢出被裁掉。
+
+   ⚠️⚠️ **刻意不写 align-items（= 默认 stretch）**（2026-10-21 合并审计的**根因修法**）。
+
+   原先这里是 align-items: flex-start ⇒ panelHead 是 column flex、交叉轴是**水平**
+   ⇒ 每个子项按 fit-content 收缩到 **max-content**。后果是**一整类**「窄条/贴左」缺陷，
+   而不只是账号卡片那一格：
+
+   - .dim-jh-accountList：单账号时卡片缩成 ~257px 窄条（多账号时被那句约 1200px 长的
+     排序提示撑宽，所以只有单账号暴露）—— 这是用户真机看到的那一格；
+   - .dim-jh-probeNotice / .dim-jh-empty / 补偿卡片：**短文案**时渲染成带边框背景的
+     **窄药丸**；其中 .dim-jh-empty 的加载文案 正在读取账号列表… 还带
+     text-align: center ⇒ 每次开面板都看到一句**贴左**的加载提示（最常被看到的一格）。
+
+   ⇒ 去掉 align-items 让全部子项 stretch 到面板宽，**一次修好账号列表 + 7 个兄弟**。
+
+   ⚠️ **本次唯一的可见行为变化**：.dim-jh-headerActions 有 justify-content: center，
+   而它此前是 max-content 宽（没有空余可分配 ⇒ 居中不生效、观感贴左）；现在它整宽 ⇒
+   按钮总宽小于面板宽时**真的居中**（这正是它声明 center 的本意）。
+
+   ⚠️ **不要**把它改回 flex-start：那会同时复发上面那一整类缺陷
+   （而下面 .dim-jh-accountList 那两条规则只能兜住账号列表这一格）。 */
+.dim-jh-panelHead { display: flex; flex-direction: column; gap: 10px; margin-bottom: 16px; }
+/* 账号列表容器：宽度与账号数量无关。
+   ⚠️ 根因已在上面 .dim-jh-panelHead 修掉（去掉 align-items: flex-start），
+      故 align-self 现在是**冗余兜底** —— 保留是刻意的：万一有人把
+      align-items: flex-start 改回来，账号列表（用户唯一明确报障过的那一格）仍正确。
+   ⚠️ min-width: 0 在本容器（column flex 的**交叉轴**方向）**是惰性声明** ——
+      min-width: auto 的自动最小尺寸只在**主轴**生效，而主轴是纵向（对应 min-height）。
+      保留它只为「将来 panelHead 改成 flex-direction: row」时承重；
+      **不要**把它当成「账号列表靠它才整宽」—— 那样清理时会先删错那一行。 */
+.dim-jh-accountList { align-self: stretch; min-width: 0; }
+.dim-jh-accountList > .dim-jh-accountCard { width: 100%; box-sizing: border-box; }
 .dim-jh-panelTitle { margin: 0; font-size: 16px; font-weight: 600; color: var(--dsw-alias-label-primary, #1f2329); }
 
 /* 面板标题下方的操作按钮组（显示列表 / 刷新积分 / 一键领取积分 / 重测所有 / 重置所有 / 新建账号）。

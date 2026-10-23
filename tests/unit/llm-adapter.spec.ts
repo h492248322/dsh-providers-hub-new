@@ -164,26 +164,35 @@ describe('CodeArtsAdapter', () => {
     expect(ids[0]).toBe('GLM-5.2')
   })
 
-  it('resolveModel discloses contextWindow for GLM-5.2 and deepseek-v4 models', async () => {
-    // GLM-5.2：202752；glm-5.3-flash：1048576（1M，对齐 deveco-code-rust 90aeb17d）；
-    // deepseek-v4-flash/pro：1048576（1M）；deepseek-v4.1-flash：1000000
-    // （对齐 IDE 下发的 inferhub-provider 模型配置，2026-09 kernel 日志）。
-    // 其余模型（GLM-5.1/GLM-5/openpangu-*）未公开容量，context 应为 undefined。
+  it('resolveModel discloses contextWindow for every model in the catalog', async () => {
+    // ⚠️ 2026-10-21 重取证（本机 42 份 IDE 内核日志，2026-09-11~10-21）：
+    //    权威来源是 IDE 自己下发的 `provider["inferhub-provider"].models[*].limit.context`。
+    //    - GLM-5.2：**1_048_576**（09-11~10-20 是 202_752，**10-21 上游改成 1M**）
+    //    - glm-5.3：1_048_576（本次报障模型，原先**完全没有**条目）
+    //    - openpangu-2.0-flash / -pro：524_288（原先没有条目 ⇒ 用户没有占用条）
+    //    - deepseek-v4.1-flash：1_048_576（本表原先写 1_000_000，按 IDE 权威值改正）
+    // ⚠️ **本家不再有「context 为 undefined」的目录条目** —— 表里查不到时走
+    //    具名兜底 `CODEARTS_FALLBACK_CONTEXT_WINDOW`（真实报障：缺窗口 ⇒
+    //    DSH 的上下文占用条整条不渲染）。逐项守卫见
+    //    `codearts-context-window.spec.ts`。
     const adapter = makeAdapter()
     const glm52 = await adapter.resolveModel('codearts', 'GLM-5.2')
-    expect(glm52.context).toEqual({ contextWindow: 202752 })
+    expect(glm52.context).toEqual({ contextWindow: 1_048_576 })
     const glm53flash = await adapter.resolveModel('codearts', 'glm-5.3-flash')
     expect(glm53flash.context).toEqual({ contextWindow: 1_048_576 })
+    const glm53 = await adapter.resolveModel('codearts', 'glm-5.3')
+    expect(glm53.context).toEqual({ contextWindow: 1_048_576 })
     const dsFlash = await adapter.resolveModel('codearts', 'deepseek-v4-flash')
     expect(dsFlash.context).toEqual({ contextWindow: 1048576 })
     const dsPro = await adapter.resolveModel('codearts', 'deepseek-v4-pro')
     expect(dsPro.context).toEqual({ contextWindow: 1048576 })
     const dsV41Flash = await adapter.resolveModel('codearts', 'deepseek-v4.1-flash')
-    expect(dsV41Flash.context).toEqual({ contextWindow: 1_000_000 })
+    expect(dsV41Flash.context).toEqual({ contextWindow: 1_048_576 })
+    // 表里**没有**条目的模型也必须给出窗口（否则用户看不到占用比）。
     const glm51 = await adapter.resolveModel('codearts', 'GLM-5.1')
-    expect(glm51.context).toBeUndefined()
+    expect(glm51.context).toEqual({ contextWindow: 524_288 })
     const pangu = await adapter.resolveModel('codearts', 'openpangu-2.0-pro')
-    expect(pangu.context).toBeUndefined()
+    expect(pangu.context).toEqual({ contextWindow: 524_288 })
   })
 
   // 回归：dsh-llm 0.1.1-rc.2 的 LlmRuntime.prepareCall() 会直接调用
@@ -197,7 +206,7 @@ describe('CodeArtsAdapter', () => {
     expect(call.model).toMatchObject({
       provider: 'codearts',
       id: 'GLM-5.2',
-      context: { contextWindow: 202752 },
+      context: { contextWindow: 1_048_576 },
       inputModalities: ['text'],
     })
     expect(typeof call.stream).toBe('function')
@@ -1424,7 +1433,7 @@ describe('CodeArtsAdapter', () => {
     // DSH 契约：listModels 的结果仅供参考，缺省不构成请求拒绝。
     const resolved = await adapter.resolveModel('codearts', 'GLM-5.2')
     expect(resolved.id).toBe('GLM-5.2')
-    expect(resolved.context?.contextWindow).toBe(202752)
+    expect(resolved.context?.contextWindow).toBe(1_048_576)
   })
 
   // ── 目录门控：没有已登录账号就不显示该 provider 的模型 ──

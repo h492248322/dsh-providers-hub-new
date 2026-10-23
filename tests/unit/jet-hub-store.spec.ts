@@ -23,6 +23,7 @@ import {
   sanitizePermanentLocks,
   sanitizeProviderClosed,
   sanitizeProviderOrder,
+  sanitizeSidebarEntryEnabled,
   withAllowed,
   withoutAllowed,
 } from '../../src/jet-hub-store.js'
@@ -74,6 +75,21 @@ describe('sanitizeNativeWebSearchEnabled', () => {
     expect(sanitizeNativeWebSearchEnabled('false')).toBe(true)
     expect(sanitizeNativeWebSearchEnabled(0)).toBe(true)
     expect(sanitizeNativeWebSearchEnabled({})).toBe(true)
+  })
+})
+
+describe('sanitizeSidebarEntryEnabled', () => {
+  it('只有显式 false 才算关闭，其余一律按显示（与网关/原生搜索逐字同构）', () => {
+    // ⚠️ 方向不能反：丢键 / 脏值都必须回到**默认显示**。反过来（只认 true）
+    // 会让任何一次读取失败都变成「侧栏入口被静默藏起来」，而用户从来没关过它
+    // —— 而且入口藏起来后，页头那个开关就成了唯一入口，属于双重伤害。
+    expect(sanitizeSidebarEntryEnabled(false)).toBe(false)
+    expect(sanitizeSidebarEntryEnabled(undefined)).toBe(true)
+    expect(sanitizeSidebarEntryEnabled(null)).toBe(true)
+    expect(sanitizeSidebarEntryEnabled(true)).toBe(true)
+    expect(sanitizeSidebarEntryEnabled('false')).toBe(true)
+    expect(sanitizeSidebarEntryEnabled(0)).toBe(true)
+    expect(sanitizeSidebarEntryEnabled({})).toBe(true)
   })
 })
 
@@ -141,6 +157,8 @@ describe('老契约后端（SettingsStore）', () => {
       gatewayAllowLan: false,
       // save 未携带原生搜索开关 → 写出启用（缺省），读回同值。
       nativeWebSearchEnabled: true,
+      // save 未携带侧栏入口开关 → 写出显示（缺省），读回同值。
+      sidebarEntryEnabled: true,
       // save 未携带顺序 → 写出空数组（未自定义），读回同值。
       providerOrder: [],
       // 关闭意图缺省空表（没有任何供应商被关闭）：读回同值（Gitee IKP8OF）。
@@ -305,6 +323,8 @@ describe('文件后端（FileStore）', () => {
       gatewayAllowLan: false,
       // 原生搜索开关缺省启用 —— 与升级前行为一致
       nativeWebSearchEnabled: true,
+      // 侧栏入口开关缺省显示 —— 与升级前行为一致
+      sidebarEntryEnabled: true,
       // 顺序缺省空数组（未自定义）—— 与升级前行为一致
       providerOrder: [],
       // 关闭意图缺省空表（没有任何供应商被关闭）：读回同值（Gitee IKP8OF）。
@@ -391,6 +411,41 @@ describe('文件后端（FileStore）', () => {
       'utf-8',
     )
     expect(createJetHubStore(makeCtx(undefined)).load()?.nativeWebSearchEnabled).toBe(true)
+  })
+
+  /**
+   * 「侧栏入口」偏好的**持久化**守卫（与上面原生搜索那组同构）。
+   *
+   * 判据必须是**跨实例读回**：`JS` 里断言 `sanitizeSidebarEntryEnabled` 的返回值
+   * 是同义反复 —— 真正的缺陷形态是「有 sanitize、没生产调用者」，用户关掉入口、
+   * 重启后又冒出来一行。所以这里走**真实的** `save()` / `load()`。
+   */
+  it('⚠️ 侧栏入口关闭可跨实例读回（关了就是关了，含老契约后端）', async () => {
+    const writer = createJetHubStore(makeCtx(undefined))
+    await writer.save({ accounts: [], disabledModels: {}, sidebarEntryEnabled: false })
+
+    const reader = createJetHubStore(makeCtx(undefined))
+    expect(reader.load()?.sidebarEntryEnabled).toBe(false)
+  })
+
+  it('老文档没有侧栏入口开关时缺省为显示（= 升级前行为）', () => {
+    mkdirSync(join(dir, 'jet-hub'), { recursive: true })
+    writeFileSync(
+      join(dir, 'jet-hub', 'state.json'),
+      JSON.stringify({ accounts: [], disabledModels: {} }),
+      'utf-8',
+    )
+    expect(createJetHubStore(makeCtx(undefined)).load()?.sidebarEntryEnabled).toBe(true)
+  })
+
+  it('侧栏入口开关落盘时脏值被归一化为显示', () => {
+    mkdirSync(join(dir, 'jet-hub'), { recursive: true })
+    writeFileSync(
+      join(dir, 'jet-hub', 'state.json'),
+      JSON.stringify({ accounts: [], disabledModels: {}, sidebarEntryEnabled: 'off' }),
+      'utf-8',
+    )
+    expect(createJetHubStore(makeCtx(undefined)).load()?.sidebarEntryEnabled).toBe(true)
   })
 
   /**
@@ -608,6 +663,8 @@ describe('文件后端（FileStore）', () => {
       gatewayAllowLan: false,
       // 原生搜索开关同理：写盘时缺省即启用，读回同值。
       nativeWebSearchEnabled: true,
+      // 侧栏入口开关同理：写盘时缺省即显示，读回同值。
+      sidebarEntryEnabled: true,
       // 顺序缺省空数组（未自定义）：读回同值。
       providerOrder: [],
       // 关闭意图缺省空表（没有任何供应商被关闭）：读回同值（Gitee IKP8OF）。

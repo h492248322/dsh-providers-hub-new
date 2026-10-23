@@ -35,7 +35,7 @@
 import type { AccountPool } from './account-pool.js'
 import { NEVER, UNUSABLE, type ExpiryProbe } from './aggregate-core.js'
 import type { BuddyCredential } from './buddy.js'
-import { fetchCreditBalance } from './credits.js'
+import { fetchCreditBalance, isExclusiveCreditPool } from './credits.js'
 import { CODEBUDDY } from './product.js'
 import { LOOMY } from './loomy-product.js'
 import type { LoomyCredential } from './loomy.js'
@@ -304,6 +304,97 @@ export const WIRED_EXPIRY_PROVIDERS: readonly string[] = Object.freeze([
  *  （面板与排序都不是高频路径），却让「刚登录的账号不出现在排序里」的窗口更长。
  */
 export const EXPIRY_CACHE_TTL_MS = 60_000
+/**
+ * **单渠道折算的总预算**（毫秒）。
+ *
+ * ## 为什么必须封顶
+ *
+ * 本函数内部 `for (const item of credentials)` **串行**折算，而单账号折算自带
+ * 30 s 级的上游超时（各 `*Expiry` 自己的 `*_REQUEST_TIMEOUT_MS`）⇒ 单渠道最坏
+ * 耗时 = **账号数 × 单账号超时**。账号池随用户增删账号线性增长，于是「发一条
+ * 消息 / 打开面板」的等待被账号数线性放大。
+ *
+ * ## ⚠️ 本仓库的**具体取证**（上游 86e3591 把它删了，本仓库保留）
+ *
+ * 上游删掉下面这段的理由，是**他们那份仓库里 `buddy` / `workbuddy` 查无实据**
+ * （`PROVIDER_REGISTRY` 只有 20 个 id、`src/` 下无 `buddy-*.ts`）。
+ * **该理由在本仓库不成立**：这两家就在下面的 {@link WIRED_EXPIRY_PROVIDERS} 里，
+ * 也都在 `provider-expiry.ts` 的 `createProviderExpiry()` 里（`buddyFamilyExpiry`）
+ * ⇒ 走 `buddyExpiry` → `fetchCreditBalance`（`credits.ts` 的
+ * `REQUEST_TIMEOUT_MS = 30_000`）。故这条**真实故障**证据在本仓库成立，按
+ * 「如实登记真实故障证据」保留：
+ *
+ * - 用户报障「重启后配置一直加载不出来」；同机实测 `session/modelCatalog`
+ *   冷启动 **290 000 / 222 000 / 54 000 ms**（中位 **222 秒**），而同一时刻
+ *   `settings/describe` 只要 **68 ms** ⇒ 事件循环没被堵，是本函数在逐账号串行等上游；
+ * - 该机账号池 **workbuddy 7 个号 + buddy 8 个号** ⇒ 最坏 `7×30 + 8×30 = 450 s`；
+ * - 账号数在 2026-10-17 23:00 到 10-18 00:30 之间从 **17 涨到 31**
+ *   ⇒ 用户感受到「昨天还能忍、今天撞墙」。
+ *
+ * ⚠️ 顺带订正上游 commit message 里一条**在本仓库为假**的断言：它说
+ * `credits.ts` 的 `REQUEST_TIMEOUT_MS`「在 `createProviderExpiry()` 里没有消费者
+ * （死路径）」—— 本仓库里 `fetchCreditBalance` **正是** buddy 系的消费者。
+ *
+ * ## ⚠️⚠️ 它封的是哪条路径（别读错 —— 这里已误判过两次）
+ *
+ * 本探针的消费者只有**两处**，且都**不在**目录加载路径上：
+ *
+ * | 消费者 | 何时跑 |
+ * |---|---|
+ * | `aggregate-adapter.ts` 的 `candidatesFor` | **发消息**（`prepareCall`） |
+ * | `aggregate-adapter.ts` 的 `describeExpiryOrder` | 面板「按临期排序」（用户点按钮） |
+ *
+ * ⚠️ `buildModelCatalog` / `resolveModel` / `listModels` / `refreshCatalog`
+ * **一律不调本探针**（前者走 `coldModelInfo` + 后台刷新，后两者只读各渠道目录）
+ * ⇒ **本预算不会缩短模型选择器的冷启动耗时**。想改善那条路径要动的是
+ * `AGGREGATE_BACKGROUND_REFRESH_TIMEOUT_MS` 与 `catalogForListModels`，不是这里。
+ * 把因果链写成「修 `modelCatalog` 冷启动」是**错的**（2026-10-22 审计实测：
+ * 那四个方法体里 `expiryProbe` 出现 0 次）。
+ *
+ * ## 为什么是 8 秒
+ *
+ * - `candidatesFor` 是**发消息**路径（用户按了发送正在等），超过 10 秒已可认为卡死；
+ * - 正常情况下一个渠道折算远低于 8 秒（本仓库排障日志里 codearts / trae / zcode
+ *   均在 1.2 秒内）—— 8 秒只截断「上游在超时边缘」的渠道；
+ * - 被截断的渠道按**保守方向**处理，与本文件铁律
+ *   「宁可少一个候选，不可把未知当可用」一致。
+ *
+ * ## ⚠️⚠️ 预算**按账号均分**，不是「先到先得」（2026-10-22 审计打穿后改）
+ *
+ * 初版是「首号吃满整个预算，耗尽就 `break`」。实测后果：某渠道的**第一个**账号
+ * 稳定慢于 8 秒 ⇒ 后面所有账号**每一轮都轮不到** ⇒ 每轮都 `UNUSABLE` ⇒ 还被
+ * `cacheAndReturn` 缓存 60 秒 ⇒ 该渠道在聚合轮换里**永久不可见**。
+ * 那正是上一版注释自称要避免的故障，被自己的实现从另一个入口做了出来
+ *（`listAvailableCredentials` 的顺序 = `readAccounts()` 固定顺序，无轮转 ⇒ 每轮
+ * 都是同一个「首号」）。
+ *
+ * ⇒ 现在每个账号只拿「**剩余预算 ÷ 剩余账号数**」（见循环处的 `perAccountMs`）：
+ * 总时长仍 ≤ 本预算，但**每个账号都有一次机会**。
+ *
+ * ⚠️ 截断**不是**把结果写成 `NEVER`：那会让一个我们其实没查清的渠道以
+ *   「永久可用」身份参与排序。已成功折算的账号仍按**真实观测值**返回
+ *   （如实登记：那是**部分观测**，不是全量）；一个都没成时才 `UNUSABLE`。
+ */
+export const EXPIRY_PROBE_BUDGET_MS = 8_000
+
+/**
+ * 单账号可用的**最低预算下限**（毫秒）。
+ *
+ * ## 为什么必须有下限（2026-10-22 审计打穿后补）
+ *
+ * 预算按「剩余预算 ÷ 剩余账号数」均分后，账号一多，每份就会小到不可用：
+ * 8 秒 ÷ 31 个账号 = **258 ms**，而正常的折算实测在 350 ms ~ 1.2 s 之间 ⇒
+ * **每个账号都会被自己的那份截断** ⇒ 整渠道 `UNUSABLE`，等于把「账号多」直接
+ * 变成「渠道不可见」。那与 {@link EXPIRY_PROBE_BUDGET_MS} 要解决的问题同型。
+ *
+ * ⇒ 每份取 `max(下限, 均分)`：宁可让本渠道**略微超出**总预算，也不让任何一个
+ * 账号因为「排得靠后」或「账号太多」而被跳过。超出量有界（≤ 账号数 × 下限），
+ * 且只在「前几个账号各自吃满自己那份」的病态情形下才叠加。
+ *
+ * ⚠️ 取值理由：1.2 秒是实测里最慢的正常渠道（trae）的耗时量级 ⇒ 取 1.5 秒留余量。
+ * 再小会让正常渠道被误截断；再大则「账号多」时总耗时增长过快。
+ */
+export const EXPIRY_PROBE_MIN_SLICE_MS = 1_500
 
 /**
  * `createExpiryProbe` 的返回类型：临期探针 **+ 缓存失效入口**。
@@ -323,6 +414,29 @@ export type ExpiryProbeWithCache = ExpiryProbe & { clear: () => void }
   now?: () => number
   /** 缓存时长（毫秒）；默认 {@link EXPIRY_CACHE_TTL_MS}。 */
   ttlMs?: number
+
+  /**
+   * 单渠道折算的**总预算**（毫秒）；默认 {@link EXPIRY_PROBE_BUDGET_MS}。
+   *
+   * `0` 表示**不封顶**（保留升级前行为，供需要精确结果的调用方与单测使用）。
+   *
+   * ## ⚠️⚠️ 非法值一律回落默认，绝不「静默劣化」（2026-10-22 审计打穿后修）
+   *
+   * 归一化见 {@link normalizeExpiryProbeBudget}。初版只判 `=== 0`，于是：
+   *
+   * | 传入 | 初版实际行为 |
+   * |---|---|
+   * | `Infinity`（「不封顶」最自然的直觉写法） | `setTimeout` 延迟溢出被 Node **钳成 1 ms** ⇒ 全部渠道瞬间 `UNUSABLE` |
+   * | `NaN` / `1e10` / 字符串 `'0'` | 同上（`1e10` 与 `'0'` 也溢出） |
+   * | `-1` | `deadline` 在过去 ⇒ **一个账号都不探** |
+   *
+   * ⇒ 只有**有限的非负数**才被采纳；其余（含 `Infinity`）一律回落默认值。
+   * 想让预算「不限时」请传 `0`（那是本字段唯一登记的「不封顶」写法）。
+   *
+   * ⚠️ 这是**每渠道**预算，不是全局预算：`candidatesFor` 逐渠道 `await`，
+   * 每个渠道独立计时 —— 一个渠道慢不会连坐其它渠道。
+   */
+  budgetMs?: number
   /**
    * 该渠道的**全部目录模型 id**（可选的加强依赖，2026-10-12 加入）。
    *
@@ -358,6 +472,72 @@ export type ExpiryProbeWithCache = ExpiryProbe & { clear: () => void }
    *    去重，而取数原语需要凭据）。
    */
   balanceOf?: (provider: string, accountId: string, credential: unknown) => Promise<unknown>
+}
+
+/**
+ * 归一化 {@link ExpiryProbeOptions.budgetMs}（**纯函数，可直接单测**）。
+ *
+ * ## 为什么必须有它（2026-10-22 审计打穿）
+ *
+ * 初版只判 `budgetMs === 0`，其余值原样交给 `setTimeout`。而 `setTimeout` 的
+ * 延迟是 **32 位有符号整数**，越界/`NaN` 会被 Node **钳成 1 ms**（并打一条
+ * `TimeoutOverflowWarning` / `TimeoutNaNWarning` 到 stderr）。实测后果：
+ *
+ * | 传入 | 实测（3 账号全挂死） |
+ * |---|---|
+ * | `Infinity`（「不封顶」最自然的直觉写法） | 每个账号**瞬间** UNUSABLE（计时器 1 ms） |
+ * | `NaN` / `1e10` / 字符串 `'0'` | 同上 |
+ * | `-1` | `deadline` 在过去 ⇒ **0 次 fetch** |
+ *
+ * ⇒ 判据：**只有有限的非负数被采纳**；`0` 保留「不封顶」语义；其余一律回落
+ * 默认值（`Infinity` 也回落 —— 想要不封顶请传 `0`，那是唯一登记的写法）。
+ *
+ * ⚠️ 上界 `2 ** 31 - 1` 是 `setTimeout` 自己的上限，超过它就会被钳成 1 ms ⇒
+ *   必须在**这里**截断，而不是指望 `setTimeout` 帮忙。
+ */
+export function normalizeExpiryProbeBudget(raw: unknown): number {
+  const max = 2 ** 31 - 1
+  if (typeof raw !== 'number' || !Number.isFinite(raw) || raw < 0) return EXPIRY_PROBE_BUDGET_MS
+  if (raw === 0) return 0
+  return Math.min(raw, max)
+}
+
+/**
+ * 算出「**当前这个账号**可以等多久」（**纯函数，可直接单测**）。
+ *
+ * ## 为什么把它抽出来（2026-10-22 变异验证的血泪）
+ *
+ * 这段算术原本内联在循环里，于是只能用**耗时**来判它有没有生效。实测：
+ * 「去掉 `min(剩余预算, …)`」这个变异只让 31 个账号的耗时从 8.01 s 变成 9.05 s
+ * —— 而**探测账号数两者完全相同**（都是 6 个）。⇒ 那条用例：
+ * - 用 `toBeLessThan(预算 + 5s)` 时对变异**完全无牙**；
+ * - 用 `toBeLessThan(预算 + 1.2s)` 时又会被 CI 抖动打成**时红时绿**。
+ *
+ * ⇒ 抽成纯函数后，判据变成**确定性的逐格算术**，与时钟无关。
+ *
+ * ## 口径：`min(剩余预算, max(下限, 均分))`
+ *
+ * | 项 | 作用 |
+ * |---|---|
+ * | `均分` = 剩余 ÷ 剩余账号数 | 让**每个账号都有机会**；快账号省下的预算自动滚给后面的 |
+ * | `下限` = {@link EXPIRY_PROBE_MIN_SLICE_MS} | 账号多时均分会小到不可用（8 s ÷ 31 = 258 ms，而正常渠道实测 350 ms~1.2 s）⇒ 没它会把「账号多」直接变成「全被截断」 |
+ * | **`min(剩余预算, …)`** | **总时长硬上界** —— 下限**不得**透支预算 |
+ *
+ * ⚠️ 第三项是必须的：我第一版漏了它，实测 31 个账号全挂跑了 **46.8 秒**（31 × 下限）。
+ *
+ * @param budgetMs - 已归一化的总预算；`0` 表示不封顶。
+ * @param remainingMs - 本渠道**还剩多少预算**（可能为负 / `Infinity`）。
+ * @param remainingAccounts - **含当前账号在内**还有几个没探。
+ * @returns 当前账号可等待的毫秒数（`Infinity` = 不封顶）。
+ */
+export function expiryProbeSliceMs(
+  budgetMs: number,
+  remainingMs: number,
+  remainingAccounts: number,
+): number {
+  if (budgetMs === 0) return Number.POSITIVE_INFINITY
+  const share = Math.floor(remainingMs / Math.max(1, remainingAccounts))
+  return Math.min(remainingMs, Math.max(EXPIRY_PROBE_MIN_SLICE_MS, share))
 }
 
 export function createExpiryProbe(
@@ -630,8 +810,123 @@ export function createExpiryProbe(
      * 后者会让实现方白走一次「查缓存 → 未命中」的分支（行为相同，但多一层间接）。
      */
     const cachedBalanceOf = options.balanceOf
-    for (const item of credentials) {
+    // ⚠️ 必须走归一化：初版直接 `?? EXPIRY_PROBE_BUDGET_MS`，于是 `Infinity`
+    //    （最像「不封顶」的写法）会让 `setTimeout` 溢出被钳成 1 ms ⇒ 全部渠道瞬间
+    //    UNUSABLE。判据与后果见 `normalizeExpiryProbeBudget` 的表。
+    const budgetMs = normalizeExpiryProbeBudget(options.budgetMs ?? EXPIRY_PROBE_BUDGET_MS)
+    /**
+     * 把一次「单账号折算」限制在给定预算内。
+     *
+     * ⚠️ **超时返回哨兵值而不是抛错**：这不是调用方中止，而是我们自己的预算用完。
+     * 抛 `AbortError` 会被上层误判成「用户取消」并冒泡成 `MISSING_CREDENTIAL`；
+     * 返回 `UNUSABLE` 才符合「本轮剔除该账号」的语义。
+     *
+     * ⚠️ **`signal` 是第三个竞争者**（2026-10-22 审计补）。`credentialExpiry` 的
+     * 签名里**没有** `signal`，各 `*Expiry` 用的是自己的 `AbortSignal.timeout(30_000)`
+     * ⇒ 折算层唯一的 abort 防线是循环顶部的 `throwIfAborted()` 与 catch 里的两条，
+     * 而**取消发生在 await 期间时它们全都看不到**。实测（`budgetMs: 0`，即升级前
+     * 语义，取消于 100 ms）：仍等满 1.5 秒才返回 `UNUSABLE`，并把它**缓存 60 秒**
+     * ⇒ 用户取消一次，该渠道对路由消失 60 秒，且报错是「请先登录」式的误导。
+     * 这是**既有缺陷**（非本次改动引入），但修它正好落在本函数里，故顺手补上。
+     *
+     * ⚠️ 超时**不取消**在途的 fetch（各 `*Expiry` 内部自带自己的超时信号，
+     * 它们会在自己的超时后结束）。这里只是**不再等它** —— 让它自然结束，
+     * 避免把上游连接强行掐断引发重试风暴。
+     *
+     * ⚠️ **`Promise.race` 会订阅全部竞争者**，故落败者的 reject 不会变成
+     * `unhandledRejection`（实测确认）。但**早退分支**（`budgetMs === 0`）只
+     * `await task`、不订阅别的 —— 那里必须靠 `task` 自己，别把它改成
+     * 「先建 race 再早退」（那会留下一个没人订阅的 promise）。
+     *
+     * ⚠️ 计时器**不能 `unref()`**（实测踩到）：调用方正 `await` 这次折算，
+     * 若计时器不保持进程活跃，Node 会判定「没有待办」直接退出 ——
+     * 独立验证时进程以 `Warning: Detected unsettled top-level await` 静默结束。
+     * 这与后台写盘的 `unref` 场景不同：这里的计时器是**前台等待**的一部分。
+     *
+     * @param budgetForThisAccount - 该账号可用的毫秒数（**已按剩余账号数均分**，
+     *   见循环处的 `perAccountMs`）；`budgetMs === 0` 时不封顶。
+     */
+    const withinBudget = async <T>(
+      budgetForThisAccount: number,
+      task: Promise<T>,
+      signal?: AbortSignal,
+    ): Promise<T | typeof UNUSABLE> => {
+      if (budgetMs === 0) return await task
+      let timer: ReturnType<typeof setTimeout> | undefined
+      let onAbort: (() => void) | undefined
+      /** 与 `timeout` 同一个哨兵：谁先胜出都只是「不再等」。 */
+      const timeout = new Promise<typeof UNUSABLE>((resolve) => {
+        timer = setTimeout(() => resolve(UNUSABLE), budgetForThisAccount)
+      })
+      /**
+       * 中止竞争者：**抛** `AbortError`（不是 resolve 哨兵）—— 中止必须原样逃逸，
+       * 与循环顶部 `signal?.throwIfAborted()` 同一口径。
+       */
+      const aborted = new Promise<never>((_resolve, reject) => {
+        if (signal === undefined) return
+        if (signal.aborted) {
+          reject(abortErrorOf(signal))
+          return
+        }
+        onAbort = () => reject(abortErrorOf(signal))
+        signal.addEventListener('abort', onAbort, { once: true })
+      })
+      try {
+        return await Promise.race([task, timeout, aborted])
+      } finally {
+        if (timer !== undefined) clearTimeout(timer)
+        if (onAbort !== undefined) signal?.removeEventListener('abort', onAbort)
+        // ⚠️ `aborted` 若从未胜出（正常路径），它内部登记的 listener 已被摘掉；
+        //    而 `Promise.race` 已订阅它 ⇒ 不会有未处理的 rejection。
+        //    但若 `signal` 已 aborted 且 `reject` 已发生、race 又先被 task 胜出，
+        //    那个 rejection 仍被 race 消费（实测无 unhandledRejection）。
+      }
+    }
+    // ⚠️ **本渠道的预算起点**（见 `EXPIRY_PROBE_BUDGET_MS` 的长注释）。
+    const deadline = budgetMs === 0 ? Number.POSITIVE_INFINITY : now() + budgetMs
+    for (let index = 0; index < credentials.length; index += 1) {
+      const item = credentials[index] as (typeof credentials)[number]
       signal?.throwIfAborted()
+      /**
+       * ⚠️⚠️ **预算按「剩余账号数」均分，且**双重封顶**（2026-10-22 审计打穿后改）。
+       *
+       * ## 初版为什么错
+       *
+       * 初版把整个剩余预算交给当前账号、耗尽就 `break`。实测后果（真实报文形状）：
+       * 第 1 号 12 秒后才失败、第 2 号 100 ms 就能成功 ⇒
+       *   `budgetMs: 0` → 真实到期时刻（渠道可用）
+       *   默认 8 秒    → `UNUSABLE`（渠道被判死，第 2 号**一次都没被问**）
+       * 而 `listAvailableCredentials` 的顺序 = `readAccounts()` 的**固定顺序**（无轮转）
+       * ⇒ 只要「首号」稳定慢于 8 秒，**每一轮**都是同一个首号、每一轮都 `UNUSABLE`
+       * ⇒ 再被 `cacheAndReturn` 缓存 60 秒 ⇒ 该渠道在聚合轮换里**永久不可见**。
+       * 这正是本常量上一版注释自称要避免的那件事。
+       *
+       * ## 现在的口径：`min(剩余预算, max(下限, 均分))`
+       *
+       * | 项 | 作用 |
+       * |---|---|
+       * | `均分` = 剩余 ÷ 剩余账号数 | 让**每个账号都有机会**，且快账号省下的预算自动滚给后面的 |
+       * | `下限` = {@link EXPIRY_PROBE_MIN_SLICE_MS} | 账号多时均分会小到不可用（8 s ÷ 31 = 258 ms < 正常渠道的 350 ms~1.2 s）⇒ 没它会把「账号多」直接变成「全被截断」 |
+       * | **`min(剩余预算, …)`** | **总时长硬上界** —— 下限**不得**透支预算 |
+       *
+       * ⚠️ 第三项是**必须**的（我第一版漏了它，实测 31 个账号全挂时跑了 **46.8 秒**
+       * = 31 × 下限）：没有 `min`，下限会在预算耗尽后继续续命 ⇒ 预算形同虚设。
+       * 现在 31 个账号全挂 ≈ 5 × 1500 + 500 = **8 秒**（有界），且**前 6 个账号都
+       * 拿到了一次机会**（不是只有首号）。
+       *
+       * ## 已知代价（如实登记）
+       *
+       * 账号数超过 `预算 ÷ 下限`（默认 8 s ÷ 1.5 s ≈ 5 个）时，**靠后的账号本轮探不到**
+       * ⇒ 若它们里有更早到期的那个，本轮返回的是**偏乐观**的到期时刻。
+       * 这与「未探完 ⇒ 保守 ⇒ UNUSABLE」的铁律**不冲突**：铁律管的是「一个都没成」，
+       * 这里已有一个成 ⇒ 渠道可用的**结论**是真的，只是排序值可能偏乐观。
+       * ⇒ 真要根治得让起点**轮转**（每轮从不同账号开始），那是独立改动，不在本处。
+       */
+      const remainingAccounts = credentials.length - index
+      const remaining = deadline - now()
+      // ⚠️ 预算真的用完了才停（`budgetMs === 0` 时 `remaining` 恒 Infinity，不会命中）。
+      if (budgetMs !== 0 && remaining <= 0) break
+      const perAccountMs = expiryProbeSliceMs(budgetMs, remaining, remainingAccounts)
       const credential = item.credential
       let value
       try {
@@ -643,7 +938,7 @@ export function createExpiryProbe(
          * ⚠️ `catalogIds` 在这里**不求值**（传的是个函数）：只有 zcode 会调它，
          * 其余 6 家每轮因此**零额外目录读取**（那是本仓库反复强调的成本）。
          */
-        value = await credentialExpiry(provider, credential, {
+        value = await withinBudget(perAccountMs, credentialExpiry(provider, credential, {
           ...item.entry.id === undefined ? {} : { accountId: item.entry.id },
           // ⚠️ officeace 的余额查询**必须**拿到 ref 才走云侧直读（见该字段注释）；
           //    其余家忽略它。
@@ -663,7 +958,7 @@ export function createExpiryProbe(
             : {
                 cachedBalance: () => cachedBalanceOf(provider, item.entry.id as string, credential),
               },
-        })
+        }), signal)
       } catch (error) {
         // 中止仍必须逃逸（与上面的 `try` 同一口径）。
         signal?.throwIfAborted()
@@ -679,6 +974,10 @@ export function createExpiryProbe(
     }
     // ⚠️ 一个都没成功 ⇒ 未知 ⇒ 剔除（不是 NEVER）。
     if (!anyConverted) return cacheAndReturn(provider, UNUSABLE, startedAt)
+    // ⚠️ **部分观测也要如实登记**：走到这里可能是「探完全部账号」，也可能是
+    //    「每个账号各吃满自己那份均分预算」。返回的是**已观测到的最小值**，
+    //    不声称它是全量最小值（真实代价：某个排得靠后的账号若更早到期，本轮看不到）。
+    //    这与「一个都没成 ⇒ UNUSABLE」是**两个不同结论**，不要合并。
     return cacheAndReturn(provider, earliest, startedAt)
     },
     /**
@@ -783,6 +1082,30 @@ async function credentialExpiry(
 function isAbortError(error: unknown): boolean {
   if (error === null || typeof error !== 'object') return false
   return (error as { name?: unknown }).name === 'AbortError'
+}
+
+/**
+ * 造一个 `AbortError`（供「预算等待期间被取消」那条腿用）。
+ *
+ * ⚠️ 为什么需要它：`signal.throwIfAborted()` 抛的是**平台自带的** `DOMException`
+ * / `AbortError`，而 `withinBudget` 的 abort 竞争者要自己造一个。两者必须**同类**
+ * ——`isAbortError` 只认 `name === 'AbortError'`，造错了（例如 `new Error()` 后忘了
+ * 改名）会让中止被上层 `catch` 吞成 `UNUSABLE`，正是本文件反复修的形态。
+ *
+ * ⚠️ 优先用 `signal.reason`：取消方可能带了自定义 reason（如上层传了 `DOMException`），
+ * 原样透传比自造更贴近「中止原样逃逸」的铁律。但只在它**确实是中止类**时才用
+ *（自定义 reason 可能是任意值，把它当 AbortError 抛会让 `isAbortError` 判假）。
+ */
+function abortErrorOf(signal: AbortSignal): unknown {
+  const reason = signal.reason as unknown
+  if (reason !== null && typeof reason === 'object'
+    && (reason as { name?: unknown }).name === 'AbortError') {
+    return reason
+  }
+  if (typeof DOMException === 'function') return new DOMException('This operation was aborted', 'AbortError')
+  const error = new Error('This operation was aborted')
+  error.name = 'AbortError'
+  return error
 }
 
 /** buddy 系：有效资源包 `deductionEndTime` 的最小值；无有效包 → NEVER。 */
@@ -948,6 +1271,20 @@ async function sharedPackageExpiry(
   for (const pkg of balance.packages) {
     if (pkg.active !== true) continue
     if (!(typeof pkg.remaining === 'number' && pkg.remaining > 0)) continue
+    /**
+     * ⚠️⚠️ **独立池不进折算**（2026-10-21 合并审计发现）。
+     *
+     * AStudio 的星火池是服务端下发的**独立池**（不参与主池合计、也不能当
+     * 通用积分消耗）。若把它算进来：
+     * ① `hasAnyCredit` 会因它为真 ⇒ 主池全空时也判「有余额」⇒ 账号**不被
+     * 剔除** ⇒ 聚合把请求发给一个只有专属池的账号 ⇒ 上游按主池计费 ⇒ 失败；
+     * ② `earliest` 会取**它**的到期时刻 ⇒ 星火池先过期时整个账号被判「马上
+     * 作废」⇒ 聚合把它排到最前 ⇒ **提前烧掉主池的长期积分**。
+     *
+     * ⚠️ 判据与后端选号侧（`buddy-balance-rank.ts`）同源（同一份
+     * `isExclusiveCreditPool`）⇒ 两侧口径一致。
+     */
+    if (isExclusiveCreditPool(pkg)) continue
     hasAnyCredit = true
     const end = pkg.deductionEndTime
     if (typeof end === 'number' && Number.isFinite(end) && end > 0 && end < earliest) earliest = end

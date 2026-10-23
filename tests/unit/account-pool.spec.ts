@@ -2715,6 +2715,119 @@ describe('AccountPool · setAccountsEnabled（供应商级批量启停）', () =
   })
 
   /**
+   * 「侧栏入口」总开关（与上面「渠道原生搜索」那组逐条同构）。
+   *
+   * ⚠️ 本组存在的理由与那组相同：这类偏好开关最常见的缺陷形态**不是**开关点不动，
+   * 而是「只接了内存副本与 RPC、两个持久化后端都没接」—— 用户关掉入口，重启后
+   * 那一行又冒出来。所以判据一律是**跨实例读回**，而不是同实例断言。
+   */
+  describe('侧栏入口总开关', () => {
+    it('默认显示（老用户升级后多出一行，但不会把已有布局改坏）', () => {
+      expect(new AccountPool(createMockContext() as never).sidebarEntryEnabled()).toBe(true)
+    })
+
+    it('⚠️ 关闭后可读回，且跨实例落盘（关了就是关了）', async () => {
+      const seeded = createMockContext([makeMockAccount()])
+      const writer = new AccountPool(seeded as never)
+      expect(writer.sidebarEntryEnabled()).toBe(true)
+      await writer.setSidebarEntryEnabled(false)
+      expect(writer.sidebarEntryEnabled()).toBe(false)
+
+      // 新实例从同一后端载入 —— 证明不是只改了内存副本。
+      expect(new AccountPool(seeded as never).sidebarEntryEnabled()).toBe(false)
+    })
+
+    it('重新打开后可读回 true', async () => {
+      const seeded = createMockContext()
+      const pool = new AccountPool(seeded as never)
+      await pool.setSidebarEntryEnabled(false)
+      await pool.setSidebarEntryEnabled(true)
+      expect(pool.sidebarEntryEnabled()).toBe(true)
+    })
+
+    it('⚠️ 改开关不得抹掉同一文档里的账号与黑名单', async () => {
+      const seeded = createMockContext([makeMockAccount()])
+      const pool = new AccountPool(seeded as never)
+      await pool.setSidebarEntryEnabled(false)
+
+      const raw = seeded.replacePayloads.at(-1) as
+        { accounts?: ProviderAccountEntry[]; disabledModels?: Record<string, unknown>; sidebarEntryEnabled?: boolean }
+      expect(raw.accounts).toHaveLength(1)
+      expect(raw.disabledModels).toBeDefined()
+      expect(raw.sidebarEntryEnabled).toBe(false)
+    })
+
+    it('⚠️ 另一次无关写入不得把已关闭的本开关抹回显示', async () => {
+      // `SettingsStore.save` 是整体替换白名单：漏掉本键时任何一次账号/黑名单/
+      // 顺序写入都会把它从文档里删掉，症状是「改个账号顺序，侧栏入口又回来了」。
+      const seeded = createMockContext([makeMockAccount()])
+      const writer = new AccountPool(seeded as never)
+      await writer.setSidebarEntryEnabled(false)
+      const other = new AccountPool(seeded as never)
+      await other.setProviderOrder(['buddy'])
+
+      expect(new AccountPool(seeded as never).sidebarEntryEnabled()).toBe(false)
+    })
+  })
+
+  /**
+   * 「允许局域网访问」开关（与上面「侧栏入口」那组逐条同构）。
+   *
+   * ⚠️⚠️ **本组存在的理由**（2026-10-22 对抗审计 M-3）：这个开关加进来时
+   * `queueStoreSave` 的快照已经带上了 `gatewayAllowLan`，但**一条用例都没有**。
+   * 审计实测：把 `src/account-pool.ts` 里那一行删掉，3 个 spec、**182 条用例全绿**。
+   *
+   * 而后果是**真可达的**：`SettingsStore.save` 是整体替换语义 ⇒ 漏键时任何
+   * 一次账号 / 黑名单 / 顺序写入都会把它从文档里删掉 ⇒ 重启后
+   * 静默回到只绑回环，用户会以为「开关坏了」（局域网访问忽然不通）。
+   *
+   * ⚠️ 判据一律是**跨实例读回**（与本文件其它开关组同因）：只断言同实例读回，
+   * 一个「没写磁盘」的实现照样骗过用例。
+   */
+  describe('允许局域网访问开关', () => {
+    it('默认关闭（暴露面变大必须是显式选择）', () => {
+      expect(new AccountPool(createMockContext() as never).gatewayAllowLan()).toBe(false)
+    })
+
+    it('⚠️ 打开后可读回，且跨实例落盘', async () => {
+      const seeded = createMockContext([makeMockAccount()])
+      const writer = new AccountPool(seeded as never)
+      expect(writer.gatewayAllowLan()).toBe(false)
+      await writer.setGatewayAllowLan(true)
+      expect(writer.gatewayAllowLan()).toBe(true)
+      // 新实例从同一后端载入 —— 证明不是只改了内存副本。
+      expect(new AccountPool(seeded as never).gatewayAllowLan()).toBe(true)
+    })
+
+    it('⚠️⚠️ 另一次无关写入不得把已打开的本开关抹回关闭（M-3 删行变异就是这样全绿的）', async () => {
+      // 整体替换语义：`queueStoreSave` 快照漏掉本键时，任何一次账号/黑名单/
+      // 顺序写入都会把它从文档里删掉 ⇒ 重启后静默回到只绑回环。
+      const seeded = createMockContext([makeMockAccount()])
+      const writer = new AccountPool(seeded as never)
+      await writer.setGatewayAllowLan(true)
+      // 无关写入：另一个实例改供应商顺序（不带本键）
+      const other = new AccountPool(seeded as never)
+      await other.setProviderOrder(['buddy'])
+
+      expect(
+        new AccountPool(seeded as never).gatewayAllowLan(),
+        '一次无关写入就把「允许局域网」抹掉了 —— `queueStoreSave` 快照漏了 gatewayAllowLan',
+      ).toBe(true)
+    })
+
+    it('⚠️ 改本开关不得抹掉同一文档里的账号与黑名单', async () => {
+      const seeded = createMockContext([makeMockAccount()])
+      const pool = new AccountPool(seeded as never)
+      await pool.setGatewayAllowLan(true)
+
+      const raw = seeded.replacePayloads.at(-1) as
+        { accounts?: ProviderAccountEntry[]; disabledModels?: Record<string, unknown>; gatewayAllowLan?: boolean }
+      expect(raw.accounts).toHaveLength(1)
+      expect(raw.disabledModels).toBeDefined()
+      expect(raw.gatewayAllowLan).toBe(true)
+    })
+  })
+  /**
    * 账号入库的**观察点**（Gitee issue IKJOZB）。
    *
    * 该 issue 的根因是「冷启动空池 ⇒ 续期调度器不武装 ⇒ 之后登录的账号永不续期」。

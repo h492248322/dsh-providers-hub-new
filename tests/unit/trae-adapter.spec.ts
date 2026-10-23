@@ -1720,6 +1720,62 @@ describe('TRAE 适配器 · 消息序列化（真实缺陷回归）', () => {
     expect(imageIndex, '外侧图片不得被静默丢弃').toBeGreaterThan(toolIndex)
   })
 
+  it('⚠️ 一个 assistant 发多个 tool_call、「非最后一个」结果内嵌图片时，全部 tool 必须紧密相邻（4027 真实缺陷 · 多调用漏网场景）', async () => {
+    // 真实复现（2026-10-19）：模型一次并发调了 read_image + read，
+    // 图片在**第一个**结果里。旧实现在每条 user 消息末尾无条件 flushToolImages()，
+    // 而 DSH 0.1.7 把每条 tool 结果转成**独立的** role:'user' 消息 ⇒ 图片被 flush 成
+    // user 消息插在第 2 条 role:'tool' 之前 ⇒ 上游恒定 4027，且坏报文落库后会话永久卡死。
+    //
+    // 旧回归用例只覆盖 1 个 tool_call，故这条路径从未被测到。
+    const { adapter, fetcher } = makeAdapter({
+      responses: [sseResponse(soloSse(['done', { finish_reason: 'stop' }]))],
+      remoteModels: [{ id: 'deepseek-v4.1-flash', name: 'DeepSeek-V4.1-Flash', multimodal: true }],
+      readImage: async () => ({ data: new Uint8Array([137, 80, 78, 71]), mediaType: 'image/png' }),
+    })
+    await collect(adapter, {
+      model: 'deepseek-v4.1-flash',
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool-call', id: 'call_img', name: 'read_image', arguments: '{}' },
+            { type: 'tool-call', id: 'call_txt', name: 'read', arguments: '{}' },
+          ],
+        },
+        // DSH 0.1.7：每个工具结果是**独立**的 role:'tool' 消息。
+        {
+          role: 'tool',
+          toolCallId: 'call_img',
+          content: [
+            { type: 'text', text: '<path>x.png</path>' },
+            { type: 'image', attachment: { attachmentId: 'att-1' } },
+          ],
+        },
+        {
+          role: 'tool',
+          toolCallId: 'call_txt',
+          content: [{ type: 'text', text: '文件内容' }],
+        },
+      ],
+    } as unknown as GenerateOptions)
+
+    const messages = sentBody(fetcher).messages as Array<Record<string, any>>
+    const assistantIndex = messages.findIndex((m) => m.role === 'assistant')
+    const toolIndexes = messages
+      .map((m, i) => (m.role === 'tool' ? i : -1))
+      .filter((i) => i >= 0)
+
+    expect(toolIndexes.length, '两条 tool 结果都必须下发').toBe(2)
+    // 🔴 核心断言：**两条 tool 必须紧挨着**，中间不得插入任何消息（尤其带图 user 消息）。
+    expect(toolIndexes[0], '第一条 tool 必须紧跟 assistant tool_calls').toBe(assistantIndex + 1)
+    expect(toolIndexes[1], '第二条 tool 必须紧邻第一条，中间不得插入 user 消息').toBe(toolIndexes[0] + 1)
+
+    // 图片不得静默丢失，且必须排在**所有** tool 消息之后。
+    const imageIndex = messages.findIndex((m) => JSON.stringify(m.content ?? '').includes('image_url'))
+    expect(imageIndex, '图片不得静默丢失').toBeGreaterThan(-1)
+    expect(imageIndex, '图片应挂在全部 tool 消息之后').toBeGreaterThan(toolIndexes[1])
+  })
+
   it('孤儿 tool-call 被剔除（会话自愈，避免上游 400）', async () => {
     const { adapter, fetcher } = makeAdapter({
       responses: [sseResponse(soloSse(['done', { finish_reason: 'stop' }]))],

@@ -27,7 +27,7 @@ describe('ProviderDescriptor：与既有产物的逐条一致性', () => {
     }
   })
 
-it('共 22 条（20 个真渠道 + aggregate + codely；codely 2026-10-20 仍 channel:false）', () => {
+it('共 23 条（21 个真渠道 + aggregate；codely 2026-10-22 已翻 channel:true）', () => {
     // ⚠️ 2026-10-13 合并：officeace（第 15）与 accio（第 16）**同一次**并入，
     //    故从 15/14 直接跳到 17/16 —— 不是漏了一格。
     // ⚠️ 2026-10-15 加 minimaxintl（MiniMax Code 国际版，第 17 个真渠道）：
@@ -43,10 +43,14 @@ it('共 22 条（20 个真渠道 + aggregate + codely；codely 2026-10-20 仍 ch
     // ⚠️ 2026-10-20 合并 remote master 时 astudio 随上游并入（21 → 22 条），而本条
     //    期望值当时仍是上游的 21 ⇒ 变红。按**注册表事实**更正为 22（这条断言是
     //    「注册表没被误删」的唯一防线，数字必须跟着注册表走，不能反向改注册表凑数）。
-    expect(PROVIDER_REGISTRY).toHaveLength(22)
-    expect(PROVIDER_REGISTRY.filter((d) => d.channel).length).toBe(20)
-    expect(PROVIDER_REGISTRY.find((d) => d.id === 'aggregate')?.channel).toBe(false)
-    expect(PROVIDER_REGISTRY.find((d) => d.id === 'codely')?.channel).toBe(false)
+    expect(PROVIDER_REGISTRY).toHaveLength(23)
+    // ⚠️ 2026-10-22（A6）：codely **已翻 `channel: true`** —— 它的推理 / 目录 / 余额 / 签到 / 续期全部已接线，
+    //    而 `channel` 在生产代码里**零个读取点** ⇒ 原来那个 `false` 只是为了让守卫不变红而选的，它同时把 codely 挡在聚合目录之外。现在真实接线已完成，翻正。
+    expect(PROVIDER_REGISTRY.filter((d) => d.channel).length).toBe(22)
+    expect(
+      PROVIDER_REGISTRY.find((d) => d.id === 'codely')?.channel,
+      'codely 已接线完成，必须是 channel: true（否则它的模型永不进聚合目录）',
+    ).toBe(true)
   })
 
   /**
@@ -318,5 +322,76 @@ describe('客户端图标表与 registry 同步（行为断言）', () => {
       expect(typeof icon, `${id} 的图标类型`).toBe('string')
       expect((icon as string).startsWith('data:image/'), `${id} 的图标必须是 data URI`).toBe(true)
     }
+  })
+
+  /**
+   * ★ 对象字面量里**不得有重复键**（`pnpm build:all` 的 `duplicate-object-key` 警告）。
+   *
+   * ## 为什么上面那两条守卫抓不到它（真实缺陷，2026-10-22）
+   *
+   * PR #1 的 `b69e6736 feat(codely)` 往 `PROVIDER_ICONS` 末尾追加 `codely` 时，
+   * 把 `autoclaw` / `modelscope` / `aggregate` 三个键**又抄了一遍**。而 JS 的对象
+   * 字面量语义是「后者胜」⇒
+   *
+   * - `Object.keys()` 集合**完全不变** ⇒ 上面那条「键集合相等」**照样全绿**；
+   * - 三个重复键的值恰好相同 ⇒ 上面那条「非空 data URI」也**照样全绿**。
+   *
+   * 唯一暴露它的是 `pnpm build:all` 的 esbuild 警告：
+   * ```
+   * ▲ [WARNING] Duplicate key "autoclaw" in object literal [duplicate-object-key]
+   * ```
+   * 而 `build.mjs` **没有把警告升级成失败**，`pnpm test` 也不跑 esbuild ⇒
+   * 这是一个**只有人手看构建日志才会发现**的缺口。
+   *
+   * ⚠️ 当时的三个值相同所以没有功能后果，但「守卫全绿 + 构建有警告」正是本仓库
+   * 记过的假绿形态：哪天两处值不同，就会静默用错图标而**没有任何**报警。
+   *
+   * ## 判据为什么读源码文本（本文件唯一一处）
+   *
+   * 重复键在**求值后**就消失了（后者覆盖前者），import 出来的对象里**无法**观测
+   * —— 没有行为等价物。故只能读文本，且必须**剥掉注释**（注释里出现
+   * `autoclaw: AUTOCLAW_ICON` 这类示例不算重复键），并**限定在对象字面量范围内**
+   * （文件里还有别的对象）。
+   */
+  it('★ PROVIDER_ICONS 字面量里没有重复键（esbuild duplicate-object-key 的文本判据）', async () => {
+    const { readFileSync } = await import('node:fs')
+    const raw = readFileSync(
+      new URL('../../plugin-src/client/provider-icons.js', import.meta.url),
+      'utf8',
+    )
+    // ① 剥注释（行注释 + 块注释）—— 否则注释里的示例会被当成真键。
+    const stripped = raw
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/(^|[^:])\/\/[^\n]*/g, '$1')
+    // ② 只取 `PROVIDER_ICONS = { … }` 这一段（文件里还有 `PROVIDER_ICON_*` 常量）。
+    const start = stripped.indexOf('export const PROVIDER_ICONS')
+    expect(start, '找不到 PROVIDER_ICONS 字面量 —— 本判据的锚点失效了，先修判据').toBeGreaterThan(-1)
+    const open = stripped.indexOf('{', start)
+    // 用括号配对找结尾（值里是 data URI 字符串，不含花括号）。
+    let depth = 0
+    let end = -1
+    for (let i = open; i < stripped.length; i += 1) {
+      if (stripped[i] === '{') depth += 1
+      else if (stripped[i] === '}') {
+        depth -= 1
+        if (depth === 0) { end = i; break }
+      }
+    }
+    expect(end, 'PROVIDER_ICONS 的花括号没有配对 —— 本判据的锚点失效了').toBeGreaterThan(open)
+    const body = stripped.slice(open + 1, end)
+    // ③ 提顶层键（行首可选空白 + `标识符:`；值里的对象字面量本文件不存在）。
+    const keys = [...body.matchAll(/^[ \t]*([A-Za-z_$][\w$]*)\s*:/gm)].map((m) => m[1]!)
+    expect(keys.length, '一个键都没提到 ⇒ 判据失效（不是「没有重复」）').toBeGreaterThan(15)
+    const seen = new Set<string>()
+    const dup: string[] = []
+    for (const key of keys) {
+      if (seen.has(key)) dup.push(key)
+      seen.add(key)
+    }
+    expect(
+      dup,
+      'PROVIDER_ICONS 里有重复键 ⇒ esbuild 会报 duplicate-object-key 警告，'
+      + '而 `Object.keys()` 守卫**看不见**它（后者胜，键集合不变）。请删掉重复行。',
+    ).toEqual([])
   })
 })

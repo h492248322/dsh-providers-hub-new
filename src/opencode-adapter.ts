@@ -51,6 +51,7 @@ import {
   type OpencodeModelCapability,
 } from './opencode-capability.js'
 import { proxyFetch } from './opencode-proxy.js'
+import { createModelCatalog, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
 import { consumeOpenAiSse, collectImages, httpErrorCode, serializeMessages } from './openai-compat.js'
 import { registerAdapterIdempotent } from './llm-register-compat.js'
 import { reportLedgerAccount } from './token-ledger.js'
@@ -156,20 +157,17 @@ export interface OpencodeAdapterOptions {
   identitySlots: () => Promise<readonly IdentitySlot[]>
   /** 拉远端目录；缺省时直接用兜底表。 */
   fetchRemoteCatalog?: OpencodeCatalogFetcher
-  /** 用户模型黑名单。 */
-  disabledModels?: () => ReadonlySet<string>
   /**
-   * 「该供应商**整体关闭**」探测（Gitee issue IKP8OF）。
+   * 账号池（**黑名单、关闭意图的唯一数据源**）。
    *
-   * ⚠️ **与 {@link disabledModels} 是两条腿，不可互相替代**：
-   * 后者是「这些具体 id 被关着」（有界集合），而本回调回答的是
-   * 「用户要求整个供应商关着吗」—— 它能覆盖**关闭之后才出现的模型**，
-   * 那些 id 从未进过黑名单，`disabledModels` 永远看不到它们。
+   * ⚠️⚠️ **2026-10-23 迁移**：本家此前手写 `listModels`，黑名单与关闭意图靠
+   * `disabledModels` / `providerClosed` 两个**选项回调**传进来。那两个字段
+   * 已随迁移删除 —— 现在统一由共享骨架（`model-catalog.ts`）从本池读取。
    *
-   * 本家不走共享骨架（`model-catalog.ts`），故必须在这里显式判一次；
-   * 缺失时按「未整体关闭」处理（老接线 / 单测替身的行为逐字不变）。
+   * ⚠️ 省略时（单测 / 嵌入方）行为退回「不过滤、不判关闭意图」；
+   * **生产接线必须传**（`index.ts` 负责，且有守卫逐家点名）。
    */
-  providerClosed?: () => boolean
+  accountPool?: import('./account-pool.js').AccountPool
   /** 记录受限的副作用（切槽时由接线层提供）。 */
   markLimited?: (slotId: string, modelId: string, resetAtMs: number) => Promise<void>
   /** 诊断日志。 */
@@ -236,8 +234,28 @@ export function opencodeRetryAfterMs(
 }
 
 export class OpencodeAdapter extends LlmAdapter {
+  /**
+   * 共享目录骨架（`model-catalog.ts`）——**黑名单 / 关闭意图 / 目录门控 /
+   * 模态回填 / 映射**的唯一实现处（2026-10-23 迁移，见 `listModels` 的注释）。
+   */
+  private readonly skeletonCatalog: ModelCatalog
+
   constructor(private readonly options: OpencodeAdapterOptions) {
     super()
+    // ⚠️⚠️ **`accountPool` 必须是真池**：骨架里 `deps.accountPool?.disabledModelsFor`
+    //    与 `providerClosedFor?.(...)` 全靠它；传 `{}` 或 `undefined` 会让
+    //    `?.` 变成静默 no-op（Gitee IKP8OF 实测过的形态）。
+    this.skeletonCatalog = createModelCatalog(
+      this.options.accountPool === undefined ? {} : { accountPool: this.options.accountPool },
+      {
+        product: OPENCODE,
+        loadCatalog: () => this.loadCatalogEntries(),
+        syncCatalog: () => this.syncCatalogEntries(),
+        // ⚠️ 未知 id **保守报 `['text']`**：能力表查不到时把「未知」当「支持」
+        //    会让 DSH 把图片投影成上游不接受的形态（与本文件迁移前口径一致）。
+        unknownModelInputModalities: () => ['text'] as const,
+      },
+    )
   }
 
   providerInfo(provider: string): LlmProviderInfo {
@@ -272,55 +290,75 @@ export class OpencodeAdapter extends LlmAdapter {
     return OPENCODE_FALLBACK_MODELS.map((m) => ({ id: m.id, name: m.name, isFree: m.isFree }))
   }
 
+  /**
+   * 模型选择器的目录 —— **委托共享骨架**（`model-catalog.ts`）。
+   *
+   * ## ⚠️⚠️ 2026-10-23 迁移（用户要求：实体 provider 一律走共享骨架）
+   *
+   * 迁移前本方法**手写**了四件事：判 `providerClosed`、槽位门控、
+   * 「只有匿名身份时只给免费模型」、过滤 `disabledModels` + 手工 map。
+   * 其中「关闭意图 / 黑名单 / 模态回填 / `provider` 回填」与其余 13 家
+   * **逐字同义** ⇒ 各写一份正是 Gitee IKP8OF 那类漂移缺陷的温床。
+   *
+   * 现在那四条由骨架承担，**本家独有的两条**放进 `loadCatalog`
+   * （`loadCatalogEntries`）：
+   * - 无任何槽位 ⇒ 返回 `[]`（隐藏 provider 分组）；
+   * - **只有匿名身份时只给免费模型**（用户定稿的可见性口径）。
+   *
+   * ⚠️ 模态仍走 `inputModalitiesOf`（**远端能力表**），在 `toCatalogEntry` 里。
+   */
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
-    // ⚠️⚠️ 「供应商整体关闭」⇒ 一条都不播（Gitee issue IKP8OF）。
-    // 排在槽位读取之前：关闭态下不需要任何身份/目录工作，且新模型
-    // （关闭之后才进远端目录的）不在黑名单里，只能靠本判据拦住。
-    if (this.options.providerClosed?.() === true) return []
+    return await this.skeletonCatalog.listModels(_provider)
+  }
+
+  /**
+   * 异步读目录并转成骨架的中间结构。
+   *
+   * ⚠️⚠️ **本家独有门控全在这里**（迁移前它们散在 `listModels` 里）：
+   * ① 无任何槽位 ⇒ `[]`；② 只有匿名身份 ⇒ 只留免费模型。
+   *
+   * ⚠️ **顺序约束**（2026-10-17 对抗审计实测澄清）：能力表注入发生在
+   * `catalog()` 内层（经 `loadOpencodeCatalog`），故这里**不需要**再前置读一次。
+   * 若将来 `catalog()` 出现**不经过 `loadOpencodeCatalog`** 的路径，
+   * 该约束会重新失效 —— 那时必须在这里补回并同时补一条能抓住它的守卫。
+   */
+  private async loadCatalogEntries(): Promise<readonly CatalogEntry[]> {
     const slots = await this.options.identitySlots()
-    // 无任何槽 = 连匿名槽都没了（异常态）：返回空数组隐藏 provider 分组，
+    // 无任何槽 = 连匿名槽都没了（异常态）：空目录隐藏 provider 分组，
     // **不抛错**（抛错会多一条 provider 级报错，UI 表现为「供应商加载失败」）。
     if (slots.length === 0) return []
-    // ⚠️⚠️ **这里的顺序约束在下一行，不在本函数**（2026-10-17 对抗审计实测澄清）。
-    //
-    // 远端的「协议可达性」与「免费判定」两张表是由 `opencode-capability.ts`
-    // 归一 models.dev 时注入的（见 `publishRemoteTables`），而注入发生在
-    // **读能力表**的那一刻；`catalog()` 内部会逐条调
-    // `isReachableOpencodeModel` / `isFreeOpencodeModel` 过滤远端目录。
-    //
-    // ⚠️ **本函数原本也有一句前置读**，注释写着「顺序不能颠倒」。实测
-    //   （对抗审计 + 我复现）：**那句是冗余的** —— 真正兜住顺序约束的是
-    //   `loadOpencodeCatalog` 里更靠前的那次读（它在 `catalog()` 被调用的
-    //   更内层，必然先执行）。证据：单独去掉本函数那句，全仓 27+9084 条
-    //   单测**仍全绿**；两处同时去掉，端到端守卫立刻变红。
-    //
-    // ⇒ 已删掉本函数那句（避免两处同款前缀、且让人误以为改这里就够了）。
-    //    若将来 `catalog()` 出现**不经过 `loadOpencodeCatalog`** 的路径
-    //    （例如直接用兜底表、或新增别的目录源），顺序约束会**重新失效** ——
-    //    那时必须在这里补回，并**同时**补一条能抓住它的守卫。
-    //
-    // ⚠️ **同步**读（不 await）：渲染路径上等网络会让模型选择器一直空白
-    // （真机事故 2026-10-02）。能力表在下面 map 时用到。
     const all = await this.catalog()
-    const capabilities = getOpencodeCapabilitiesSync()
     // ⚠️ 可见性口径（用户定稿）：只有匿名身份时**只给免费模型**。
     // 免费判定以**远端 models.dev 的 cost** 为准（由上面那次读取注入）。
     const hasAccountSlot = slots.some((s) => s.kind === 'account')
     const visible = hasAccountSlot ? all : all.filter((m) => isFreeOpencodeModel(m.id))
-    const disabled = this.options.disabledModels?.() ?? new Set<string>()
-    return visible
-      .filter((m) => !disabled.has(m.id))
-      .map((m) => ({
-        provider: OPENCODE.id,
-        id: m.id,
-        name: m.name,
-        // ⚠️ 模态以**远端能力表**为准，不再一律 text（用户报障
-        // 「space-bunny-free 发图提示不支持」：该模型实测接受图片，
-        // 而我们硬编码 ['text'] 让 DSH 在本地就把图投影成了文字占位符）。
-        // ⚠️ 能力表拿不到时**保守回退 text**（`inputModalitiesOf` 的实现）——
-        // 声明支持就必须真支持，这是本仓库的硬约定。
-        inputModalities: inputModalitiesOf(capabilities, m.id),
-      }))
+    return visible.map((m) => this.toCatalogEntry(m))
+  }
+
+  /**
+   * **同步**全量目录（`listAllModels()` 用）。
+   *
+   * ⚠️ 与 `loadCatalogEntries` 同一套转换口径（否则「设置页看到的」与
+   * 「选择器看到的」会分叉）；差别只在不打网络：这里用兜底表。
+   */
+  private syncCatalogEntries(): readonly CatalogEntry[] {
+    return OPENCODE_FALLBACK_MODELS.map((m) => this.toCatalogEntry(m))
+  }
+
+  /** 本家私有形状 → 骨架的 `CatalogEntry`（**唯一**转换点）。 */
+  private toCatalogEntry(m: OpencodeCatalogEntry): CatalogEntry {
+    const capabilities = getOpencodeCapabilitiesSync()
+    return {
+      id: m.id,
+      name: m.name,
+      // ⚠️ 模态以**远端能力表**为准，不再一律 text（用户报障
+      // 「space-bunny-free 发图提示不支持」：该模型实测接受图片，
+      // 而我们硬编码 ['text'] 让 DSH 在本地就把图投影成了文字占位符）。
+      // ⚠️ 能力表拿不到时**保守回退 text**（`inputModalitiesOf` 的实现）——
+      // 声明支持就必须真支持，这是本仓库的硬约定。
+      inputModalities: inputModalitiesOf(capabilities, m.id),
+      ...(m.isFree === true ? { isFree: true } : {}),
+    }
   }
 
   async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {

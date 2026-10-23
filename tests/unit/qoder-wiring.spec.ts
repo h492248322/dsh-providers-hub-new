@@ -381,7 +381,12 @@ describe('Qoder 同族 RPC 注册表（src/jet-hub-rpc.ts）', () => {
     //    「本 case 内」的合理范围），改的是**窗口**不是判据。
     const branch = code.slice(start, start + 8000)
     expect(branch).toContain('isQoderFamily(req.provider)')
-    expect(branch).toContain('fetchQoderCreditBalance(credential, product)')
+    // ⚠️ 2026-10-21 改：此处原断言 `fetchQoderCreditBalance(credential, product)`。
+    //    面板改用**带原因**的变体 `fetchQoderBalanceDetailed`（同一个文件里
+    //    并列存在，前者只回 `null`、后者回 `{ balance, error }`）。断言要守的
+    //    不变式是「余额查询按 `product` 分站」—— 即调用点必须**把 product 传进去**
+    //    （两站 `openApiBase` 不同，传错就查到别人的账），故判据换成新函数名。
+    expect(branch).toContain('fetchQoderBalanceDetailed(credential, product)')
     // ⚠️ 核心：qoder 的特例必须**先于**查表 —— 否则它会落到积分表里
     //    （表里没有 qoder 条目 ⇒ 变成 `unsupported provider`，用户看到
     //    「该渠道不支持积分」而它其实有余额接口）。行为由

@@ -5,7 +5,9 @@ import Schema from '@deepseek-ai/schemastery'
 // Codely 的续期服务对象（2026-10-20：推理已走 HTTP 自签，这里只负责续期）
 import { CodelyAuth } from './codely-auth-service.js'
 import { createHash } from 'node:crypto'
-import { registerCodeArtsLlm, PROVIDER as CODEARTS_PROVIDER } from './llm-adapter.js'
+import { codeartsImagePart, codeartsVisionModel, registerCodeArtsLlm, PROVIDER as CODEARTS_PROVIDER } from './llm-adapter.js'
+// ⚠️ `analyzeImage`：让纯文本模型也能看图（2026-10-21）。模块头有完整判据链。
+import { installAnalyzeImage } from './analyze-image.js'
 import { startCatalogPrewarm } from './catalog-prewarm.js'
 import { broadcastCatalogChanged } from './catalog-broadcast.js'
 import { registerBuddyLlm } from './buddy-adapter.js'
@@ -52,7 +54,7 @@ import { buddyExpiringWindowDays } from './buddy-balance-rank.js'
 import { BuddyBalanceSelector } from './buddy-balance-selector.js'
 import type { BuddyNoAccountReason } from './buddy-balance-selector.js'
 import type { LoomyNoAccountReason } from './loomy-balance-selector.js'
-import { createCredentialResolver } from './credential-resolver.js'
+import { createCredentialResolver, NO_FREE_MODEL } from './credential-resolver.js'
 import { LOBSTERAI } from './lobsterai-product.js'
 import { QODER, QODER_CN } from './qoder-product.js'
 import { TRAE } from './trae-product.js'
@@ -173,7 +175,7 @@ import * as officeaceAuth from './officeace-auth.js'
 // 自签直连，`codely-sign.ts`；`CodelyAdapter` 同时供 `probeById` 探测用）。
 import { CodelyAdapter, registerCodelyLlm } from './codely-adapter.js'
 import { CODERLY } from './codely-product.js'
-import { readCodelyCredential, type CodelyCredential } from './codely-auth.js'
+import { CODELY_PROVIDER_ID, readCodelyCredential, type CodelyCredential } from './codely-auth.js'
 // 「锁定永久积分」在 officeace 上的**唯一执行实现**（issue IKLTHB 第 ① 条：
 // 该渠道登记了 `permanentLock: true`，而原先全仓没有任何代码读这张锁定表）。
 import { createOfficeAceCredentialProvider } from './officeace-lock.js'
@@ -1167,7 +1169,85 @@ export function apply(ctx: Context): void {
       return outcome === undefined ? undefined : isRemoteCatalogComplete(outcome)
     },
     accountPool: pool,
+    // 图片字节桥接（2026-10-21 接通）。
+    //
+    // ⚠️ 复用**同一个** `makeReadImage(ctx)` —— 不另写第二套（其余 14 家全走它）。
+    //
+    // ⚠️ 只有 VL 模型（`kimi-k2.6-vl` / `Qwen3-VL-235B`）能收图，实测文本模型
+    //    发图回 `InferHub.001001020.406 The request model is not multimodal`。
+    //    适配器内部按 `codeartsAcceptsImage(model)` 判定，非 VL 模型**根本不读字节**
+    //    （见 `stream()` 的注释），故这里不必再加一层判据。
+    readImage: makeReadImage(ctx),
   })
+
+  /**
+   * `analyzeImage`：让**纯文本模型**也能看图（2026-10-21，用户诉求）。
+   *
+   * ## 为什么走适配器自己的 `stream()` 而不是 `ctx.llm.stream()`
+   *
+   * 直接用本适配器实例有三个好处，且都是**必须**的：
+   * 1. 复用同一套凭据解析与**请求级换号**（池里哪个号能用、撞额度怎么换）；
+   * 2. 复用 `codeartsAcceptsImage` 的读图闸门与 `image_url` 序列化（同一份实现）；
+   * 3. 不经过 `ctx.llm` 的路由投影 —— 那条路会按**目标模型**的模态再判一遍。
+   *
+   * ## ⚠️ 每次识图是**一次独立的、非会话的**上游请求
+   *
+   * 它不写进会话历史、不占会话的 tool 轮次，与 IDE 的 `analyzeImage` 同构。
+   * 故这里手工构造 `messages`（不传 `tools`、不传 system）。
+   */
+  const describeWithVision = async (
+    imageDataUrls: readonly string[],
+    prompt: string,
+    signal: AbortSignal,
+  ): Promise<string> => {
+    const visionModel = codeartsVisionModel()
+    const parts: Array<Record<string, unknown>> = [
+      ...imageDataUrls.map((url) => codeartsImagePart(url)),
+      { type: 'text', text: prompt },
+    ]
+    let text = ''
+    for await (const chunk of codearts.stream({
+      provider: CODEARTS_PROVIDER,
+      model: visionModel,
+      messages: [{ role: 'user', content: parts }],
+      signal,
+    } as never)) {
+      const typed = chunk as { type?: string; text?: unknown }
+      if (typed.type === 'text-delta' && typeof typed.text === 'string') text += typed.text
+    }
+    if (text.trim().length === 0) {
+      // ⚠️ 空正文要**明确报错**而不是返回空串：空串会让主模型以为"图上什么都没有"，
+      // 从而给用户一个自信的错误答案（本仓对「空响应」一贯如此处理）。
+      throw new Error(
+        `analyzeImage: 识图模型（${visionModel}）没有返回任何文字；`
+        + '可能是上游排队或图片格式不被接受，请稍后重试。',
+      )
+    }
+    return text
+  }
+
+  installAnalyzeImage(
+    ctx,
+    { readImage: makeReadImage(ctx), describe: describeWithVision },
+    (exec) => {
+      // 与官方 `read_image` 的 `assertImageCapableRoute` 同一手法：
+      // 先读会话已折叠的 `request/header` 路由，再回退到 agent options。
+      const agent = (exec as {
+        agent?: {
+          options?: { provider?: string; model?: string }
+          session?: { requestHeader?: () => { config?: { provider?: string; model?: string } } | undefined }
+        }
+      }).agent
+      const routed = agent?.session?.requestHeader?.()?.config
+      return {
+        provider: routed?.provider ?? agent?.options?.provider,
+        model: routed?.model ?? agent?.options?.model,
+      }
+    },
+    // ⚠️ 传 logger：`DSH_DISABLE_ANALYZE_IMAGE` 关闸时必须**留一条日志**，
+    //    否则「工具不见了」与「注册静默失败」同形（后者是本工具栽过的坑）。
+    { info: (message: string) => ctx.logger?.info?.(message) },
+  )
 
   // ===== Buddy (腾讯 CodeBuddy) 服务 =====
   // 不注册斜杠命令：登录/状态/续期都在 Jet Hub 设置页完成（多账号 + 账号池），
@@ -2063,8 +2143,12 @@ export function apply(ctx: Context): void {
           kind: 'buddy',
           selector: lobsteraiBalanceSelector,
           lockedError: buddyLockedError('LobsterAI'),
-          // ⚠️ LobsterAI **没有** `isFreeModel`（只有 buddy / trae 的适配器有）：
-          // 它的模型表不带倍率字段，判不出「免费」—— 缺省即「从不跳过锁定」。
+          // ⚠️ LobsterAI 的「免费」是**钱包**概念不是**模型**概念，没有模型级免费：
+          //   `lobsterai-credits.ts:340` 的 `/api/user/quota` 只给
+          //   `freeCreditsTotal=300`（免费**积分额度**），`lobsterai-errors.ts`
+          //   里的 `freecreditsused` 是**错误码**。模型表本身不带倍率字段
+          //   ⇒ 判不出、也不该判（见 `NO_FREE_MODEL` 的说明）。
+          isFreeModel: NO_FREE_MODEL,
         },
         fallback: { kind: 'ref', refName: LOBSTERAI.defaultCredentialRef },
         // 退到单凭据 ref 之前先证明失败原因（见 `throwIfAllAccountsRateLimited`
@@ -2209,6 +2293,15 @@ export function apply(ctx: Context): void {
           selector: qoderBalanceSelector,
           lockedError: qoderLockedError('Qoder'),
           reportPickedAccount: true,
+          // ⚠️ 免费模型**必须**跳过「锁定 + 临期积分」这道门（与 buddy / trae
+          //    同因，见 `credential-resolver.ts:359-365` 的长注释）：
+          //    锁定保护的是永久积分，而免费模型既不扣临时也不扣永久积分 ——
+          //    不传这个钩子，免费模型会和付费模型走同一条余额分档路，锁定期间
+          //    被 `allowPermanent=false` 一并拦下，报出「额度都属于永久」这种
+          //    与事实相反的错误（真实报障 2026-10-21）。
+          // ⚠️ 判据在适配器里（读远端目录的 `is_free`，远端/兜底同源），
+          //    本处只透传 —— 不要在这里另写一份。
+          isFreeModel: (modelId) => qoderAdapter.isFreeModel(modelId),
         },
         fallback: { kind: 'ref', refName: QODER.defaultCredentialRef },
         // 区分「全部限流」与「没登录」（见该助手的说明）—— 否则用户会去
@@ -2291,6 +2384,8 @@ export function apply(ctx: Context): void {
           selector: qoderCnBalanceSelector,
           lockedError: qoderLockedError('Qoder (中国版)'),
           reportPickedAccount: true,
+          // 同国际版：免费模型不受「锁定永久积分」约束（判据在适配器里）。
+          isFreeModel: (modelId) => qoderCnAdapter.isFreeModel(modelId),
         },
         fallback: { kind: 'ref', refName: QODER_CN.defaultCredentialRef },
         // 同国际版：区分「全部限流」与「没登录」（见该助手的说明，IKJOZ9）。
@@ -2860,6 +2955,8 @@ export function apply(ctx: Context): void {
           kind: 'buddy',
           selector: minimaxBalanceSelector,
           lockedError: minimaxLockedError('MiniMax Code (中国版)'),
+          // ⚠️ 本家没有模型级免费概念（产品表零 `isFree` 字段，上游目录也不返回）。
+          isFreeModel: NO_FREE_MODEL,
           /**
            * ⚠️⚠️ **刻意不写 `reportPickedAccount: false`**（与 buddy 系那两处**相反**）。
            *
@@ -2959,6 +3056,8 @@ export function apply(ctx: Context): void {
           kind: 'buddy',
           selector: minimaxIntlBalanceSelector,
           lockedError: minimaxLockedError('MiniMax Code (国际版)'),
+          // ⚠️ 本家没有模型级免费概念（产品表零 `isFree` 字段，上游目录也不返回）。
+          isFreeModel: NO_FREE_MODEL,
           // ⚠️ 与中国版**同因**：本家旧闭包是纯池选号、账本一直在回报 ⇒
           //    必须 `true`，写 `false` 会让 token 用量记不到国际站上（见中国版处说明）。
           reportPickedAccount: true,
@@ -3211,6 +3310,11 @@ export function apply(ctx: Context): void {
           selector: autoclawBalanceSelector,
           // ⚠️ 本家独有文案（池名是「钱包流水批次」而不是 buddy 的「资源包」）。
           lockedError: autoclawLockedError('AutoClaw'),
+          // ⚠️⚠️ 本家**曾**标过 `isFree: true`，那是**错的**（2026-10-21 二轮审计订正）：
+          //   初版把「远端目录里没有它、但直接调用能用」误当成「不扣费」，而真机
+          //   实测它**每次都扣积分**（`docs/autoclaw-models.md:25`）。现有 4 个模型
+          //   全是 `isFree: false` ⇒ 本家确实没有模型级免费，显式表态即可。
+          isFreeModel: NO_FREE_MODEL,
           reportPickedAccount: true,
         },
         // ⚠️ **必须接**（与 accio 同因）：本工厂的兜底是**固定 ref**
@@ -3238,13 +3342,13 @@ export function apply(ctx: Context): void {
     //    ⚠️ 刻意**不接** `readImageRequest` 缩放桥接：智谱侧对单图字节上限
     //    无实测依据，编一个预算是凭空造数字（同 modelscope 的取舍）。
     readImage: makeReadImage(ctx),
-    // ⚠️⚠️ **必须接 `disabledModels` 与 `providerClosed`**（2026-10-20，IKP8OF）：
-    //    本家手写 `listModels`、不走共享骨架，而这两条回调此前**一个都没传** ⇒
-    //    用户在 Jet Hub 里关掉的 autoclaw 模型**照样出现在选择器里**（实测形态与
-    //    modelscope 那条「接线层漏实参」逐字相同：字段与消费点都在，只缺实参）。
-    //    `providerClosed` 另外覆盖「关闭之后才新增的模型」（黑名单里没有它们）。
-    disabledModels: () => pool.disabledModelsFor(AUTOCLAW.id),
-    providerClosed: () => pool.providerClosedFor(AUTOCLAW.id),
+    // ⚠️⚠️ **2026-10-23 迁移：黑名单与「关闭供应商」已由共享骨架从账号池读走**
+    //
+    // 本家此前**手写** `listModels`，故需要分别传 `disabledModels` / `providerClosed`
+    // 两个回调（2026-10-20 那次就是靠这两行兜住的）。用户定稿「实体 provider 一律走
+    // 共享骨架」后，那两个字段**已删除** —— 现在唯一入口是本行传进去的池。
+    // ⚠️ **不要把它们加回来**：那会重现「同一语义两套判据」（本仓库红线）。
+    accountPool: pool,
   })
 
   // ===== AutoClaw 国际版（autoclawintl）=====
@@ -3282,6 +3386,8 @@ export function apply(ctx: Context): void {
           kind: 'buddy',
           selector: autoclawIntlBalanceSelector,
           lockedError: autoclawLockedError('AutoClaw (国际版)'),
+          // ⚠️ 同国内版：本家无模型级免费（`isFree` 全为 false，见那处说明）。
+          isFreeModel: NO_FREE_MODEL,
           reportPickedAccount: true,
         },
         throwIfAllRateLimited: throwIfAllAccountsRateLimited,
@@ -3291,10 +3397,9 @@ export function apply(ctx: Context): void {
     //    查不到自己的账号（本插件在 workbuddy 上踩过同类坑）。
     product: AUTOCLAW_INTL,
     readImage: makeReadImage(ctx),
-    // ⚠️⚠️ 同国内版（IKP8OF）：本家手写 `listModels`，两条回调必须显式接线。
-    //    两个站点各一条，漏一处即该站静默失效（本仓库的既有纪律）。
-    disabledModels: () => pool.disabledModelsFor(AUTOCLAW_INTL.id),
-    providerClosed: () => pool.providerClosedFor(AUTOCLAW_INTL.id),
+    // ⚠️⚠️ 同国内版（2026-10-23 迁移）：黑名单与关闭意图由共享骨架从账号池读。
+    //    两个站点**各一条** `accountPool`，漏一处即该站静默失效（本仓库的既有纪律）。
+    accountPool: pool,
   })
 
   const accio = new AccioAuth(ctx)
@@ -3452,9 +3557,10 @@ export function apply(ctx: Context): void {
       balance: {
         kind: 'buddy',
         selector: astudioBalanceSelector,
-        // ⚠️ 本家**没有**免费模型概念（`AstudioAdapter` 不实现 `isFreeModel`），
-        //    故不传该字段 —— 缺省 `undefined` 会让 `createCredentialResolver`
-        //    走「免费模型短路」之外的常规分档路径（正确行为）。
+        // ⚠️ 本家**没有**免费模型概念（`AstudioAdapter` 只在 `listAllModels`
+        //    的返回类型里声明了 `isFree?`，兜底表零个 `isFree: true`，
+        //    上游目录也不返回该字段）⇒ 显式表态，不要删字段（见 `NO_FREE_MODEL`）。
+        isFreeModel: NO_FREE_MODEL,
         lockedError: astudioLockedError('AStudio'),
         // ⚠️⚠️ **必须是 `true`**（2026-10-21 合并审计发现：PR !119 原写的 `false`
         //    让上面 `reportAccount` 成了**不可达的死接线**）。
@@ -3619,18 +3725,16 @@ export function apply(ctx: Context): void {
     //    （它按「像素预算发请求版本」的形态只在 opencode / accio 那几家实现）。
     //    魔搭的图片走 `readImage` 单一路径，逐模型按 `supportsImage` 声明模态。
     readImage: makeReadImage(ctx),
-    // ⚠️⚠️ **必须接 `disabledModels`**（2026-10-17 审计发现）：模型黑名单是
-    //    「设置页 → 显示列表」逐 id 开关的产物，而**模型选择器读的正是这份黑名单**
-    //    （`ModelscopeAdapter.listModels` 读 `options.disabledModels?.()`）。
-    //    ⚠️ 本回调此前**没有传** ⇒ 黑名单完全失效 ⇒ 用户在「显示列表」里关掉的模型
-    //    **照样出现在模型选择器里**（实测：只开了 V4.1 Flash，选择器仍列全部 36 个）。
-    //    ⚠️ 典型形态：适配器**支持**该能力（字段与消费点都在），只是**接线层漏了实参**
-    //    ⇒ 无报错、无日志，纯静默。
-    disabledModels: () => pool.disabledModelsFor(MODELSCOPE.id),
-    // ⚠️⚠️ **必须接 `providerClosed`**（Gitee issue IKP8OF）：本家不走共享骨架
-    //    （`model-catalog.ts`），故「整个供应商关闭」这条判据必须在这里显式接线，
-    //    否则关闭后**新长出来的模型**仍会出现在选择器里（黑名单里没有它们）。
-    providerClosed: () => pool.providerClosedFor(MODELSCOPE.id),
+    // ⚠️⚠️ **2026-10-23 迁移：黑名单与「关闭供应商」已由共享骨架从账号池读走**
+    //
+    // 本家此前**手写** `listModels`，故需要在这里分别传 `disabledModels` 与
+    // `providerClosed` 两个回调（2026-10-17 / IKP8OF 两次实测都栽在「漏传实参」
+    // 上：适配器支持该能力、消费点也对，只是接线层漏了 ⇒ 纯静默失效）。
+    //
+    // 用户定稿「实体 provider 一律走共享骨架」后，那两个回调**已删除**：
+    // `ModelscopeAdapter.listModels` 改为委托 `createModelCatalog`，黑名单与
+    // 关闭意图统一从上面那个 `accountPool` 读。⚠️ **不要把回调加回来** ——
+    // 那会让「同一语义两套判据」重现（本仓库红线），且会掩盖池没接上的缺陷。
   })
 
   // 一次性修复**老账号**的昵称与凭据字段（与上面 WorkBuddy 的启动清理同类）。
@@ -3978,6 +4082,37 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     ctx.logger.warn(`[jet-hub] 修正 Gemini 账号显示名失败：${String(error)}`)
   })
 
+  // 一次性修复**老 MiniMax 账号**的展示名（Gitee issue IKP8UA 修法 ③）。
+  //
+  // 成因见 `minimax-auth.ts` 的 `repairAccountNicknames`：MiniMax 的
+  // `access_token` **不是 JWT**，而旧昵称判据走 `decodeJwtSub` ⇒ 恒空 ⇒
+  // 账号卡片恒显示插件内部 id（`minimax-6395cf64`），多账号无法分辨。
+  // 光改登录路径**不会自愈存量账号**（本机实测 7 条全是内部 id），故补这一次。
+  //
+  // ⚠️ 两个站点**各一条**（它们共用同一个 auth 类、但 product 不同 ⇒
+  //    `apiHost` 与 XFF 判据都不同，见 `minimax-identity.ts`）。
+  //    漏一处即该站静默不自愈（本仓库的既有纪律：双站点每处都要到位）。
+  // ⚠️ 幂等 + 失败不阻塞启动（`repairAccountNicknames` 内部逐账号 catch）。
+  void minimax.repairAccountNicknames(pool).then((repaired) => {
+    if (repaired.length > 0) {
+      ctx.logger.info(
+        `[jet-hub] 已修正 ${repaired.length} 个 MiniMax 账号的显示名（改用上游账号名）：${repaired.join(', ')}`,
+      )
+    }
+  }).catch((error: unknown) => {
+    ctx.logger.warn(`[jet-hub] 修正 MiniMax 账号显示名失败：${String(error)}`)
+  })
+
+  void minimaxIntl.repairAccountNicknames(pool).then((repaired) => {
+    if (repaired.length > 0) {
+      ctx.logger.info(
+        `[jet-hub] 已修正 ${repaired.length} 个 MiniMax 国际版账号的显示名（改用上游账号名）：${repaired.join(', ')}`,
+      )
+    }
+  }).catch((error: unknown) => {
+    ctx.logger.warn(`[jet-hub] 修正 MiniMax 国际版账号显示名失败：${String(error)}`)
+  })
+
   // ===== 多账号静默续期调度 =====
   // 替代原有的单账号 scheduleRefresh()，使用 refreshAll() 遍历所有账号续期
   const REFRESH_INTERVAL_MS = 30 * 60 * 1000  // 每 30 分钟检查一次
@@ -4194,9 +4329,13 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   }
 
   const officeAceAdapter = registerOfficeAceLlm(ctx, {
-    disabledModels: () => pool.disabledModelsFor(OFFICEACE.id),
-    // ⚠️⚠️ 同上（IKP8OF）：本家手写 `listModels`，不走共享骨架。
-    providerClosed: () => pool.providerClosedFor(OFFICEACE.id),
+    // ⚠️⚠️ **2026-10-23 迁移：黑名单与「关闭供应商」已由共享骨架从账号池读走**
+    //
+    // 本家此前**手写** `listModels`，故需要分别传 `disabledModels` / `providerClosed`
+    // 两个回调（IKP8OF 那次就是靠这两行兜住的）。用户定稿「实体 provider 一律走
+    // 共享骨架」后，那两个字段**已删除** —— 现在唯一入口是本行传进去的池。
+    // ⚠️ **不要把它们加回来**：那会重现「同一语义两套判据」（本仓库红线）。
+    accountPool: pool,
     // ⚠️ **按当前选中账号的 ref 取凭据**（2026-10-13）：凭据存在 DSH 凭据库里
     //    按 `credentialRef` 索引（与 gemini / raccoon 同款）。缺省会读兼容文件
     //    `session.json`，那份是**所有账号共用**的 ⇒ 号池轮换形同虚设。
@@ -4311,6 +4450,30 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   // 冷启动也广播一次：首次目录在注册后异步就绪，不补这一发就只能等用户重启。
   ctx.emit('llm/adapters-updated')
 
+  /**
+   * Codely 的续期实例（2026-10-22 A6 接线）。
+   *
+   * ⚠️⚠️ **三个必选依赖都必须传**，少一个都是静默失效：
+   * - `credentials`：不传 ⇒ `refreshAccountCredential` 第一行就 `return`（续期一次都不发）；
+   * - `writebackExpiry`：不传 ⇒ 池里 `expiresAt` 不回写，界面「有效期」停在旧值
+   *   （officeace 记过同款）；
+   * - `fetcher`：传真实 `fetch` 即可（默认值就是），故省略。
+   *
+   * ⚠️ `writebackExpiry` 必须走 `pool.updateAccount`（与各家同形）—— 直接写
+   *   `credentialRef` 对应的凭据不行：那份凭据已在 `refreshAccountCredential`
+   *   里写回过，这里只补「池条目的有效期字段」。
+   */
+  const codelyAuth = new CodelyAuth(ctx, {
+    credentials: ctx.credentials as never,
+    writebackExpiry: async (accountId, expiresAtMs) => {
+      await pool.updateAccount(accountId, {
+        // ⚠️ `ProviderAccountEntry.expiresAt` 是**毫秒数值**（`number`），不是 ISO 字符串
+        //    —— 写成 `toISOString()` 会直接编译失败（TS2345）。
+        ...expiresAtMs === undefined ? {} : { expiresAt: expiresAtMs },
+      })
+    },
+  })
+
   // ===== OpenCode Zen（账号槽 + 匿名槽平权混合池）=====
   //
   // 形态与前面所有 provider 相同：进程内 LlmAdapter 直发远端，无子进程、无端口。
@@ -4378,9 +4541,14 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
         ? AbortSignal.timeout(OPENCODE_CATALOG_TIMEOUT_MS)
         : AbortSignal.any([signal, AbortSignal.timeout(OPENCODE_CATALOG_TIMEOUT_MS)]),
     }),
-    disabledModels: () => pool.disabledModelsFor(OPENCODE.id),
-    // ⚠️⚠️ 同上（IKP8OF）：本家手写 `listModels`，不走共享骨架。
-    providerClosed: () => pool.providerClosedFor(OPENCODE.id),
+    // ⚠️⚠️ **2026-10-23 迁移：黑名单与「关闭供应商」已由共享骨架从账号池读走**
+    //
+    // 本家此前**手写** `listModels`，故需要分别传 `disabledModels` / `providerClosed`
+    // 两个回调（IKP8OF 那次就是靠这两行兜住的）。用户定稿「实体 provider 一律走
+    // 共享骨架」后，那两个字段**已删除** —— 现在唯一入口是本行传进去的池。
+    // ⚠️ **不要把它们加回来**：那会重现「同一语义两套判据」（本仓库红线），
+    // 并掩盖池没接上这类缺陷。
+    accountPool: pool,
     markLimited: async (slotId, modelId, resetAtMs) => {
       // 匿名条目同样落盘：它是池里的一条普通条目，限额标记在面板可见、
       // 可用「重测/清除」恢复（早期把匿名槽当进程内状态，重启即丢）。
@@ -5185,6 +5353,69 @@ async function fetchBalanceReading(
         )
       }
     }
+
+  /**
+   * ⚠️⚠️ **codely 的 runtime 必须单独注册**（2026-10-22 合并审计修，真实可达缺陷）。
+   *
+   * ## 缺陷（实测）
+   *
+   * `probeById.codely` 已登记（上面那个模块级常量里键存在），但 `probe` 域
+   * **只在上面的 `for (const [id, auth] of registry)` 循环体内**被挂上
+   * （`...Object.hasOwn(probeById, id) ? { probe: probeById[id] } : {}`），
+   * 而 codely **不在**那个 20 项 `registry` 数组里（它是 `channel:false`、无 auth 服务）
+   * ⇒ `runtimeOf('codely') === undefined` ⇒ `adapterForProbe()` 抛
+   * 「codely 没有探测适配器（该 provider 不支持重测）」。
+   *
+   * 实测后果：
+   * - `account.retest`（重测）**恒抛错**，冒泡成「操作失败：codely 没有探测适配器」；
+   * - `account.test`（测试）返回 `{"ok":false,"message":"无法确认：codely 没有探测适配器…"}`；
+   * - 只有 `account.reset` 能用（它不需要 probe）。
+   *
+   * ⚠️ 而 `probeById.codely` 的头注释与 `provider-registry.ts` 的 codely 条目
+   * 都写着「『重测 / 重置』有真实作用对象」—— **只有「重置」成立**，本次一并订正。
+   *
+   * ## 为什么不在 `registry` 数组里加一行
+   *
+   * 那个数组元素类型是 `readonly [string, JetHubAuthLike]`，而 codely **没有 auth
+   * 服务**（登录与余额都是自由函数）。硬塞一个假 auth 会让 `auths.codely` 出现、
+   * 进而让 `expectedProviderIdsWithAuth()` 派生出的**一批**守卫变红，且
+   * `account.refresh` 会对一个没有 refresh 实现的渠道开绿灯。
+   * ⇒ 用「**只注册 runtime、不带 auth**」这一最小形态：`ProviderRuntime.auth` 本就是
+   * 可选字段（`provider-runtime.ts` 的 `readonly auth?:`），opencode 同样没有它。
+   *
+   * ## ⚠️ 守卫（本次一并补）
+   *
+   * `provider-runtime-wiring.spec.ts` 新增「`probeById` 的每一项都真的挂到了
+   * runtime」—— 原来的存在性守卫只比 `Object.keys(probeById)` 与期望集合，
+   * **不查「这一项是否真被挂上」** ⇒ `probeById.codely` 存在即算通过，尽管它
+   * 永远不可达（`opencode` 是同一盲区的**存量**受害者，本次一并覆盖）。
+   */
+
+  const codelyRuntimeDescriptor = descriptorOf(CODELY_PROVIDER_ID)
+  if (codelyRuntimeDescriptor !== undefined && Object.hasOwn(probeById, CODELY_PROVIDER_ID)) {
+    registerProviderRuntime({
+      descriptor: codelyRuntimeDescriptor,
+      // ✅ **给 `auth`**（2026-10-22 A6）：`CodelyAuth` 已改为 `extends Service`、签名已符合
+      //    `JetHubAuthLike`（单参 `refreshAll(pool)`），且真有 refresh 端点。
+      //    ⚠️ **必须给**：`wiredRefreshTargets()` 遍历的是 runtime 里的 `auth.refreshAll`，
+      //    不给它 ⇒ codely 永不进批量续期表 ⇒ 凭据过期后积分行报「未登录」且日志零字
+      //    （issue IKKHL5 形态）。
+      auth: {
+        // ⚠️ 必须包一层（与上面主循环同因）：直接挂方法引用会丢 `this`。
+        refreshAccount: (refName, pool, accountId) =>
+          codelyAuth.refreshAccountCredential(refName, pool, accountId),
+        refreshAll: (pool) => codelyAuth.refreshAll(pool),
+      },
+      // ⚠️ 这两行不能少：`creditsOf` 返回 `undefined` 时，
+      //    `provider-runtime-wiring` 那条「声明了 balance 就必须挂 credits 域」就会点名。
+      credits: creditsOf(creditsTable, CODELY_PROVIDER_ID),
+      // ⚠️ codely **未接临期折算**（上游不下发到期时间）⇒ 本行取到 `undefined`。
+      //    这与 `expiry-runtime-parity.spec.ts` 的显式豁免表一致。
+      expiry: expiryOf(expiryTable, CODELY_PROVIDER_ID),
+      probe: probeById[CODELY_PROVIDER_ID],
+    })
+  }
+
   }
 
   /**
@@ -5220,10 +5451,12 @@ async function fetchBalanceReading(
     // OfficeAce（华为 ModelArts MaaS 云端直连）：值是 **auth 服务形状的包装对象**
     //（纯函数集合 + 统一 auth 契约），不是 Service 实例。
     officeace: officeaceAuthService as never,
-    // ⚠️ Codely 的续期对象**暂未挂**（2026-10-20）：`JetHubAuths.codely` 是
-    //    **可选**键，实现见 `codely-auth-service.ts`（`CodelyAuth`）。
-    //    接线时**必须同时**补齐 `jet-hub-rpc-auth-wiring` 的 17→18 与
-    //    `refreshAll` 14→15 两处计数，否则守卫按「键位恰好 17 家」变红。\n    //    （推理与目录都不依赖它 ⇒ 不挂也不影响使用。）
+    // ✅ **Codely 的续期对象已接**（2026-10-22 A6）：`CodelyAuth` 签名已改成
+    //    契约的**单参** `refreshAll(pool)`（与各家同形，见 A5 的修）。
+    //    ⚠️ 它同时进了 `SELF_HEAL_REFRESHABLE_PROVIDERS`（`jet-hub-rpc.ts`）——
+    //    两处**缺一不可**：只挂 auths 而不进自愈表 ⇒ 积分行过期后报「未登录」
+    //    且日志零字（issue IKKHL5 形态，均已复发四次）。
+    codely: codelyAuth,
     autoclaw,
     // ⚠️ 键是 **provider id** `autoclawintl`，值是变量 `autoclawIntl` ——
     //    两者不同名（id 全小写、变量带驼峰），写成简写会引用不存在的变量。

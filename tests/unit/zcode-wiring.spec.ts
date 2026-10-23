@@ -416,7 +416,7 @@ describe('ZCode 客户端接入（缺口 3 / 4 / 5）', () => {
     // 2026-10-20 加 autoclawintl（AutoClaw 国际版）：21 → 22）。
     // ⚠️ 这个断言的价值是「**别把既有 provider 挤掉**」，所以它同时断言
     // 上面的具体 id；若将来再加 provider，记得同步这里。
-    expect(ids).toHaveLength(22)
+    expect(ids).toHaveLength(23)
   })
 
   it('展示名与产品配置一致（避免两处漂移）', () => {
@@ -660,11 +660,13 @@ describe('ZCode RPC 分派（缺口 2：接线）', () => {
     // ⚠️ 2026-10-19 **本 fork** 加 codely（Unity，UI 先行）：20 → 21。
     //    ⚠️ clientProviderIds() 是**客户端图标表**的 id 数，与 registry 口径不同 ——
     //    权威值以断言实测为准，注释里的加减号只是**历史沿革**，不要拿来推当前数字。
-    expect(clientIds.length).toBe(22)
-    // ⚠️ 20 个 auth 键（22 个客户端 id − opencode − aggregate − codely）。
-    expect(keys).toHaveLength(20)
+    expect(clientIds.length).toBe(23)
+    // ⚠️ **21 个 auth 键**（23 个客户端 id − opencode − aggregate）。
+    //    ⚠️ 2026-10-22（A6）：codely **已接续期**（`CodelyAuth` 签名修正为单参
+    //    `refreshAll(pool)`，并接入 `index.ts` 的 `auths`）⇒ 它不再是豁免项。
+    expect(keys).toHaveLength(21)
     const withoutKey = clientIds.filter((id) => !keys.includes(id))
-    expect([...withoutKey].sort()).toEqual(['aggregate', 'codely', 'opencode'])
+    expect([...withoutKey].sort()).toEqual(['aggregate', 'opencode'])
   })
 
   it('★ 不占键位的是 opencode 与 aggregate（豁免被验证，不是被假设）', () => {
@@ -679,12 +681,14 @@ describe('ZCode RPC 分派（缺口 2：接线）', () => {
     //    `{ qodercn: 'qoderCn' }` 别名，正是因为那时形参名是变量名 ——
     //    那层别名本身就是「键与 id 不同名」这个缺陷的化石。
     const withoutKey = clientIds.filter((id) => !keys.includes(id))
-    // ⚠️ 三者豁免理由**不同**（见上一条用例的注释）：opencode 是「RPC 走
-    //    handleOpencodeRpc」、aggregate 是「没有 auth 服务」、codely 是
-    //    「UI 先行过渡态：适配器与 auth 尚未接线（2026-10-19，接线后移出）」。
+    // ⚠️ 两者豁免理由**不同**（见上一条用例的注释）：opencode 是「RPC 走
+    //    handleOpencodeRpc」、aggregate 是「没有 auth 服务」。
+    //    ⚠️ **codely 已从本清单移出**（2026-10-22 A6）：它的 `CodelyAuth`
+    //    之前不能接是因为**契约都没对上**（`refreshAll` 是 2 参 ⇒ TS2322），
+    //    而不是「不需要续期」。
     //    断言写成数组（而非 `toHaveLength(2)`）是为了在**将来多出豁免**时
     //    立刻可见是哪几个。
-    expect([...withoutKey].sort()).toEqual(['aggregate', 'codely', 'opencode'])
+    expect([...withoutKey].sort()).toEqual(['aggregate', 'opencode'])
   })
 })
 

@@ -39,6 +39,19 @@ commit-msg.tmp
 .codely-cli/
 .research/
 
+# Codely 官方 CLI 的**本地会话导出**（`auto-saves/`）。
+#
+# ⚠️⚠️ 这些是**机器本地的聊天记录**，不是源码、不是夹具、也不是运行时依赖：
+#   每个文件含**完整会话正文** + 本机绝对路径（`F:\AIProject\deepseek-harness-codearts`）。
+#   2026-10-22 合并审计实测：PR #1 把 6 个这样的文件（约 223 KB）**提交进了仓库**，
+#   而 `.gitignore` 当时没有任何规则挡住它 —— 与 `.e2e-logs/` 完全同型
+#   （那次也是「运行产物被 `git add .` 一起带上」）。
+#
+# ⚠️ 用目录前缀匹配（`.codely-cli/`），不用 `auto-saves/`：
+#   后者会顺手忽略掉别处的同名目录，看起来像无关文件莫名消失。
+.codely-cli/
+
+
 ide-models.json
 scripts/*
 # ⚠️ 白名单：部署产物的打包脚本与安装模板是**交付物**（service.bat -Mode standalone /

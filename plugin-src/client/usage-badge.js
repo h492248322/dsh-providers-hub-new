@@ -53,6 +53,8 @@ import {
   formatExpirySplitLine,
   formatPoolSplitLine,
   splitCreditsByExpiry,
+  exclusivePoolRemainingOf,
+  isExclusivePool,
 } from './credit-expiry.js';
 import { ensureJetHubStyles } from './jet-hub-styles.js';
 
@@ -1462,7 +1464,20 @@ function UsageBadgeActive(props) {
         key: part.key,
         className: 'dim-jh-badgeNotePart',
         'data-tone': part.tone,
-        ...(part.countdown === undefined ? {} : { title: `最早作废：${part.countdown}后` }),
+        // ⚠️⚠️ **不得无条件追加「后」**（2026-10-21 合并审计发现，!135 引入的回归）。
+        //
+        // `expirySplitParts` 的 `countdown` 已从「裸时长」改为「**可能是完整短语**」：
+        // 倒计时只覆盖其中一批时它是 `其中 500 于 6 天 0 小时后到期`。旧代码在这里
+        // 无条件拼 `后` ⇒ 实测得到残句：
+        //   `最早作废：其中 500 于 6 天 0 小时后到期后`
+        // （!135 只改了生产者、没同步这个消费者；本处此前**零用例**，变异实测全绿。）
+        //
+        // ⇒ 直接用它，两种形态都自洽：
+        //   `最早作废：6 天 0 小时`                    ← 倒计时覆盖全部临期时
+        //   `最早作废：其中 500 于 6 天 0 小时后到期`  ← 只覆盖其中一批时
+        // ⚠️ **不要**在这里按「短语/时长」分支 —— 那是在消费方复制生产者才知道的
+        //   形态知识，必然再次漂移（本仓头号缺陷形态）。
+        ...(part.countdown === undefined ? {} : { title: `最早作废：${part.countdown}` }),
       }, part.countdown === undefined ? part.text : `${part.text}（${part.countdown}）`));
     });
     return React.createElement('div', { key: 'note', className: 'dim-jh-badgeRowNote' }, children);
@@ -1653,7 +1668,24 @@ function splitParts(balance, windowDays, provider) {
   // 当日池（loomy / raccoon）：池按名字分，没有到期维度 ⇒ 单段无色。
   if (poolText !== null) return [{ key: 'pool', text: poolText, tone: 'muted' }];
   // 其余渠道：按到期时间分**三档**，逐段带色（永久绿 / 长期黄 / 临期红 + 倒计时）。
-  return expirySplitParts(splitCreditsByExpiry(packages, windowDays, Date.now()), format, Date.now());
+  const now = Date.now();
+  const parts = expirySplitParts(splitCreditsByExpiry(packages, windowDays, now), format, now);
+  /**
+   * **独立池**（AStudio 星火积分等）追加一段无色说明。
+   *
+   * ⚠️ 为什么这里也要加（2026-10-21 真实缺陷）：设置页的账号卡片（`jet-hub.js`
+   *    的 `CreditBalanceRow`）与**本弹窗**是**两套独立渲染代码** —— 前者改了
+   *    后者没改，用户看到「设置页有、徽标弹窗没有」。本仓反复记录过这种
+   *    「同一语义两处渲染」的漂移，故两处必须同时改。
+   *
+   * ⚠️ `splitCreditsByExpiry` 已把独立池**摘出**三档（不进 `permanent`），
+   *    故这里从 `packages` 现算，不能从 `split` 里取。
+   */
+  const exclusive = exclusivePoolRemainingOf(packages);
+  if (exclusive > 0) {
+    parts.push({ key: 'exclusive', text: `另有 ${format(exclusive)} 专属（不计入）`, tone: 'muted' });
+  }
+  return parts;
 }
 
 /**

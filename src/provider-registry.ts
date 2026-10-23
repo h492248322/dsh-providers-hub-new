@@ -649,6 +649,11 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
     // ⇒ 胶囊只剩「合计」，永久绿/长期黄/临期红三行一个都不渲染。
     // ⚠️ 漏登记的症状是**静默的**（无报错、无日志），与 officeace / autoclaw
     //    当初同一根因；新增带到期时间的渠道时必须一并登记本字段。
+    // ⚠️ PR !134 独立补登了同一字段（2026-10-21 用户报障「星火 25000 不显示」，
+    //    注释称「四个池都带 `*NextExpireTime`」—— member / buy / activity / spark）。
+    //    合并时保留 master 这份（依据 `/points/balance` 实测原文），并保留
+    //    PR !134 带来的**客户端侧**修法（`packageExpiryMs` 归一 + 独立池摘出）——
+    //    那两处才是「25000 不显示」的另一半根因，registry 登记只是另一半。
     usesExpiryWindow: true,
     // ⚠️ **2026-10-20 补登记：永久积分锁定**。
     //
@@ -907,37 +912,41 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
     //    ② `/auth/refresh` **端点已实测**（200、`refresh_token` 不轮换），实现待补。
     //    ③④⑤⑥ 见上方清单。
     //
-    //    ## ⚠️ 为什么推理已通而本行仍是 `false`
-    //    推理（⓪）**不依赖本开关**：适配器已注册在 `ctx.llm` 与 `modelAdapters`，
-    //    端到端实测 4.0s 拿到非空 chunk ⇒ 现在选 codely 模型**就能对话**。
-    //    本行只是三张派生守卫（应有 auth / 应进聚合目录 / 应可续期）的判据，
-    //    翻 `true` 必须**同时**补完 ②~⑥；实测单独翻 true 会让 **14 条**守卫变红。
-    //    ⇒ 推理已走纯 HTTP（`codely-sign.ts` 自签，实测 200 / 1.4s，**不需要客户端**），
-    //    但 `channel: true` 会点燃 **9 个 spec / 11 条派生登记**（聚合白名单、自愈名单、
-    //    auth 键位 17→18、续期表、descriptor 21→22、modelAdapters 键集合……）。
-    //    2026-10-20 实测后**回滚为 false**：先补齐那批登记再一次性翻，避免红仓库。
-    channel: false,
-    // ✅ `rateLimit` 恢复缺省 true（2026-10-20 删除显式 false）：请求级换号 + 冷却
-    //    已接（`codely-adapter.ts` 的 `updateModelRateLimit` 写点：402/预算耗尽 →
-    //    UTC+8 次日 0 点、429 → 1h），`probeById.codely` 探测适配器同步挂上 ⇒
-    //    「重测 / 重置」有真实作用对象。旧注释「UI 先行阶段材料还没有」的前提已
-    //    消失 —— 再留着 false = 耗尽账号的冷却标记写进池却永远清不掉
-    //    （`WRITES_RATE_LIMIT_PROVIDERS` 与本行由 wiring 守卫双向锁死）。
+    /**
+     * ✅ `channel: true`（2026-10-22 A6 翻正）。
+     *
+     * ## 为什么原来是 `false`，现在为什么能翻
+     *
+     * 原注释写的是「推理已通但 `channel: true` 会点燃 9 个 spec / 11 条派生登记，先补齐再翻」。
+     * ⚠️⚠️ 但那是**流程理由，不是产品理由** —— 2026-10-22 对抗审计指出：
+     * `channel` 在**生产代码里零个读取点**（全仓普查，唯一消费者是 tests/），
+     * 而 `false` 造成两个**用户可见**缺口：
+     * - 它的模型**永不进聚合目录与轮换候选**（`AGGREGATE_CHANNELS` 缺它）；
+     * - `credits-balance-self-heal.spec.ts` 用 `d.channel && d.credits.balance` 派生期望集合
+     *   ⇒ codely 被**自动豁免**，那条专为「漏登记」而建的守卫对它**永不会红**。
+     *
+     * ⇒ 本次同步补齐全部派生登记（接线已完成：推理 / 目录 / 余额 / 签到 / 续期）：
+     * `SELF_HEAL_REFRESHABLE_PROVIDERS`、`JetHubAuths.codely`、`AGGREGATE_CHANNELS`、
+     * `WIRED_EXPIRY_PROVIDERS` + `createProviderExpiry()`、`modelAdapters`、以及四张 spec 的计数。
+     *
+     * ⚠️ **聚合轮换还差一块真实的东西**：Codely 的余额端点**不下发任何到期时间**
+     * （`/api/user/usage/summary` 只有 `remaining_points` / `is_exhausted`；抽象成
+     * `CreditPackage` 时 `expiredTime` 是**空串**—— 见 `codely-credits.ts`）。
+     * 而聚合候选表的第一判据就是「临期档」。⇒ 本次**不把它加进**
+     * `WIRED_EXPIRY_PROVIDERS`，理由是**上游没有这个数据**（不是「没接」），
+     * 并在 `expiry-runtime-parity.spec.ts` 的豁免表逐字登记。
+     * ⚠️ 上游一旦开始下发到期时间，只需补一个折算原语 + 两处登记。
+     */
+    channel: true,
+    // ✅ `rateLimit` 缺省 true：请求级换号 + 冷却已接（`codely-adapter.ts` 的
+    //    `updateModelRateLimit` 写点：402/预算耗尽 → UTC+8 次日 0 点、429 → 1h），
+    //    `probeById.codely` 探测适配器同步挂上 ⇒「重测 / 重置」有真实作用对象。
     // ✅ `credits.balance: true`（2026-10-19 真凭据实测）：余额端点
-    //    `GET /api/user/usage/summary`（Bearer + X-User-Agent）→
-    //    `{remaining_points:"2400", is_exhausted:false, details:[{type:'gift_credit',…}]}`
-    //    —— ⚠️ 数字是**字符串**。原语在 `src/codely-credits.ts`，接线在
-    //    `provider-credits.ts`（全仓首例 balance:true + channel:false：
-    //    登录与余额都是自由函数，不需要 auth 服务；provider-runtime-wiring
-    //    的守卫只查已注册 runtime，codely 无 runtime 被跳过）。
+    //    `GET /api/user/usage/summary` → `{remaining_points:"2400", is_exhausted:false, details:[…]}`
+    //    —— ⚠️ 数字是**字符串**。原语在 `src/codely-credits.ts`。
     // ✅ `dailyCheckin: true`（2026-10-20 真凭据实测接通）：两步端点
-    //    `POST /api/points/check-in/init`（查状态）→ `POST /api/points/check-in`
-    //    （执行）均 200；幂等判据是 `init` 的 `can_check_in`，活动状态在
-    //    `activity_status`。原语 `claimCodelyDailyCheckIn` 在 `src/codely-credits.ts`
-    //    （端点来源是网页 dashboard 的 SPA bundle —— 官方 CLI 二进制里没有签到
-    //    调用），接线在 `provider-credits.ts`（`precheckStatus: false`，内部自带
-    //    init 预检）。客户端「一键领取积分」按钮与页头「一键签到」遍历都从本表
-    //    派生，无需改 UI。
+    //    `POST /api/points/check-in/init`（查状态）→ `POST /api/points/check-in`（执行）；
+    //    幂等判据是 `init` 的 `can_check_in`。原语 `claimCodelyDailyCheckIn`。
     credits: { balance: true, dailyCheckin: true },
   },
   {

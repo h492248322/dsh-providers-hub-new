@@ -16,17 +16,44 @@ import { normalizeHarnessMessages } from './message-shape.js'
 import { signRequestHuawei } from './sign.js'
 // ⚠️ `detailFieldText`（`detail` 那条腿）**只留一份实现** —— 本仓库 6 份同义的
 // `errorDetail` 各写一条判据必然漂移（见 `openai-compat.ts` 的注释，IKLBSH A1）。
-import { detailFieldText } from './openai-compat.js'
+//
+// ⚠️⚠️ **`serializeMessages` / `collectImages` 也改用共享实现**（2026-10-21）：
+// 本文件原有一份**只处理文本**的私有 `serializeMessages`（注释还写着「其余非
+// 文本块（图片）被丢弃」）。接图片时若在私有那份上再加一条腿，就会变成
+// 「同一语义两套实现」—— 而共享实现已经把 12 家的坑（工具结果内嵌图片提升为
+// 独立 user 消息、空 Map 不降级、`[image unavailable]` 占位符、递归深度与
+// `collectImages` 对齐）全部踩过了。**故直接复用，不另写。**
+import { collectImages, detailFieldText, serializeMessages } from './openai-compat.js'
+
+/**
+ * 重新导出共享的 `serializeMessages`（**只为了让既有调用方与测试的导入路径不变**）。
+ *
+ * ⚠️ 这里**没有**第二份实现 —— 上面那条 import 就是唯一来源。写成
+ * `export { serializeMessages }` 而不是在这里再包一层，是为了让「有两份实现」
+ * 这件事在类型层面就不可能发生。
+ *
+ * ⚠️ 使用者（`tests/unit/session-replay.spec.ts` 等）测的是「0.1.7 形状与
+ * 0.1.5 形状等价」，判据与实现份数无关，故保留原导入路径即可。
+ */
+export { serializeMessages }
 import { createBlankReasoningSuppressor, createDsmlMarkerNormalizer, createReasoningLoopDetector, fixDsmlMarkers, hasUsableToolName, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reasoningLoopFailure, resolveEmptyResponseReason, resolveToolPairing, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
 import { planSessionTitleThinking } from './session-title.js'
 import type { CodeArtsCredential } from './types.js'
 import {
   registerAdapterIdempotent,
 } from './llm-register-compat.js'
+import { CODEARTS_PROVIDER, codeartsAcceptsImage, codeartsVisionModel } from './codearts-vision.js'
 import { reportLedgerAccount } from './token-ledger.js'
 
 export const CHAT_API_BASE = 'https://snap-access.cn-north-4.myhuaweicloud.com/api/v2'
-export const PROVIDER = 'codearts'
+/**
+ * codearts 的 provider id。
+ *
+ * ⚠️ 字面量的**唯一定义处在 `codearts-vision.ts`**（叶子模块）—— 注册期包装
+ *（`llm-register-compat.ts` 的 analyzeImage 摘除）与工具层判据必须同源，
+ * 两条腿不一致会让「摘掉」与「执行期断言」分叉。此处只是具名转出。
+ */
+export const PROVIDER = CODEARTS_PROVIDER
 /**
  * 本家**恒声明**的两档思考开关 —— 顺序即**强度序（弱 → 强）**（Issue IKLIDV）。
  *
@@ -168,20 +195,133 @@ const DEFAULT_MODELS: readonly string[] = [
 
 /**
  * 模型上下文窗口（最大合并请求+响应 token 数）。
- * - GLM-5.2：202752（对齐 CodeArts Agent IDE 模型卡标注）。
- * - glm-5.3-flash：1048576（1M，逆向自 IDE gateway/config，对齐 deveco-code-rust 90aeb17d）。
- * - deepseek-v4-flash / deepseek-v4-pro：1048576（1M，UI 标注）。
- * - deepseek-v4.1-flash：1000000（对齐 IDE 下发的 inferhub-provider 模型配置，
- *   2026-09 kernel 日志；对齐 deveco-code-rust fb1b4a2）。
- * - 其余模型未公开上下文容量，留 undefined 让后端默认裁剪。
+ *
+ * ## 权威来源与取证（2026-10-21 重取证）
+ *
+ * ⚠️⚠️ **不是从 HTTP 端点读的** —— 本家两个目录端点**都不下发窗口**：
+ * `snap-access /v1/model/builtin` 的条目键全集实测只有
+ * `channel_source, credit, display_enabled, enable, intervals, model_category,
+ *  model_desc, model_id, model_name, model_sku, provider, supports_images, time_slots`
+ * （**无任何 context/window/length/token 类字段**）；`opengw gateway/config`
+ * 本机 4 个账号全回 `4000 invalid channel, group not found`。
+ *
+ * 权威来源是 **CodeArts Agent IDE 自己下发的 provider 配置**：
+ * 内核日志 `cag-global-server` 的 `provider models replace body is {…}` 里
+ * `provider["inferhub-provider"].models[*].limit.context`。
+ * 本机取证范围 **2026-09-11 ~ 2026-10-21，42 份内核日志**，按日期收敛：
+ *
+ * | 模型 | `limit.context` | 取值历史 |
+ * |---|---|---|
+ * | `GLM-5.2` | **1_048_576** | 09-11~10-20 是 `202_752`，**10-21 起上游改成 1M** |
+ * | `glm-5.3` | **1_048_576** | 同上（09 月表里没有它，10-17 起出现，先 202752 后 1M） |
+ * | `glm-5.2-sft-harmony` | **202_752** | 全期稳定（09-11~10-21） |
+ * | `openpangu-2.0-flash` / `-pro` | **524_288** | 全期稳定 |
+ * | `deepseek-v4.1-flash` | **1_048_576** | 全期稳定（本表原先写 1_000_000，**已按 IDE 权威值改正**） |
+ * | `glm-5.3-flash` | **1_048_576** | 逆向自 IDE gateway/config（对齐 deveco-code-rust 90aeb17d） |
+ * | `deepseek-v4-flash` / `-pro` | **1_048_576** | UI 标注「每日 1000 万免费 Tokens」同批（对齐 fb1b4a2） |
+ *
+ * ⚠️ **`GLM-5.2` 的 202_752 已过期**（那是 10-20 及以前的配置）。留着它有两个
+ * 真实后果，且都是**静默**的：① 占用比被封顶成 100%（分母小 5 倍）；
+ * ② 自动压缩阈值 = `0.8 × 202752 ≈ 162K` ⇒ **1M 的能力永远吃不到**
+ * （与 `officeace-product.ts` 那次「估值偏小 5.3 倍」逐字同因）。
+ *
+ * ⚠️ **本表查不到时不再省略 `context`** —— 见 {@link CODEARTS_FALLBACK_CONTEXT_WINDOW}。
  */
 const CONTEXT_WINDOWS: ReadonlyMap<string, number> = new Map([
-  ['GLM-5.2', 202752],
+  ['GLM-5.2', 1_048_576],
+  ['glm-5.3', 1_048_576],
   ['glm-5.3-flash', 1_048_576],
-  ['deepseek-v4-flash', 1048576],
-  ['deepseek-v4-pro', 1048576],
-  ['deepseek-v4.1-flash', 1_000_000],
+  ['glm-5.2-sft-harmony', 202_752],
+  ['openpangu-2.0-flash', 524_288],
+  ['openpangu-2.0-pro', 524_288],
+  ['deepseek-v4-flash', 1_048_576],
+  ['deepseek-v4-pro', 1_048_576],
+  ['deepseek-v4.1-flash', 1_048_576],
 ])
+
+/**
+ * 本表查不到时**必须**给的那个窗口（`undefined` 在本家是不可接受的）。
+ *
+ * ## 为什么不能「查不到就省略」（真实报障，2026-10-21）
+ *
+ * 用户报障「codearts 对话后，DSH 下方本该显示上下文占用比的地方没有显示」。
+ * 判据链在宿主侧：
+ * 1. `dsh-client-ui-conversation/lib/client.js` 的 `contextOccupancy()`：
+ *    `if (usedTokens === void 0 || pressure?.contextWindow === void 0) return null`，
+ *    而 `ContextMeter` 在 `context === null` 时 **`return null`** ⇒
+ *    整个环 + 百分比 + 弹层**都不渲染**（不是显示 0%，是**根本不出现**）；
+ * 2. 分母 `contextWindow` 来自 `dsh-agent-loop` 写入的 `request/context` 事件，
+ *    值就是适配器 `resolveModel()` 返回的 `context.contextWindow`。
+ *
+ * ⇒ **本家任何一条目录条目缺窗口，用户就少一个占用条**。实测当时 7 条目录里
+ * 只有 2 条有窗口（`glm-5.3` / `openpangu-*` / `glm-5.2-sft-harmony` 全缺）。
+ * 会话落盘对照（`session-fd3e2786`，同一会话内切模型）：
+ * `{"model":"deepseek-v4.1-flash","contextWindow":1000000}` 有 ⇒ 条在；
+ * `{"model":"glm-5.3"}` 无 ⇒ 条消失。
+ *
+ * ## 为什么是「具名兜底」而不是继续省略
+ *
+ * 仓内先例：`aggregate-adapter.ts` 的 `AGGREGATE_COLD_CONTEXT_WINDOW` —— 同一个
+ * 宿主约束（`dsh-compaction-basic` 在 `info.context === undefined` 时抛
+ * `TargetPressureConfigError: no context capacity for …`）⇒ 纪律是
+ * 「**宁给具名兜底，不省略**」。本家是直连适配器，省略即同时丢掉占用条与
+ * 压缩阈值的唯一输入。
+ *
+ * ## 取值 524_288 的取舍（用户 2026-10-21 选定）
+ *
+ * 取**当前目录里最小的真实窗口**（`openpangu-*` 实测值）：
+ * - 偏小 ⇒ 对 1M 模型会**偏早**触发自动压缩（代价：多压一次，不报错）；
+ * - 偏大 ⇒ 若某未知模型其实更小，就变成**上游溢出报错**而不是自动压缩
+ *   （代价：一轮对话报废）。
+ * ⇒ 取偏小一侧。⚠️ **本值不是「实测的该模型窗口」**，只是安全边界；
+ * 命名与注释都不得声称它是真值（与 `AGGREGATE_COLD_CONTEXT_WINDOW` 同纪律）。
+ */
+export const CODEARTS_FALLBACK_CONTEXT_WINDOW = 524_288
+
+/**
+ * 取某模型的上下文窗口：**静态表优先、查不到用具名兜底**（恒返回正数）。
+ *
+ * ⚠️ 兜底**必须**在 `resolveModel` 与目录两条路径上都生效 —— 只改一条会让
+ * 「选择器里显示了」与「对话里不显示」分叉（本家目录与 `resolveModel`
+ * 共用 `CONTEXT_WINDOWS`，故收敛到这里）。
+ */
+export function codeartsContextWindow(modelId: string): number {
+  const known = CONTEXT_WINDOWS.get(modelId)
+  return known !== undefined && known > 0 ? known : CODEARTS_FALLBACK_CONTEXT_WINDOW
+}
+
+/**
+ * 把上游 `ratio_display` 原串转成**仓内倍率口径**（`x0.7`）。
+ *
+ * ## 为什么必须转（2026-10-21 合并审计发现）
+ *
+ * 上游 `/v1/model/builtin` 的 `ratio_display` 是 `0.7x`（**x 在数字后**），
+ * 而全仓其余各家的展示名是 ` · x{n}`（**x 在数字前**）：buddy（`x0.29`）、
+ * loomy（`x0.1`）、trae（`x0.08`）、accio（`x0.013`）、lobsterai（`x1.08`）。
+ *
+ * ⚠️ 而 `src/aggregate-core.ts` 的 `priceFactorFromName` 是**全仓唯一的倍率解析口**
+ * （聚合的「同临期档内倍率升序」与选择器的 `· 最低 x{n}` 都走它），它的正则
+ * `·\s*[×x]?\s*(\d+(?:\.\d+)?)...$` 把 `[×x]?` 放在数字**之前** ⇒
+ * ` · 0.18x` **匹配不上** ⇒ 恒返回 `Infinity`。
+ *
+ * ⇒ 后果：codearts 是聚合渠道（`AGGREGATE_CHANNELS` 第 1 位），它的候选价格
+ *   恒为 `Infinity` ⇒ 聚合**永远挑不到 codearts**（同临期档内它排最后），
+ *   选择器的「· 最低 x{n}」也漏掉它。
+ *
+ * ## 转换的边界（红线：绝不臆造）
+ *
+ * - **只改形态，不改数值** —— 数值仍逐字取自上游 `ratio_display`；
+ * - **认不出就返回 `undefined`**（调用方据此不显示倍率，**不用占位值冒充**）；
+ * - ⚠️ 上游若改形态（比如也改成 `x0.7`）⇒ 这里认不出 ⇒ 不显示倍率
+ *   （**保守方向**：少显示好过显示一个错的数）。此时应更新本函数与
+ *   `RemoteModel.rateLabel` 的注释。
+ */
+export function codeartsRateSuffix(display: string): string | undefined {
+  if (typeof display !== 'string') return undefined
+  const m = /^\s*(\d+(?:\.\d+)?)\s*x\s*$/i.exec(display)
+  if (m === null) return undefined
+  return `x${m[1]}`
+}
 
 /**
  * 单次请求输出上限的安全边界。
@@ -193,8 +333,10 @@ const CONTEXT_WINDOWS: ReadonlyMap<string, number> = new Map([
  * 都有该 id，极易张冠李戴）。
  *
  * ⚠️ 这是**全 provider 统一**的边界，不是逐模型表：本适配器的出站点只有一个，
- * 而 `CONTEXT_WINDOWS` 之上方已注明「其余模型未公开上下文容量」——
+ * 而 `CONTEXT_WINDOWS` 之上方已注明「窗口的权威来源是 IDE 下发的 provider 配置」——
  * 拿不到实测就不该臆造更小的值。故凡走本适配器的模型一律收敛到此上限。
+ * ⚠️ 与窗口**不是同一件事**：窗口缺失走的是 `CODEARTS_FALLBACK_CONTEXT_WINDOW`
+ * （有兜底），输出上限这里是**恒定收敛**（无兜底分支）。
  */
 const CODEARTS_MAX_OUTPUT_TOKENS = 65_536
 
@@ -220,7 +362,7 @@ export interface CodeArtsAdapterOptions {
   resolveCredential: () => Promise<CodeArtsCredential | undefined>
   refresh: () => Promise<void>
   /** 动态拉取远端模型列表；失败时调用方回退到静态列表。 */
-  fetchRemoteModels?: () => Promise<Array<{ id: string; name: string }>>
+  fetchRemoteModels?: () => Promise<Array<{ id: string; name: string; rateLabel?: string }>>
   /**
    * 最近一次目录拉取的**各来源成败**（issue IKJVTF，审计 I3）。
    *
@@ -262,104 +404,83 @@ export interface CodeArtsAdapterOptions {
    * 缓存的**兜底表**会永久留在对话框里，远端目录真的落地也不重读。
    */
   onCatalogLoaded?: () => void
+  /**
+   * 读图片字节（内联为 data URL 发上游）。
+   *
+   * ## 为什么必须由接线层桥接
+   *
+   * 适配器拿不到 `ctx`，而图片字节在附件服务（`ctx.attachments.readImage`）里。
+   * 接线层用 `makeReadImage(ctx)` 注入 —— 与其余 14 家**同一个**桥接件，
+   * 不另写第二套（本仓纪律：同一语义只留一份实现）。
+   *
+   * ## ⚠️ 只有 VL 模型能收图（实测）
+   *
+   * 见 {@link CODEARTS_VL_MODELS}：`kimi-k2.6-vl` / `Qwen3-VL-235B` 收图 200，
+   * 文本模型（含 `glm-5.3`）一律 `InferHub.001001020.406 The request model is
+   * not multimodal`。故本回调只会在**目标模型声明了 image 模态**时被调用
+   * （模态声明见 `toCatalogEntry` 的 `inputModalities`）。
+   */
+  readImage?: (attachment: unknown) => Promise<{ data: Uint8Array; mediaType: string }>
 }
 
-/**
- * 将消息内容载荷展平为纯文本字符串。Harness 消息
- * 以 OpenAI 风格的块数组形式携带内容（`[{type:'text',...}]`，且
- * 助手历史可能包含 `{type:'reasoning',...}` 块）；CodeArts
- * 端点会拒绝非 `text` 块类型并返回空流，因此只保留
- * `text` 块并拼接。
- */
-function contentToText(content: unknown): string {
-  if (typeof content === 'string') return content
-  if (!Array.isArray(content)) return ''
-  return content
-    .filter((block): block is { type: string; text: unknown } =>
-      typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'text')
-    .map((block) => String(block.text))
-    .join('')
-}
+
 
 /**
- * 将 harness 对话消息序列化为 CodeArts chat-completions 的传输
- * 格式。助手的 `tool-call` 块转换为 `tool_calls` 字段；`reasoning`
- * 块折叠为 `reasoning_content` 字段（deepseek-v4 等推理模型的后端
- * 校验要求 assistant 消息必须携带该字段，缺失会报 "Missing
- * `reasoning_content` field"）；工具结果（搭载在 harness 用户消息中）
- * 展开为独立的 `{role: 'tool'}` 消息，使模型能看到其调用的返回值。
- * 其余非文本块（图片）被丢弃，与端点接受的格式一致。
+ * 能**原生收图**的模型（`supports_images: true`，`model_category: 图片理解`）。
  *
- * ⚠️ 入口先做 **DSH 0.1.7 消息形状归一化**（见 `message-shape.ts`）：0.1.7 把工具
- * 结果改为一等 `role:'tool'` 消息，若不归一化，下面的 `type === 'tool-result'`
- * 判据恒不命中 → 工具调用被 `resolveToolPairing` 整体剔除。
+ * ## 实测（2026-10-21，只读探测 `/v1/model/builtin`，8 条目录逐条核对）
+ *
+ * | 模型 | `supports_images` | `model_category` |
+ * |---|---|---|
+ * | `kimi-k2.6-vl` | **true** | **图片理解** |
+ * | `Qwen3-VL-235B` | **true** | **图片理解** |
+ * | `GLM-5.2` / `glm-5.3` / `glm-5.2-sft-harmony` / `openpangu-2.0-flash` / `openpangu-2.0-pro` / `deepseek-v4.1-flash` | false | 文本生成 |
+ *
+ * ⇒ 只有这两条能收图，其余**发图必被上游拒**：
+ * `{"error_code":"InferHub.001001020.406","error_msg":"The request model is not multimodal"}`
+ * （实测 glm-5.3，见 `CODEARTS_VL_MODELS` 的探测记录）。
+ *
+ * ## ⚠️ 与「VL 模型不进目录」的关系（**刻意保留**）
+ *
+ * `toCatalogEntry` / `catalogEntries` 仍**把 VL 模型从对话目录里过滤掉**
+ *（`-VL-` / `-vl` 判据）—— 它们上下文小、不支持工具调用，当 agent 主模型会
+ * 踩别的坑。本表**只用于两件事**：
+ * 1. 判断「某个模型能不能收图」（{@link codeartsAcceptsImage}）；
+ * 2. `analyzeImage` 工具内部挑一个 VL 模型去做识图（{@link codeartsVisionModel}）。
+ *
+ * 即：**用户仍然不能在模型选择器里选 VL 模型，但主模型可以借它识图** ——
+ * 这与 IDE 自己的行为一致（IDE 也是 `fetchMultimodalModelId` 选一个 VL 模型
+ * 去服务 `analyzeImage` 工具，见 `docs/agent-notes/providers-codearts.md`）。
  */
-export function serializeMessages(messages: readonly { role: string; content: unknown }[]): Array<Record<string, unknown>> {
-  const normalized = normalizeHarnessMessages(messages)
-  const wire: Array<Record<string, unknown>> = []
-  // 剔除无法配对的工具调用/结果（详见 resolveToolPairing）：孤儿 tool_calls
-  // 会让后端对之后每一条消息都返回 400，整个会话永久报废。
-  const { keepCallIds, keepResultIds } = resolveToolPairing(normalized)
-  for (const message of normalized) {
-    if (message.role === 'assistant') {
-      // 存量自愈：清洗历史里已持久化的行首 `course` / `课` 泄漏
-      // （见 `stripCourseLeakFromHistoryContent`）。只清 assistant ——
-      // 判据只对模型自己的输出成立，清洗用户输入等于篡改用户的话。
-      const content = stripCourseLeakFromHistoryContent(
-        message.role,
-        Array.isArray(message.content) ? message.content : [],
-      )
-      const toolCalls = content
-        .filter((block): block is { type: string; id: unknown; name: unknown; arguments: unknown } =>
-          typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'tool-call')
-        .filter(block => keepCallIds.has(String(block.id)))
-        .map((block) => ({
-          id: String(block.id),
-          type: 'function' as const,
-          function: { name: String(block.name), arguments: normalizeToolArguments(String(block.arguments)) },
-        }))
-      const reasoning = content
-        .filter((block): block is { type: string; text: unknown } =>
-          typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'reasoning')
-        .map((block) => String(block.text))
-        .join('')
-      wire.push({
-        role: 'assistant',
-        content: contentToText(content),
-        // 后端（deepseek-v4-flash/pro）校验要求 assistant 消息必须包含
-        // reasoning_content 字段：历史里的推理块在上一轮被持久化，回传时
-        // 若缺失该字段会直接 400（"Missing `reasoning_content` field"）。
-        // 始终携带该字段（无推理时为空串），确保字段存在。
-        reasoning_content: reasoning,
-        ...toolCalls.length > 0 ? { tool_calls: toolCalls } : {},
-      })
-      continue
-    }
-    if (message.role === 'system') {
-      wire.push({ role: 'system', content: contentToText(message.content) })
-      continue
-    }
-    // user 角色：工具结果搭载在 harness 用户消息中；将每个展开为
-    // 独立的 role:'tool' 传输消息，与 deepseek 适配器的行为一致。
-    const content = Array.isArray(message.content) ? message.content : []
-    const toolResults = content.filter((block): block is { type: string; toolCallId: unknown; content: unknown } =>
-      typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'tool-result')
-    // 纯文本 user 消息（字符串 content）需原样传递：contentToText 处理
-    // 字符串时直接返回，但这里不能用 `content`（非数组时为 []）——否则
-    // 字符串 user 消息会被序列化成空串，模型看不到任务指令。
-    const text = contentToText(message.content)
-    if (text.length > 0 || toolResults.length === 0) wire.push({ role: 'user', content: text })
-    for (const result of toolResults) {
-      // 丢弃孤儿工具结果：没有对应 tool_call 其结果同样会让后端 400。
-      if (!keepResultIds.has(String(result.toolCallId))) continue
-      wire.push({
-        role: 'tool',
-        tool_call_id: String(result.toolCallId),
-        content: contentToText(result.content) || '(no output)',
-      })
-    }
-  }
-  return wire
+// ⚠️ 「哪个模型能收图」与「analyzeImage 用哪个 VL 模型」的**唯一定义处**在
+//    `codearts-vision.ts`（无依赖叶子模块，理由见其模块头）：那里同时被**注册期包装**
+//    （`llm-register-compat.ts` 逐请求摘除 analyzeImage）与工具层使用，
+//    写在这里会让 `llm-register-compat → llm-adapter → llm-register-compat` 成环。
+//    本文件只**转出**这两个符号，既有导入路径（`from './llm-adapter.js'`）不变。
+export { codeartsAcceptsImage, codeartsVisionModel }
+
+/**
+ * 把 harness 的图片块转成 CodeArts 接受的 wire 形态。
+ *
+ * ## ⚠️⚠️ 只有一种形态被接受（2026-10-21 实测四选一）
+ *
+ * 对 `kimi-k2.6-vl` 与 `Qwen3-VL-235B` 各发一张 8×8 纯红 PNG、问「是什么颜色」：
+ *
+ * | 形态 | 结果 |
+ * |---|---|
+ * | **`{type:'image_url', image_url:{url:'data:…'}}`** | **HTTP 200，答「红色」** ✅ |
+ * | `{type:'image_url', image_url:'data:…'}`（字符串） | 406 `InferHub.001001046` multimodal content incorrect |
+ * | `{type:'image', source:{type:'base64',…}}`（Anthropic 系） | 400 `ModelArts.81001` unsupported content type |
+ * | `{type:'input_image', image_url:…}`（Responses 系） | 406 `InferHub.001001046` |
+ *
+ * ⇒ **必须是 OpenAI 的「对象套 url」形态**，且 url 是 base64 data URL。
+ * 反向对照：同一份格式发给文本模型 `glm-5.3` 得
+ * `InferHub.001001020.406 The request model is not multimodal` ⇒ 这条判据有判别力。
+ *
+ * @param dataUrl - 已经拼好的 `data:image/…;base64,…` 串
+ */
+export function codeartsImagePart(dataUrl: string): { type: 'image_url'; image_url: { url: string } } {
+  return { type: 'image_url', image_url: { url: dataUrl } }
 }
 
 /**
@@ -980,11 +1101,22 @@ export class CodeArtsAdapter extends LlmAdapter {
         product: { id: PROVIDER },
         loadCatalog: () => this.catalogEntries(),
         syncCatalog: () => this.syncCatalogEntries(),
-        // ⚠️ 未知 id 恒声明 `['text']`（本家是纯文本网关）。
-        // ⚠️ 这是**用户 2026-10-08 裁定的一处行为变更**：原 `resolveModel` 对未知 id
-        //    **省略**该字段（而 `listModels` 却声明 `['text']`，同一家内部不一致）
-        //    ⇒ 统一为声明。影响面为零：CodeArts 是纯文本网关，VL 模型已被滤掉。
-        unknownModelInputModalities: () => ['text'] as const,
+        // ⚠️ 未知 id 的模态：**VL 模型例外**（2026-10-21 接图片时发现）。
+        //
+        // 历史：这里原写死 `['text']`，理由是「本家是纯文本网关、VL 模型已被滤掉」。
+        // 该理由**只对目录内条目成立** —— VL 模型被 `catalogEntries()` 滤掉后，
+        // `resolveModel('kimi-k2.6-vl')` 走的是**未知 id 分支**（`entry === undefined`），
+        // 于是拿到这里的 `['text']`，而 `toCatalogEntry` 里算出的 `['text','image']`
+        // **根本轮不到**（那条只在目录命中时生效）。
+        // ⇒ 症状：VL 模型声明不了 image ⇒ DSH 在**入库阶段**就拒图（真缺陷，
+        //    由 `codearts-image-input.spec.ts` 的守卫 ① 当场抓住）。
+        // ⇒ 修法：按 id 判能力（`codeartsAcceptsImage`），其余仍恒 `['text']`。
+        //
+        // ⚠️ 这也解释了为什么**不能**把 VL 模型放进目录来解决：那会改变「选择器里
+        //    能选到什么」（用户可见行为），而本次只需要「识图工具能按 id 借它」。
+        unknownModelInputModalities: (modelId) => codeartsAcceptsImage(modelId)
+          ? ['text', 'image'] as const
+          : ['text'] as const,
         // ⚠️ **未知模型也声明思考档位**（7b 曾在此引入回归、7d 补回）：
         // 本网关唯一生效的思考控制是顶层 `thinking.type`，与模型无关 ⇒
         // 原实现对未知 id 同样给这两档。
@@ -994,6 +1126,24 @@ export class CodeArtsAdapter extends LlmAdapter {
           efforts: [...CODEARTS_REASONING_EFFORTS],
           defaultEffort: ReasoningEffortId(CODEARTS_DEFAULT_EFFORT),
         }),
+        /**
+         * ⚠️ **未知 id 也给窗口**（用户手填模型 id 时否则永远没有上下文占用条）。
+         *
+         * 与 `unknownModelInputModalities` / `unknownModelReasoning` **同一形态**：
+         * 本家这两项都与「具体模型」无关（纯文本网关 / 顶层 `thinking.type`），
+         * 窗口这一项在本家同样有本地兜底可用（目录窗口本就全来自静态表）。
+         *
+         * ⚠️⚠️ **必须走 `codeartsContextWindow(modelId)`，不能直接返回常数兜底**
+         *    （2026-10-21 全量测试实测踩到）：`glm-5.3` 在静态窗口表里是 1M，
+         *    但**不在静态兜底目录**（`DEFAULT_MODELS`）里 ⇒ 远端失败时它算
+         *    「目录外 id」⇒ 直接返回常数会让它拿到 524_288（**分母错 2 倍**），
+         *    而它**正是用户报障的那个模型**。
+         *
+         * ⚠️ **不要推广到别家**：多数家的窗口来自远端该模型的配置，对未知 id
+         *    编一个就是**假窗口**（分母错 ⇒ 占用比与压缩阈值一起错）。
+         *    取值理由见 `CODEARTS_FALLBACK_CONTEXT_WINDOW` 的长注释。
+         */
+        unknownModelContextWindow: (modelId) => codeartsContextWindow(modelId),
         /**
          * ★ **强制重拉**（供后台 20 分钟刷新器与「用户改设置」）。
          *
@@ -1026,7 +1176,7 @@ export class CodeArtsAdapter extends LlmAdapter {
   }
 
   /** 动态模型缓存（首次 listModels 成功后填充）。 */
-  private remoteModels: Array<{ id: string; name: string }> | undefined
+  private remoteModels: Array<{ id: string; name: string; rateLabel?: string }> | undefined
 
   /**
    * 已落缓存的目录是否**所有来源都取全**（issue IKJVTF，审计 I3）。
@@ -1146,7 +1296,9 @@ export class CodeArtsAdapter extends LlmAdapter {
    * ⚠️ 本家三处**真实差异**（不要「顺手统一」）：
    * 1. **VL 多模态不参与目录**（`-VL-` / `-VL` 结尾的 id 被滤掉）——
    *    这是本家的可见性判据，骨架不认识；
-   * 2. `contextWindow` 来自静态 `CONTEXT_WINDOWS` 表（不是远端字段）；
+   * 2. `contextWindow` 来自静态 `CONTEXT_WINDOWS` 表（不是远端字段 ——
+   *    本家两个目录端点都**不下发**窗口，取证见该表的注释），表里查不到时
+   *    走具名兜底 {@link CODEARTS_FALLBACK_CONTEXT_WINDOW}（**恒有值**）；
    * 3. `reasoning` 是**恒声明**的两档（关闭/开启，**强度序**），与 entry 无关 ——
    *    实测（2026-09-29）：本网关**唯一**真正生效的思考控制是顶层
    *    `thinking.type`，`reasoning_effort`（含 low/high/none/minimal）与嵌套
@@ -1154,14 +1306,55 @@ export class CodeArtsAdapter extends LlmAdapter {
    *    `reasoning_tokens`，落在基线噪声内；`none` 也照常思考）。
    *    故**不**臆造 low/high/max 强度阶梯。
    */
-  private toCatalogEntry(model: { id: string; name: string }): CatalogEntry {
-    const contextWindow = CONTEXT_WINDOWS.get(model.id)
+  private toCatalogEntry(model: { id: string; name: string; rateLabel?: string }): CatalogEntry {
+    // ⚠️ **恒有值**（表内优先、查不到走具名兜底）—— 缺它用户就没有上下文占用条，
+    //    见 `CODEARTS_FALLBACK_CONTEXT_WINDOW` 的长注释（真实报障 2026-10-21）。
+    const contextWindow = codeartsContextWindow(model.id)
+    // ⚠️ 倍率拼进 `name`（与 officeace / buddy / loomy / raccoon 同款：
+    //    `name` 带倍率、`resolveModel` 用裸名，骨架只认 `name`）。
+    //
+    // ⚠️⚠️ **必须同时给 `bareName`**（2026-10-21 合并审计发现）：共享骨架
+    //    `model-catalog.ts:640` 的取值是 `entry?.bareName ?? entry?.name ?? model`
+    //    ⇒ 省略 `bareName` 就回退到**带倍率**的 `name` ⇒ `resolveModel().name`
+    //    会带上倍率。全仓其余六家拼倍率的渠道（loomy / raccoon / accio /
+    //    lobsterai / trae / buddy）**全部**提供了 `bareName`，本家是唯一例外。
+    //    ⚠️ 本家比别家更严重：倍率**随时间变**（错峰档 21:00–次日 08:00）⇒
+    //    同一个模型的 `resolveModel().name` 一天变两次（`· 0.09x` ↔ `· 0.18x`）。
+    //
+    // ⚠️ **形态必须转成仓内口径 ` · x{n}`**（2026-10-21 合并审计发现）：
+    //    上游 `ratio_display` 原串是 `0.7x`（**x 在数字后**），而全仓其余各家
+    //    是 ` · x{n}`（**x 在数字前**），且 `src/aggregate-core.ts` 的
+    //    `priceFactorFromName` 的正则把 `[×x]?` 放在数字**之前** ⇒ ` · 0.18x`
+    //    **解析不出** ⇒ 恒返回 `Infinity`。
+    //    ⇒ 后果：codearts 是聚合渠道（`AGGREGATE_CHANNELS` 第 1 位），
+    //      它的候选价格恒为 `Infinity` ⇒ `rankCandidates` 的第三判据
+    //      「同临期档内倍率升序」永远挑不到 codearts，`pickerNameOf` 的
+    //      `· 最低 x{n}` 也漏掉它。
+    //    ⚠️ 转换**只改形态、不改数值**（数值仍来自上游 `ratio_display`，
+    //    绝不臆造上游未下发的数 —— 见 `RemoteModel.rateLabel` 的注释）。
+    const rate = model.rateLabel !== undefined
+      ? codeartsRateSuffix(model.rateLabel)
+      : undefined
+    const name = rate !== undefined ? `${model.name} · ${rate}` : model.name
     return {
       id: model.id,
-      name: model.name,
-      // ⚠️ 本家恒声明 `['text']`（CodeArts 是纯文本网关；VL 模型上面已滤掉）。
-      inputModalities: ['text'] as const,
-      ...contextWindow !== undefined ? { contextWindow } : {},
+      name,
+      // ⚠️ `resolveModel` 用的**裸名**（不含倍率）—— 价格只属于选择列表语境
+      //    （与 loomy / raccoon / trae / lobsterai 同款，见 `model-catalog.ts`
+      //    的 `bareName` 字段注释）。
+      bareName: model.name,
+      // ⚠️ 模态**逐模型判定**（2026-10-21 接图片时改）：VL 模型声明
+      //    `['text','image']`，其余恒 `['text']`。
+      //
+      //    为什么以前是「恒 `['text']`」：那时 VL 模型全被下面的可见性过滤滤掉，
+      //    目录里一条都不剩，所以写死无害。现在 VL 模型**仍不进目录**（理由见
+      //    `CODEARTS_VL_MODELS` 的注释），但 `analyzeImage` 工具会按 id 直接
+      //    `resolveModel('kimi-k2.6-vl')` —— 那条路径必须看到 `image`，
+      //    否则 DSH 的图片准入闸门会在**发请求之前**就拒掉。
+      inputModalities: codeartsAcceptsImage(model.id) ? ['text', 'image'] as const : ['text'] as const,
+      // ⚠️ **无条件落键**（`codeartsContextWindow` 恒返回正数）—— 写成
+      //    `...contextWindow !== undefined ? {...} : {}` 就是本缺陷的成因。
+      contextWindow,
       reasoning: {
         // ⚠️ 顺序 = **强度序（弱 → 强）**，逐条理由见 `CODEARTS_REASONING_EFFORTS`
         // 的长注释（Issue IKLIDV）—— 简言之：DSH 把该数组当展示顺序、客户端不排序，
@@ -1217,8 +1410,14 @@ export class CodeArtsAdapter extends LlmAdapter {
     model: string,
     signal?: AbortSignal,
   ): Promise<{ model: LlmResolvedModelInfo; stream: (options: GenerateOptions) => AsyncIterable<StreamChunk> }> {
+    // ⚠️⚠️ **不得在这里再写一次 `inputModalities`**（2026-10-21 接图片时发现）：
+    // 原代码是 `{ ...await this.resolveModel(...), inputModalities: ['text'] }` ——
+    // 即**硬覆盖**目录里刚算出的模态。那与「同一事实写两处」同型：只要目录里
+    // 开始按模型区分模态（VL 收图、文本模型不收），这行就会**静默把它抹平**，
+    // 症状是「VL 模型明明声明了 image，发图仍被 DSH 在入库阶段拒掉」。
+    // ⇒ 模态只由 `toCatalogEntry` 一处决定，这里原样透传。
     return {
-      model: { ...await this.resolveModel(provider, model, signal), inputModalities: ['text'] as const },
+      model: await this.resolveModel(provider, model, signal),
       stream: (options: GenerateOptions) => this.stream(options),
     }
   }
@@ -1248,7 +1447,41 @@ export class CodeArtsAdapter extends LlmAdapter {
       if (currentAccountId) reportLedgerAccount(PROVIDER, currentAccountId)
     }
 
-    const messages = serializeMessages(options.messages)
+    // ⚠️ **图片：只有 VL 模型收，且必须走共享实现**（2026-10-21 实测接线）。
+    //
+    //  - 模态闸门：`codeartsAcceptsImage(model)` 为假时**不读字节、不拼 parts**
+    //    ⇒ 请求与改造前逐字节相同（文本模型发图仍会被上游 406，但我们不会
+    //    先把图内联进去浪费一次请求；真正的准入在 DSH 侧由 `inputModalities`
+    //    拦下，见 `toCatalogEntry`）。
+    //  - `imageUrls === undefined` ⇒ 共享 `serializeMessages` 走**纯文本**老路径，
+    //    与改造前一致；非 undefined（含空 Map）时把 user 消息升级为多模态 parts。
+    //    ⚠️ 空 Map 不能降级为 undefined —— 那会让「图片在但字节读失败」的
+    //    `[image unavailable]` 占位符也被跳过，图片静默消失（与 officeace 同因）。
+    let imageUrls: Map<string, string> | undefined
+    if (codeartsAcceptsImage(options.model)) {
+      const imageRefs = new Map<string, unknown>()
+      for (const message of options.messages) {
+        if (Array.isArray(message.content)) collectImages(message.content, imageRefs)
+      }
+      if (imageRefs.size > 0) {
+        imageUrls = new Map()
+        for (const [id, ref] of imageRefs) {
+          if (this.options.readImage === undefined) {
+            // 附件服务没接线：留空 Map（图片显示为 `[image unavailable]`），
+            // 而不是抛错把整轮对话打死 —— 与其余家同一取向。
+            continue
+          }
+          try {
+            const image = await this.options.readImage(ref)
+            imageUrls.set(id, `data:${image.mediaType};base64,${Buffer.from(image.data).toString('base64')}`)
+          } catch {
+            // 单张读失败不拖垮整轮：其余图片照发，这张落占位符。
+          }
+        }
+      }
+    }
+
+    const messages = serializeMessages(options.messages, imageUrls)
     // harness 的 GenerateOptions.system 是独立的系统提示（如标题生成的
     // systemPrompt、agent 的 persona）。后端 chat/completions 只接受
     // messages 数组里的 system 角色，必须显式插入——否则模型看不到

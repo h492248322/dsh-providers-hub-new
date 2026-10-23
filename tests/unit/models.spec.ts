@@ -357,4 +357,126 @@ describe('isCodeArtsBenefitModel', () => {
     saveModelsCache([{ id: 'GLM-5.2', name: 'GLM-5.2' }])
     expect(loadModelsCache()).toEqual([{ id: 'GLM-5.2', name: 'GLM-5.2' }])
   })
+
+  it('倍率经缓存往返不丢（rateLabel 落盘/读回）', () => {
+    // ⚠️ 2026-10-21：倍率曾**两次**被静默丢弃（解析层不读、service 返回类型
+    //    写死 `{id,name}`），而 TS 结构类型允许「少字段」赋值 ⇒ 编译不报错、
+    //    运行期悄悄丢。本用例锁住缓存这一环（JSON 序列化是隐式契约）。
+    saveModelsCache([{ id: 'GLM-5.2', name: 'GLM-5.2', rateLabel: '0.7x' }])
+    expect(loadModelsCache()).toEqual([{ id: 'GLM-5.2', name: 'GLM-5.2', rateLabel: '0.7x' }])
+  })
+})
+
+describe('CodeArts 目录倍率解析（2026-10-21 新增）', () => {
+  /**
+   * 构造一份带 `credit[]` 的 `/v1/model/builtin` 响应。
+   *
+   * ⚠️ 形态取自真机取证（8 个模型）：`credit[0]` 同时有 `ratio`（数值）与
+   * `ratio_display`（展示串），两者**不同量纲**。
+   */
+  function builtinResponse(models: unknown[]): string {
+    return JSON.stringify({ count: models.length, builtinModels: models })
+  }
+
+  it('★ 取 ratio_display，不取 ratio（两者不同量纲）', async () => {
+    // 真机对照：GLM-5.2 的 ratio=0.05 但显示 0.7x；
+    // deepseek-v4.1-flash 同样 ratio=0.05 却显示 0.18x。
+    // ⇒ 若用 ratio 拼 `x{n}` 会显示一个上游从未出现过的数（红线：绝不臆造）。
+    const { fetcher } = makeFetcher({
+      [SNAP_MODEL_BUILTIN_URL]: {
+        body: builtinResponse([{
+          model_id: 'GLM-5.2',
+          model_name: 'GLM-5.2',
+          credit: [{ ratio: '0.05', ratio_display: '0.7x', before_display_ratio: null }],
+        }]),
+      },
+    })
+    const models = await fetchCodeArtsRemoteModels(makeCredential(), fetcher)
+    expect(models).toHaveLength(1)
+    expect(models?.[0]?.rateLabel).toBe('0.7x')
+  })
+
+  it('★ 错峰时段取 off_peak 档，不是 credit[0]（真实缺陷）', async () => {
+    // ⚠️ 2026-10-21 用户当场发现：deepseek-v4.1-flash 在错峰时段（21:00–次日 7:59
+    //    Asia/Shanghai）显示 0.09x，而 `credit[0]` 是 default 档的 0.18x ⇒
+    //    取 credit[0] 会在整个错峰期显示**过高的倍率**。
+    const { fetcher } = makeFetcher({
+      [SNAP_MODEL_BUILTIN_URL]: {
+        body: builtinResponse([{
+          model_id: 'deepseek-v4.1-flash',
+          model_name: 'deepseek-v4.1-flash',
+          credit: [
+            { ratio: '0.05', ratio_display: '0.18x', time_slot_id: 'default' },
+            { ratio: '0.05', ratio_display: '0.09x', time_slot_id: 'off_peak', before_display_ratio: '0.18x' },
+          ],
+          time_slots: {
+            off_peak: { timezone: 'Asia/Shanghai', schedule: '0 0 21 * * *', duration: 11, timeunit: 'hour' },
+            default: { timezone: 'Asia/Shanghai', schedule: null, duration: null, timeunit: 'hour' },
+          },
+        }]),
+      },
+    })
+    // 北京时间的「时」→ 注入时刻（与本文件其它用例同口径：算术平移 +8h）
+    const atBJ = (hour: number, minute = 0): number => {
+      const shanghai = new Date(Date.now() + 8 * 3600_000)
+      const target = new Date(shanghai)
+      target.setUTCHours(hour - 8, minute, 0, 0)
+      return target.getTime()
+    }
+    const rateAt = async (hour: number, minute = 0): Promise<string | undefined> => {
+      const ms = await fetchCodeArtsRemoteModels(makeCredential(), fetcher, undefined, atBJ(hour, minute))
+      return ms.find((m) => m.id === 'deepseek-v4.1-flash')?.rateLabel
+    }
+    // 错峰窗口：21:00 + 11h = 至次日 07:59
+    expect(await rateAt(3), '03:00 在错峰内').toBe('0.09x')
+    expect(await rateAt(21, 0), '21:00 是窗口起点').toBe('0.09x')
+    expect(await rateAt(7, 59), '07:59 是窗口终点').toBe('0.09x')
+    // 窗口外
+    expect(await rateAt(8, 0), '08:00 已出窗口').toBe('0.18x')
+    expect(await rateAt(20, 59), '20:59 未到窗口').toBe('0.18x')
+    expect(await rateAt(10), '10:00 是平时').toBe('0.18x')
+  })
+
+  it('两档但 time_slot_id 都为 null 时取 credit[0]（openpangu-2.0-pro 实况）', async () => {
+    // 真机：openpangu-2.0-pro 有两档，但两档 time_slot_id 都是 null、
+    // display 也相同 ⇒ 取任一对，不该因为「查不到时段」而退回成无倍率。
+    const { fetcher } = makeFetcher({
+      [SNAP_MODEL_BUILTIN_URL]: {
+        body: builtinResponse([{
+          model_id: 'openpangu-2.0-pro',
+          model_name: 'OpenPangu-2.0-Pro',
+          credit: [
+            { ratio: '0.028', ratio_display: '0.7x', time_slot_id: null },
+            { ratio: '0.028', ratio_display: '0.7x', time_slot_id: null },
+          ],
+        }]),
+      },
+    })
+    const ms = await fetchCodeArtsRemoteModels(makeCredential(), fetcher)
+    expect(ms).toHaveLength(1)
+    expect(ms[0]?.rateLabel).toBe('0.7x')
+  })
+
+  it('credit 为空 / 缺 ratio_display 时不落 rateLabel（不用占位值冒充）', async () => {
+    const { fetcher } = makeFetcher({
+      [SNAP_MODEL_BUILTIN_URL]: {
+        body: builtinResponse([
+          // VL 模型：真机实测 credit 整个为空数组
+          { model_id: 'kimi-k2.6-vl', model_name: 'kimi-k2.6-vl', credit: [] },
+          // 有 credit 但没有 ratio_display
+          { model_id: 'no-display', model_name: 'no-display', credit: [{ ratio: '0.05' }] },
+          // 完全没有 credit 字段
+          { model_id: 'no-credit', model_name: 'no-credit' },
+        ]),
+      },
+    })
+    const models = await fetchCodeArtsRemoteModels(makeCredential(), fetcher)
+    // ⚠️ 三个都返回（含 kimi-k2.6-vl）：可见性过滤判据是 `-VL-` / `-VL` **大写**，
+    //    而真机这条 id 是小写 `-vl` ⇒ **逃过过滤**（既有行为，非本次改动引入，
+    //    此处按真实行为断言，不擅自改判据 —— 那会改变目录内容）。
+    expect(models?.map((m) => m.id).sort()).toEqual(['kimi-k2.6-vl', 'no-credit', 'no-display'])
+    for (const m of models ?? []) {
+      expect(m.rateLabel, `${m.id} 不该有 rateLabel`).toBeUndefined()
+    }
+  })
 })

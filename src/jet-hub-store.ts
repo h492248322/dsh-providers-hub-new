@@ -206,6 +206,22 @@ export interface JetHubState {
    */
   nativeWebSearchEnabled?: boolean
   /**
+   * 「侧栏入口」开关（`false` = 主导航不显示 Jet Hub 入口）。
+   *
+   * 打开时，Jet Hub 在**主导航**（`sidebar.panellist`）里多一行，点它把 Jet Hub
+   * 页面渲染进中央主面板；关闭时只剩「设置 → Jet Hub」一条进入路径。
+   *
+   * ⚠️ **必须住宿主**，不能放浏览器 `localStorage`：Web 侧的 origin 是
+   * `127.0.0.1:<随机端口>`，每次启动端口都变 ⇒ `localStorage` 会随旧 origin
+   * 一起被抛弃，表现为「关掉的入口下次启动又回来了」。而它又与
+   * `gatewayEnabled` 同级：老版本代码整体重写 `state.json` 时会丢掉本键，
+   * 后果仅仅是**入口回到默认显示**（可逆，用户再关一次即可），没有不可逆后果。
+   *
+   * 缺键语义为**启用**：老用户升级后行为与升级前完全一致（升级前本来就
+   * 没有这一行，缺键时把入口显示出来正是用户想要的「装上就能用」）。
+   */
+  sidebarEntryEnabled?: boolean
+  /**
    * 供应商自定义显示顺序（「供应商开关」弹窗的拖拽排序，2026-10-06）。
    *
    * ⚠️ 与 `gatewayEnabled` 同级、**可以**住在这里：老版本代码整体重写
@@ -336,6 +352,9 @@ const jetHubSchema = Schema.object({
   // 「允许局域网访问」：默认关闭（暴露面变大必须是显式选择）。
   gatewayAllowLan: Schema.boolean().default(false),
   nativeWebSearchEnabled: Schema.boolean().default(true),
+  // 缺键 = 显示侧栏入口（升级前的行为是「没有这一行」，但缺键时显示它
+  // 才是用户装上就看到入口的默认；关掉是一个显式动作，见 `sanitizeSidebarEntryEnabled`）。
+  sidebarEntryEnabled: Schema.boolean().default(true),
   providerOrder: Schema.array(Schema.string()).default([]),
   // ⚠️ 用 `Schema.string()` 而不是自定义 IP 校验：schema 只负责类型，
   // 取值合法性由 `sanitizeMinimaxXff` 在**读写两侧**统一判（老契约后端不经过
@@ -388,6 +407,21 @@ export function sanitizeGatewayAllowLan(raw: unknown): boolean {
  * 要 API Key。
  */
 export function sanitizeNativeWebSearchEnabled(raw: unknown): boolean {
+  return raw !== false
+}
+
+/**
+ * 归一化「侧栏入口」开关（{@link JetHubState.sidebarEntryEnabled}）。
+ *
+ * 判据与 {@link sanitizeNativeWebSearchEnabled} **逐字同构**：**只有显式 `false`
+ * 才算关闭**，其余（缺键 / `true` / 字符串 / 对象 / 数组）一律按启用处理。
+ *
+ * ⚠️ 方向不能反。文档缺失、被手工编辑成脏值、或老版本代码整体重写时丢了本键，
+ * 都必须**回到默认显示入口** —— 反过来（只认 `true`）会让任何一次读取失败都
+ * 变成「用户明明开着入口却静默消失」，而主面板那条进入路径会跟着一起消失，
+ * 用户只剩设置页一条路且不知道发生了什么。
+ */
+export function sanitizeSidebarEntryEnabled(raw: unknown): boolean {
   return raw !== false
 }
 
@@ -938,6 +972,7 @@ class SettingsStore implements JetHubStore {
         gatewayEnabled?: unknown
         gatewayAllowLan?: unknown
         nativeWebSearchEnabled?: unknown
+        sidebarEntryEnabled?: unknown
         providerOrder?: unknown
         minimaxXff?: unknown
         providerClosed?: unknown
@@ -961,6 +996,8 @@ class SettingsStore implements JetHubStore {
       gatewayAllowLan: sanitizeGatewayAllowLan(value.gatewayAllowLan),
       // 老文档没这个键 → 启用（原生搜索本就是新功能，默认开启才符合「装上就能用」）。
       nativeWebSearchEnabled: sanitizeNativeWebSearchEnabled(value.nativeWebSearchEnabled),
+      // 老文档没这个键 → 显示侧栏入口（见 `sanitizeSidebarEntryEnabled` 的方向说明）。
+      sidebarEntryEnabled: sanitizeSidebarEntryEnabled(value.sidebarEntryEnabled),
       // 老文档没这个键 → 空数组（未自定义），展示侧按声明顺序渲染。
       providerOrder: sanitizeProviderOrder(value.providerOrder),
       // 老文档没这个键 ⇒ `undefined` ⇒ 不附 XFF（与修复前行为逐字节一致）。
@@ -1010,6 +1047,11 @@ class SettingsStore implements JetHubStore {
       //    探针实测（老契约后端）：`setNativeWebSearchEnabled(false)` 的
       //    replace 载荷里根本没有本键，新实例读回 `true`。
       nativeWebSearchEnabled: state.nativeWebSearchEnabled !== false,
+      // ⚠️ **必须带上本键**（与 `nativeWebSearchEnabled` 同因，是同一个
+      //    `replace` 整体替换陷阱的第二个受害者）：漏键会让用户明确关闭的
+      //    「侧栏入口」在**任何**一次账号/黑名单/网关/顺序写入时被抹掉，
+      //    重启后入口**静默回来**（用户本以为关掉了它）。
+      sidebarEntryEnabled: state.sidebarEntryEnabled !== false,
       // 顺序丢失只会回到声明顺序（可逆，重拖一次即恢复），同理接受丢失。
       providerOrder: state.providerOrder ?? [],
       // ⚠️ **必须带上本键**：`replace` 是整体替换语义 ⇒ 漏键会让用户设置的
@@ -1253,6 +1295,7 @@ class FileStore implements JetHubStore {
         gatewayEnabled?: unknown
         gatewayAllowLan?: unknown
         nativeWebSearchEnabled?: unknown
+        sidebarEntryEnabled?: unknown
         providerOrder?: unknown
         minimaxXff?: unknown
         providerClosed?: unknown
@@ -1274,6 +1317,8 @@ class FileStore implements JetHubStore {
         gatewayAllowLan: sanitizeGatewayAllowLan(value.gatewayAllowLan),
         // 老文档没这个键 → 启用，与升级前行为一致。
         nativeWebSearchEnabled: sanitizeNativeWebSearchEnabled(value.nativeWebSearchEnabled),
+        // 老文档没这个键 → 显示侧栏入口（与 `SettingsStore` 同一判据）。
+        sidebarEntryEnabled: sanitizeSidebarEntryEnabled(value.sidebarEntryEnabled),
         // 老文档没这个键 → 空数组（未自定义），展示侧按声明顺序渲染。
         providerOrder: sanitizeProviderOrder(value.providerOrder),
         // 老文档没这个键 ⇒ `undefined` ⇒ 不附 XFF（与修复前行为逐字节一致）。
@@ -1335,6 +1380,8 @@ class FileStore implements JetHubStore {
         gatewayAllowLan: false,
         // 同上：恢复出的文档不含原生搜索开关信息 → 启用（与全新安装一致）。
         nativeWebSearchEnabled: true,
+        // 同上：恢复出的文档不含侧栏入口开关信息 → 显示入口（与全新安装一致）。
+        sidebarEntryEnabled: true,
         // 凭据文件里也没有顺序信息 → 空数组（未自定义，与全新安装一致）。
         providerOrder: [],
         // 凭据文件里没有 XFF 设置 → 不附头（与全新安装一致）。

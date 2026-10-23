@@ -11,7 +11,9 @@
  *           model.list / model.setDisabled /
  *           captcha.demand / captcha.carrierUrl / captcha.contribute（内部载体，
  *           载体页见 src/zcode-carrier-page.ts 与 src/captcha-carrier-server.ts）/
- *           backup.export / backup.import / backup.status
+ *           backup.export / backup.import / backup.status /
+ *           nativeSearch.getEnabled / nativeSearch.setEnabled /
+ *           sidebarEntry.getEnabled / sidebarEntry.setEnabled /
  * 另有一条 GET 路由 `/api/jet-hub/captcha-carrier`：渲染内部载体的载体页
  * （⚠ 手工诊断用；guest 加载不到它，见该路由注释里的主进程取证）。
  */
@@ -135,6 +137,8 @@ import {
 import { MODELSCOPE } from './modelscope-product.js'
 import { maskModelscopeKey } from './modelscope.js'
 import { CODELY_PROVIDER_ID, startCodelyDeviceLogin, decodeCodelyJwtExpMs } from './codely-auth.js'
+import type { CodelyAuth } from './codely-auth-service.js'
+import { CODERLY } from './codely-product.js'
 import { LOBSTERAI } from './lobsterai-product.js'
 import { PROVIDER_REGISTRY, descriptorOf } from './provider-registry.js'
 import { createProviderCredits, creditsOf } from './provider-credits.js'
@@ -159,7 +163,7 @@ import {
   withQoderNickname,
 } from './qoder.js'
 import type { QoderCredential } from './qoder.js'
-import { claimQoderDailyCheckin, fetchQoderCreditBalance } from './qoder-credits.js'
+import { claimQoderDailyCheckin, fetchQoderBalanceDetailed } from './qoder-credits.js'
 import { isTraeRefreshable, traeCredentialExpiresAtMs, traeDisplayNickname } from './trae.js'
 import type { TraeCredential } from './trae.js'
 import { fetchClineUsageLimits } from './cline-quota.js'
@@ -349,6 +353,9 @@ import type {
   RpcNativeSearchGetEnabledResponse,
   RpcNativeSearchSetEnabledRequest,
   RpcNativeSearchSetEnabledResponse,
+  RpcSidebarEntryGetEnabledResponse,
+  RpcSidebarEntrySetEnabledRequest,
+  RpcSidebarEntrySetEnabledResponse,
   RpcGatewayModel,
   RpcCaptchaDemandResponse,
   RpcCaptchaCarrierUrlResponse,
@@ -764,6 +771,13 @@ export interface CreditsEndpointDeps<
   resolve(ref: CredentialRef): Promise<{ value: string } | undefined>
   /** 查询签到状态；默认使用真实的 fetchCheckinStatus。 */
   fetchStatus?: (credential: TCredential, product: TProduct) => Promise<CheckinStatus | null>
+  /**
+   * `collectCreditsStatus` 的**并发度**；默认 3。
+   *
+   * 只影响 `credits.status` 这一趟逐账号查询（见该函数的长注释）。
+   * `1` = 完全串行（升级前语义）；测试与将来调参用。
+   */
+  concurrency?: number
   /** 执行签到领取；默认使用真实的 claimDailyCheckin。 */
   claim?: (credential: TCredential, product: TProduct, entry: ProviderAccountEntry) => Promise<ClaimOutcome>
   /**
@@ -935,7 +949,66 @@ export interface CreditsEndpointDeps<
 }
 
 /**
- * 逐账号收集签到状态（顺序执行，避免并发触发风控）。
+ * `credits.status` 逐账号查询的**默认并发度**。
+ *
+ * 3 的依据与代价见 `collectCreditsStatus` 函数体内那段注释（**不要**用「浏览器
+ * 默认 6」来论证 —— 那是不同量纲）。
+ */
+export const DEFAULT_CREDITS_STATUS_CONCURRENCY = 3
+
+/**
+ * `credits.status` 逐账号查询的**并发硬上界**。
+ *
+ * ## ⚠️ 为什么必须有它（2026-10-22 审计打穿）
+ *
+ * 初版的上界是 `accounts.length`：
+ *
+ * ```ts
+ * Math.max(1, Math.min(deps.concurrency ?? 3, accounts.length || 1))
+ * ```
+ *
+ * 于是 `deps.concurrency = 1e10`（任何 ≥ 账号数的安全整数）⇒ 并发度 = 账号数
+ * ⇒ **31 个账号 = 31 个并发请求打同一上游**（实测峰值 31）。注释说的「3 个并发
+ * 压力很低」这个保护**只由 `accounts.length` 约束，没有任何硬顶**。
+ *
+ * ⇒ 上界改为本常量。它同时给「将来有人把默认值调大」加了一道闸。
+ *
+ * ⚠️ 取值 8：足够覆盖「账号很多」的正常情形（3 是默认，8 是天花板），且远低于
+ * 任何一家上游会当成爬虫的量级。调它需要重新核对 `fetchStatus` 各家的限流策略。
+ */
+export const MAX_CREDITS_STATUS_CONCURRENCY = 8
+
+/**
+ * 解析 `credits.status` 的并发度（**纯函数，可直接单测**）。
+ *
+ * 逐格行为（2026-10-22 审计逐格实测确认）：
+ *
+ * | 传入 | 结果 | 说明 |
+ * |---|---|---|
+ * | `undefined` / `0` / `-1` / `NaN` / `1.5` / `Infinity` / 字符串 | 3 | 非「正整数」一律回落默认 |
+ * | `1` | 1 | 恢复旧的完全串行语义 |
+ * | `4` | 4 | |
+ * | `1e10` / `MAX_SAFE_INTEGER` | **8** | 被 {@link MAX_CREDITS_STATUS_CONCURRENCY} 硬顶（初版这里会变成账号数） |
+ * | `accounts.length === 0` | 1 | 起 1 个 worker 立刻返回 -1（**不能**是 0 —— 那会让 `results` 全是空洞） |
+ *
+ * ⚠️ `concurrency: 0` 的语义是「**回落默认 3**」，**不是**「串行」——要串行请传 `1`。
+ *    这条在初版注释里没写，是审计点出来的语义空隙。
+ */
+export function resolveCreditsStatusConcurrency(raw: unknown, accountCount: number): number {
+  const wanted = typeof raw === 'number' && Number.isSafeInteger(raw) && raw > 0
+    ? raw
+    : DEFAULT_CREDITS_STATUS_CONCURRENCY
+  const capped = Math.min(wanted, MAX_CREDITS_STATUS_CONCURRENCY)
+  // ⚠️ `Math.max(1, …)` 不可省：账号数为 0 时 `Array.from({length: 0})` 会让
+  //    `Promise.all([])` 立即 resolve，`results` 保持全空洞（返回 `[undefined,…]`）。
+  return Math.max(1, Math.min(capped, accountCount || 1))
+}
+
+/**
+ * 逐账号收集签到状态（**有限并发**，默认 3；见函数体内 `concurrency` 的说明）。
+ *
+ * ⚠️ **原实现是纯串行**，注释写「顺序执行，避免并发触发风控」。2026-10-22 改成
+ * 有限并发，理由与代价见函数体内那段长注释 —— **别再照旧注释改回串行**。
  *
  * **包含已停用账号**：停用只影响账号池的自动选择与限流切换，不改变账号本身
  * 是否已签到。用户要看到的是「这个账号今天领了没」，因此这里不过滤 enabled。
@@ -960,26 +1033,96 @@ export async function collectCreditsStatus<TCredential = BuddyCredential, TProdu
         product as unknown as BuddyProduct,
         fetcher,
       ))
-  const results: RpcCreditsStatusResponse['accounts'] = []
-  // 顺序查询，避免并发触发风控
-  for (const entry of accounts) {
-    let status: CheckinStatus | null = null
-    try {
-      let resolved = await deps.resolve(credentialRef(entry.credentialRef))
-      if (resolved === undefined && (product as { id?: string }).id === ASTUDIO.id) {
-        resolved = await deps.resolve(credentialRef(ASTUDIO.defaultCredentialRef))
+  /**
+   * **有限并发**（2026-10-22，真实故障）。
+   *
+   * ## 为什么不再「完全串行」
+   *
+   * 原实现是纯顺序循环，注释写「避免并发触发风控」。但账号池随用户增删账号
+   * **线性增长**，而单账号上游超时是 30 s 级 ⇒ 单渠道耗时 = 账号数 × 单账号耗时
+   * ⇒ 「打开 Jet Hub 设置页」的等待被账号数线性放大。同一时刻 `model.list` 只要
+   * 毫秒级（⇒ 慢的不是读目录，是这里）。
+   *
+   * ## 为什么是 3（以及**推翻**了哪条既有理由）
+   *
+   * 原注释的理由是「顺序查询避免并发触发风控」。逐项核对后的**真实依据**是：
+   *
+   * - **实际能走到这里的渠道极少**：只有注册了 `ProviderCredits.fetchStatus` 的
+   *   渠道才会调本函数（`credits.status` 端点先判 `statusImpl?.fetchStatus` ——
+   *   实测判据在 `creditsOf(credits, req.provider)` 之后、`undefined` 即短路返回），
+   *   **本仓库是 4 家**：`minimax` / `minimaxintl`（`fetchMinimaxSigninStatus`）与
+   *   `buddy` / `workbuddy`（`fetchCheckinStatus` → `postJson`）；其余渠道走
+   *   「如实回 null」的短路分支，**零请求**。
+   *   ⚠️ 上游 86e3591 这里写的是「**两家** `minimax` / `minimaxintl`」—— 那是
+   *   **他们**那份仓库的事实（其 `provider-credits.ts` 里没有 buddy / workbuddy 条目）。
+   *   **本仓库不适用**：`buddy` 有签到状态端点，`workbuddy` 那条是**刻意注册**的
+   *   （国际版没有签到接口、但状态端点存在，见 `provider-credits.ts` 里
+   *   `workbuddy.fetchStatus` 的注释）⇒ 四家都是**只读状态查询、一次/账号**。
+   * - **429 不会被放大**：`minimax` 的 `minimaxFetchWithRetry` 只重试**传输错误**，
+   *   而 `buddy` 系走的 `credits.ts` `postJson` **同样不重试 HTTP 状态**
+   *   （实测：该文件里 `429` / `retry` 零命中）⇒ 3 并发撞限流只是 3 条同时失败，
+   *   不会变成重试风暴；
+   * - 签到（**写操作**）走的是 `collectClaimResults`，那里**仍是串行**，本改动不碰它。
+   *
+   * ⚠️ 因此**不要**照「3 远低于浏览器默认的 6」那条类比来论证安全性（浏览器并发
+   * 与服务端风控不是同一量纲，那是初版注释的推理错误）。要论证就按上面三条。
+   *
+   * ## 顺序与逃逸
+   *
+   * - 结果**按 `accounts` 原序**写回（`new Array(len)` + 下标），UI 不跳序；
+   * - 单账号的凭据缺失 / JSON 损坏 / 名称非法 / 网络失败都只影响它自己；
+   * - ⚠️ `deps.warn` 抛错**不得**逃逸成整批失败（初版会：它在 catch 里调用，
+   *   一抛就把 worker 的 promise reject 掉）⇒ 已包 try。
+   *
+   * ⚠️ 并发度可通过 `deps.concurrency` 覆盖（测试与将来调参用）；
+   *    `1` 即恢复旧的完全串行语义。上界是 {@link MAX_CREDITS_STATUS_CONCURRENCY}
+   *    （**不是** `accounts.length` —— 那会让 31 个账号变成 31 并发）。
+   */
+  const concurrency = resolveCreditsStatusConcurrency(deps.concurrency, accounts.length)
+  const results: RpcCreditsStatusResponse['accounts'] = new Array(accounts.length)
+  let cursor = 0
+  /** 取下一个待处理下标；无剩余返回 -1（同步自增，单线程下无需加锁）。 */
+  const take = (): number => (cursor < accounts.length ? cursor++ : -1)
+  const worker = async (): Promise<void> => {
+    for (let index = take(); index !== -1; index = take()) {
+      const entry = accounts[index] as ProviderAccountEntry
+      /**
+       * ⚠️ `accountId` / `nickname` 必须在 try **之外**取也会抛（`entry` 是外部对象，
+       * 可能是带 getter 的代理 / 冻结对象）。初版把它们的读取放在 `results[index] = …`
+       * 那一行 —— 而那一行在 catch **之后**、不受保护 ⇒ 一次抛错就让 worker 的
+       * promise reject ⇒ `Promise.all` 短路 ⇒ **整批失败**（违背本函数的设计约定）。
+       * ⇒ 先取到局部变量并各自兜底，写结果那一行只做纯赋值。
+       */
+      let accountId: string | undefined
+      let nickname: string | undefined
+      let status: CheckinStatus | null = null
+      try {
+        accountId = entry.id
+        nickname = entry.nickname
+        let resolved = await deps.resolve(credentialRef(entry.credentialRef))
+        if (resolved === undefined && (product as { id?: string }).id === ASTUDIO.id) {
+          resolved = await deps.resolve(credentialRef(ASTUDIO.defaultCredentialRef))
+        }
+        if (resolved !== undefined) {
+          const credential = JSON.parse(resolved.value) as TCredential
+          status = await fetchStatus(credential, product)
+        }
+      } catch (error) {
+        // 单个账号的凭据缺失 / JSON 损坏 / 名称非法 / 网络失败都不影响其余账号。
+        // ⚠️ `deps.warn` 自己抛错也**不得**逃逸（初版会让整批失败）——
+        //    告警是尽力而为，它坏了不该让用户看不到其余账号的签到状态。
+        status = null
+        try {
+          deps.warn?.(`[jet-hub] credits.status 账号 ${String(accountId ?? entry.id)} 失败: ${String(error)}`)
+        } catch {
+          // 告警失败只能静默：这里已经没有更外层的可观测通道了。
+        }
       }
-      if (resolved !== undefined) {
-        const credential = JSON.parse(resolved.value) as TCredential
-        status = await fetchStatus(credential, product)
-      }
-    } catch (error) {
-      // 单个账号的凭据缺失 / JSON 损坏 / 名称非法 / 网络失败都不影响其余账号
-      deps.warn?.(`[jet-hub] credits.status 账号 ${entry.id} 失败: ${String(error)}`)
-      status = null
+      // ⚠️ 纯赋值，不得再抛（`Promise.all` 会因 worker reject 而短路整批）。
+      results[index] = { accountId, nickname, status } as RpcCreditsStatusResponse['accounts'][number]
     }
-    results.push({ accountId: entry.id, nickname: entry.nickname, status })
   }
+  await Promise.all(Array.from({ length: concurrency }, worker))
   return results
 }
 
@@ -1153,7 +1296,19 @@ export async function collectCreditBalances<TCredential = BuddyCredential, TProd
       ))
   const fetchDetailed = deps.fetchBalanceDetailed
   const results: RpcCreditsBalancesResponse['accounts'] = []
-  // 顺序查询，避免并发触发风控
+  /**
+   * ⚠️ **这里仍是串行**（与 `collectCreditsStatus` 的有限并发**刻意不同**）。
+   *
+   * `collectCreditsStatus` 于 2026-10-22 改成有限并发（默认 3），本函数**没有**跟着改，
+   * 理由是两者接的上游不同：那个只服务 `minimax` / `minimaxintl` 的**只读 GET**，
+   * 而本函数是面板「刷新积分」的主路径，各家余额接口都有速率限制（且部分带写语义，
+   * 例如 astudio 的 `importLocalSession`、minimax 的积分端点），并发收益不明而风险
+   * 更高。⇒ 要改这里必须**逐家**核对限流策略，不能因为「隔壁改了」就跟着改。
+   *
+   * ⚠️ 也别把「顺序查询避免并发触发风控」当成通用铁律 —— 它对**写操作**
+   * （`collectClaimResults`，签到）与**余额查询**（本函数）成立，对
+   * `credits.status` 那种只读单发的状态查询不成立（依据见 `collectCreditsStatus`）。
+   */
   for (const entry of accounts) {
     let balance: CreditBalance | null = null
     let error: string | undefined
@@ -1399,6 +1554,16 @@ export interface JetHubAuths {
    * 而按 id 查表（`authOf`）会把国际站账号分派到**国内站实例**上。
    */
   readonly minimaxintl: MinimaxAuth
+  /**
+   * Codely（Unity）的续期实例 —— **可选键**（2026-10-22 A6 接线）。
+   *
+   * ⚠️ 为何是**可选**而不是必填：它的接线需要同时改到 `index.ts` 的
+   * `auths` 对象、`SELF_HEAL_REFRESHABLE_PROVIDERS`、`jet-hub-store.ts` 的前缀表，
+   * 以及多张从注册表派生的守卫。写成**必填**会让下一个加 provider 的人
+   * 被迫同时改所有消费方（而那些消费方本来就应该按 `channel` 派生）。
+   * 缺它时：存在的 `refreshAccountCredential` / `refreshAll` 路径会跳过 codely（与各家同形）。
+   */
+  readonly codely?: CodelyAuth
   /**
    * ⚠️ **Codely 的键暂不在此声明**（2026-10-20）：接线必须**四处同时**做——
    * ① 本接口加 `codely`；② `index.ts` 的 auths 对象传值；
@@ -1898,7 +2063,7 @@ async function fullCatalogIds(
  * 核对目录时的读取预算（毫秒）。
  *
  * 开关是**写操作**，不该被远端目录拉取拖住（见 `readableCatalogIds` 的注释）。
- * 取 2 秒：缓存已热时是纯内存读、立即返回；冷缓存下的正常远端拉取也在秒级内
+ * 取 2 秒：缓存已热时是纯内存读、立即返回；冷缓存下的正常远端读取也在秒级内
  * 完成，超过它说明上游正卡着 —— 此时放弃核对、照常写入开关。
  * ⚠️ 不要为了「多拿到几次核对」而调大：这条预算**直接加在用户点开关的等待上**。
  */
@@ -2308,6 +2473,16 @@ function registerJetHubEndpoints(
     //    漏登记的后果与 issue IKKHL5 逐字相同：积分行报「未登录」而上游其实
     //    只需一次 refresh，且**日志零字**。
     AUTOCLAW_INTL.id,
+    // ⚠️⚠️ codely（Unity，2026-10-22 A6 接线）：**有**真实 refresh 端点
+    //    `POST /auth/refresh {refresh_token}`（实测 200，且 `refresh_token` **不轮换**）
+    //    ⇒ 不属 loomy / zcode 那类「设计上没有 refresh 端点」的豁免。
+    //    凭据形态：`access_token` 是 JWT（实测寿命约 365 天）+ `refresh_token`，
+    //    与各家同形 ⇒ 过期后靠本表自愈，而不是用户手动重登。
+    //    ⚠️ 漏登记的后果与 issue IKKHL5 逐字相同：积分行报「未登录」而上游其实
+    //    只需一次 refresh，且**日志零字**。
+    //    ⚠️ 它之前不在本表里的**真正**原因不是「不需要」，而是「`CodelyAuth` 当时连
+    //    契约都没对上（`refreshAll` 是 2 参）」—— 见 A5 的修。
+    CODERLY.id,
     // ⚠️ **本 fork 独有**（modelscope，2026-10-17 改判）**仍刻意不在本表里**：
     //    ⚠️ 原注释写「它是 `balance: false`（魔搭没有额度 API）⇒ 积分端点压根不会
     //    为它走这条链」——**那条已被证伪**：魔搭**有**魔粒余额端点
@@ -4319,19 +4494,29 @@ function registerJetHubEndpoints(
              * 昵称：两站必须可区分（同一面板左右没有，但**账号列表与用量徽标**
              * 都会显示它，而两站账号可能出现在同一个聚合候选里）。
              *
-             * ⚠️ **国内站逐字节保持原行为**（`result.accountId` 对真实凭据恒
-             * `undefined` ⇒ 退化为 `id`）：改它会让存量用户的账号名变化。
-             * 国际站是**新增**的，加标记不构成行为回退。
+             * ## ⚠️⚠️ 2026-10-23（Gitee IKP8UA）：昵称来源已改为**真身份查询**
+             *
+             * 原实现在这里退化成内部 id，理由写的是「`accountId` 对真实凭据恒
+             * `undefined`，这是预期行为」—— 那句话说对了一半：`access_token`
+             * 确实**不是 JWT**（`mmoat_` 前缀、60 字符、0 个点，`decodeJwtSub` 恒空），
+             * 但**账号名是拿得到的**（`GET /v1/api/user/info`，真机实测两站都有）。
+             * ⇒ 「已知拿不到身份」的正确处置是**另找来源**，而不是把内部 id 当展示名。
+             *
+             * 现在身份由 `persistLogin` 内部查询并回传（`result.nickname`），
+             * 登录路径与启动自愈共用那一份实现。
+             *
+             * 三级回退（**顺序不可颠倒**）：
+             * ① `result.nickname`（真身份，最常见）；
+             * ② 老形态的 `accountId`（万一上游改发 JWT）；
+             * ③ 内部 id（含国际站的 `MiniMax 国际版` 前缀，与既有口径一致）。
              */
-            const nickname = result.accountId === undefined
-              ? (provider === MINIMAX_INTL.id ? `MiniMax 国际版 ${id}` : id)
-              : `MiniMax ${result.accountId.slice(0, 8)}`
+            const nickname = result.nickname
+              ?? (result.accountId === undefined
+                ? (provider === MINIMAX_INTL.id ? `MiniMax 国际版 ${id}` : id)
+                : `MiniMax ${result.accountId.slice(0, 8)}`)
             await pool.updateAccount(id, {
-              // ⚠️ `persistLogin` 的 `accountId` 对真实凭据**恒为 `undefined`** ——
-              // MiniMax 的 `access_token` **不是 JWT**（`mmoat_` 前缀、60 字符、
-              // 0 个点），故 `decodeJwtSub` 恒不命中、`account_id` 不会被写入。
-              // 这是**预期行为**（账号 id 由本层生成），不是缺陷：此时退化为 `id`。
-              // 一旦上游改发 JWT，这里会自动用上服务端的 account_id。
+              // ⚠️ `result.accountId` 对真实凭据**恒为 `undefined`**（token 非 JWT），
+              // 故实际生效的是 `result.nickname` 或内部 id。
               nickname,
               // ⚠️ **必须用 `minimaxCredentialExpiresAtMs`**（优先 `expires_at`，
               // 它由 OAuth 响应的 `expires_in` 自算）—— 不能指望从 token 解 JWT，
@@ -5724,7 +5909,13 @@ function registerJetHubEndpoints(
         }
 
         // ⚠️ `collectCreditsStatus` 逐账号 try/catch —— 单账号失败**不中断整体**，
-        //    这与「顺序查询避免并发风控」同属该骨架已验证的语义，**不要重写**。
+        //    这是该骨架已验证的语义，**不要重写**。
+        //
+        // ⚠️⚠️ **它已不是「顺序查询」了**（2026-10-22 改成有限并发，默认 3）：
+        //    原注释写「这与『顺序查询避免并发风控』同属该骨架已验证的语义，不要重写」
+        //    —— 而函数**就在那之后被重写了**，那条注释因此变成误导（下一个读者会照它
+        //    改回串行）。并发度的依据与代价见 `collectCreditsStatus` 函数体内那段注释。
+        //    签到（写操作）仍在 `collectClaimResults` 里**串行**，那一条没变。
         //
         // ⚠️ 第二参（product）统一传 `undefined`：它**只被透传给 `fetchStatus`**，
         //    而 `fetchStatus` 现在由 credits 表提供、自带各自的 product 配置，
@@ -6089,34 +6280,56 @@ function registerJetHubEndpoints(
           // `fetchQoderCreditBalance` 只吃 QoderCredential，故这里不用
           // collectCreditBalances 的泛型（它会把产品配置转发给 fetchBalance）。
           const values: RpcCreditsBalancesResponse['accounts'] = []
-          for (const account of accounts) {
+          /**
+           * ⚠️⚠️ **必须并发**（2026-10-21 改，真实报障「一直读取中」）。
+           *
+           * 原实现是 `for (const account of accounts) { await ... }` —— **串行**。
+           * 单账号在墙外时实测 10.7s 才失败（undici 自己的 connect timeout
+           * 先于 `AbortSignal.timeout(15s)` 触发），两个账号就是 **22s**；
+           * 前端 `callManagementRpc` **不设超时** ⇒ 整段时间面板只显示
+           * 「读取中…」，用户以为卡死。
+           *
+           * ⚠️ 并发不改变**输出顺序**：`Promise.all` 保序，每个槽位自己算，
+           *    不是按完成顺序 push。
+           * ⚠️ 也不改变**失败隔离**：每格自己返回 `{ balance: null, error }`，
+           *    一个账号炸不影响别人（`fetchQoderBalanceDetailed` 本身不抛）。
+           */
+          values.push(...await Promise.all(accounts.map(async (account) => {
             const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
             if (!resolved) {
-              values.push({
+              return {
                 accountId: account.id, nickname: account.nickname,
                 balance: null, error: '凭据未配置',
-              })
-              continue
+              }
             }
             let credential: QoderCredential
             try {
               credential = JSON.parse(resolved.value) as QoderCredential
             } catch {
-              values.push({
+              return {
                 accountId: account.id, nickname: account.nickname,
                 balance: null, error: '凭据解析失败',
-              })
-              continue
+              }
             }
-            const balance = await fetchQoderCreditBalance(credential, product)
-            values.push({
+            // ⚠️ 用**带原因**的变体 `fetchQoderBalanceDetailed`，不用
+            // `fetchQoderCreditBalance`：后者只回 `null`，四种完全不同的处境
+            // （网络不通 / 401 / 响应变形 / 企业版无数字）被压成同一句
+            // 「积分查询失败（凭据失效或响应异常）」，用户无从下手。
+            // 实测本机 Qoder 国际版：`openapi.qoder.sh` 的 TCP 443 通（93ms）
+            // 但 TLS ClientHello 被丢（12s 无响应）⇒ fetch 必在 10.7s 后报
+            // `UND_ERR_CONNECT_TIMEOUT`。这是**环境问题**，必须点名主机与出路，
+            // 否则用户只会以为「凭据坏了」，反复重新登录。
+            const detailed = await fetchQoderBalanceDetailed(credential, product)
+            return {
               accountId: account.id,
               nickname: account.nickname,
-              balance,
+              balance: detailed.balance,
               // 查不到时带上原因，卡片显示原因而非 0（与其它 provider 同约定）。
-              ...balance === null ? { error: '积分查询失败（凭据失效或响应异常）' } : {},
-            })
-          }
+              ...detailed.balance === null
+                ? { error: detailed.error ?? '积分查询失败（原因未知）' }
+                : {},
+            }
+          })))
           /**
            * ⚠️⚠️ **必须回传 `windowDays`**（2026-10-20 补，真实缺口）。
            *
@@ -6815,9 +7028,19 @@ function registerJetHubEndpoints(
             error: { code: 'bad-request', message: 'provider 与 disabled（布尔）必填' },
           }
         }
-        if (req.disabled) {
+        /**
+         * 全量目录（关闭方向用它写黑名单；两个方向都用它算 `warnings`）。
+         *
+         * ⚠️ 打开方向**不读目录**（见该分支的注释：目录故障时用户仍应能全打开）⇒
+         * `catalog` 在打开方向可能是 `undefined`，`warnings` 随之为空 —— 这是
+         * **正确**的（打开方向的 warnings 只在「这个 id 已从上游消失」时才有意义，
+         * 而那恰恰需要目录才能判定）。
+         */
+        const catalog = req.disabled
+          ? await fullCatalogIds(ctx, modelAdapters, req.provider)
+          : undefined
+        if (req.disabled && catalog !== undefined) {
           // 关闭全部：先取全量目录，再一次性写入黑名单。
-          const catalog = await fullCatalogIds(ctx, modelAdapters, req.provider)
           // ⚠️⚠️ **判据顺序是语义的一部分**，四条分支按「能否在目录不完整时
           // 安全作答」从强到弱排列（下面逐条给理由，别重排）：
           //
@@ -6894,8 +7117,22 @@ function registerJetHubEndpoints(
             //
             // ⚠️ 与关闭方向同理，**黑名单与意图必须同一次落盘**
             //   （见 `writeModelsWithProviderClosed` 的注释：分两次会留下半套状态）。
-            await pool.writeModelsWithProviderClosed(req.provider, pending, true)
-            ctx.logger.info(`[jet-hub] 关闭 ${req.provider} 的 ${pending.length} 个模型`)
+            //
+            // ⚠️⚠️ **但「是否落意图」由 `closeProvider` 决定**（2026-10-21 合并审计
+            //   发现，阻断级）：默认 `true` 保持既有语义（「关闭全部模型」≡
+            //   「关闭该供应商」），而**模型级**的批量关闭（PR !120 的「模型列表」
+            //   统一管理屏）传 `false` ⇒ 只改黑名单、不落意图。
+            //
+            //   ⇒ 否则用户在模型列表屏点一次「全关」（只想关这家模型）会把**整个
+            //   供应商**也关掉（`provider.status` 报 closed、选择器里一个模型都没有）
+            //   ；再打开**任意一个**模型，供应商又被顺带打开（`setModelDisabled` 的
+            //   打开方向会清意图）⇒ 两头都与用户意图相反，且**零提示**。
+            const closeProvider = req.closeProvider !== false
+            await pool.writeModelsWithProviderClosed(req.provider, pending, closeProvider)
+            ctx.logger.info(
+              `[jet-hub] 关闭 ${req.provider} 的 ${pending.length} 个模型`
+              + (closeProvider ? '' : '（不落供应商关闭意图）'),
+            )
           }
         } else {
           // 打开全部：纯本地操作，不读目录 —— 目录故障时用户仍应能把开关全打开。
@@ -6913,6 +7150,25 @@ function registerJetHubEndpoints(
         // ⚠️ 命中「本就已全部关闭」的幂等短路时也照样失效一次 —— 那是用户点了一个
         // 开关、期望看到最新的代价（一次上游目录读取），比「界面纹丝不动」划算。
         invalidateCatalogCache(req.provider)
+        /**
+         * ⚠️⚠️ **本端点的 `warnings` 恒为空，这是正确的**（2026-10-21 合并审计定论）。
+         *
+         * ⚠️ 合并审计最初建议「批量路径也调 `catalogWarnings`」—— **实测证明那是死代码**：
+         * `catalogWarnings` 的判据是「`ids` 里不在 `known` 的」，而本端点传的 `ids`
+         * 本就是 `catalog.ids`，而 `readableCatalogIds` 的 `known` 是
+         * `new Set(catalog.ids)` **并回黑名单** ⇒ `known ⊇ catalog.ids` **恒成立**
+         * ⇒ `missing` 恒为空 ⇒ warnings 恒 `[]`。
+         *
+         * ⇒ 而这正是**语义正确**的：批量关闭的对象是「目录里的全部模型」——它们
+         * **本来就在目录里**，不存在「关了但没有效果」的那个 id（那是**逐条开关**
+         * 的语义）。所以批量路径**无事可警告**。
+         *
+         * ⚠️ 不能把它拿来给「已下架的模型」报警：失效模型被 `withDeadModelPruning`
+         * 剔除、但 `model.list` 又把它们补回目录（带 `dead:true`）⇒ 它们**不在**
+         * `catalog.ids` 里 ⇒ **不会**被这个批量关闭涉及。
+         *
+         * ⚠️ 故客户端读 `result?.warnings` 在这条路径上恒空是**正确的**（无事可警）。
+         */
         const value: RpcModelSetAllDisabledResponse = {
           provider: req.provider,
           disabledModels: pool.listDisabledModels(req.provider),
@@ -7798,6 +8054,38 @@ function registerJetHubEndpoints(
           + `${req.enabled ? '' : '（所有渠道改用 DeepSeek 官方搜索）'}`,
         )
         const value: RpcNativeSearchSetEnabledResponse = { enabled: pool.nativeWebSearchEnabled() }
+        return { ok: true, value }
+      }
+
+      // ── 「侧栏入口」开关（Jet Hub 页头的「侧栏」开关）──
+      //
+      // 语义：**开** = 主导航（`sidebar.panellist`）里显示「Jet Hub」一行，
+      // 点它把 Jet Hub 页渲染进中央主面板（`main` 槽的 `jet-hub` key）；
+      // **关** = 该行消失，进入路径只剩「设置 → Jet Hub」。
+      //
+      // 消费方是客户端：`plugin-src/client/sidebar-entry.js` 在 `apply` 里先读
+      // 一次本端点，再决定注不注入那行；页头开关写回后由同一份进程内副本
+      // 通知两侧（设置页与主面板）重新渲染。
+      case 'sidebarEntry.getEnabled': {
+        const value: RpcSidebarEntryGetEnabledResponse = { enabled: pool.sidebarEntryEnabled() }
+        return { ok: true, value }
+      }
+
+      case 'sidebarEntry.setEnabled': {
+        const req = payload as RpcSidebarEntrySetEnabledRequest
+        // ⚠️ 与 `nativeSearch.setEnabled` 同约定：**不做默认值猜测** ——
+        // 默认成 true 会静默打开用户特意关闭的入口。
+        if (typeof req.enabled !== 'boolean') {
+          return { ok: false, error: { code: 'bad-request', message: '非空布尔 enabled 必填' } }
+        }
+        await pool.setSidebarEntryEnabled(req.enabled)
+        // 不刷新任何缓存：客户端的注册逻辑读的是**同一个**进程内副本，
+        // 写完由客户端自己按返回值（落盘后重读）同步两侧 UI。
+        ctx.logger.info(
+          `[jet-hub] ${req.enabled ? '显示' : '隐藏'}主导航侧栏入口`
+          + `${req.enabled ? '' : '（仍可从「设置 → Jet Hub」进入）'}`,
+        )
+        const value: RpcSidebarEntrySetEnabledResponse = { enabled: pool.sidebarEntryEnabled() }
         return { ok: true, value }
       }
 

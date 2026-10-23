@@ -594,8 +594,31 @@ describe('AutoclawAdapter 流式映射与端到端模拟', () => {
     expect(models.length).toBeGreaterThan(0)
     const flash = models.find((m) => m.id === 'zai_glm-5.3-flash')
     expect(flash).toBeDefined()
-    // 同上：实测非免费（每次扣约 1 点）⇒ 不得标成免费。
-    expect(flash?.isFree, '实测每次扣约 1 点 ⇒ 不得标成免费').toBe(false)
+    // ⚠️⚠️ **`isFree` 不属于 `listModels` 的语境**（2026-10-23 迁移时订正）。
+    //
+    // `LlmModelInfo` 的契约只有 `provider` / `id` / `name` / `description` /
+    // `inputModalities`（见 `@deepseek-ai/dsh-llm` 的 types.d.ts），**没有 `isFree`**。
+    // 本仓库把 `isFree` 当扩展键下发的地方**只有** `listAllModels()`
+    //（设置页按它分免费桶，见 `model-catalog-parity.spec.ts` 的「只吐三键」用例）。
+    //
+    // 迁移前本家手写 `listModels` 时**顺手**把 `isFree` 塞进了模型列表项，
+    // 那是旧实现的越界行为（骨架的 `toModelInfo` 统一收敛掉）。
+    // ⇒ 「不得冒充免费」这条语义搬到 `listAllModels()`（下面那条用例）继续守。
+    expect(
+      (flash as { isFree?: unknown }).isFree,
+      '★ listModels 的条目不得携带 isFree（不在 LlmModelInfo 契约里）',
+    ).toBeUndefined()
+  })
+
+  it('listAllModels 的 `zai_glm-5.3-flash` 必须显式 `isFree: false`（实测每次扣约 1 点）', () => {
+    const { adapter } = makeMockAdapter(() => new Response(JSON.stringify({ code: 200 }), { status: 200 }))
+    const all = adapter.listAllModels()
+    const flash = all.find((m) => m.id === 'zai_glm-5.3-flash')
+    expect(flash, '目录里必须有该模型').toBeDefined()
+    // ⚠️ 必须是**显式 false**，不能省略：省略在 `CatalogEntry` 的三态语义下与
+    // 「从未声明」同形，而徽标那侧按 `isFree === true` 分桶 ⇒ 省略会让
+    // 「目录缺失」被当成「不扣费」（2026-10-21 二轮审计订正的正是这一处）。
+    expect(flash?.isFree, '实测每次扣约 1 点 ⇒ 必须显式标 false（不得省略）').toBe(false)
   })
 
   describe('★★ 远端目录：必须真读，且解析不出就回落兜底表', () => {

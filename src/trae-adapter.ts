@@ -500,6 +500,11 @@ function serializeTraeMessages(
 
   for (const message of normalized) {
     if (message.role === 'assistant') {
+      // ⚠️ 2026-10-19 修（4027 第三例，多工具调用场景）：
+      // 进入新的 assistant 之前，上一批工具结果**已经全部下发完毕**（tool 消息只会
+      // 紧跟其 assistant），此时 flush 图片是安全的。若不在这里 flush，图片会一直
+      // 挂到整个循环结束，被挤到更后面。
+      flushToolImages()
       // 存量自愈：清洗历史里已持久化的行首 `course` / `课` 泄漏
       // （见 `stripCourseLeakFromHistoryContent`）。只清 assistant ——
       // 判据只对模型自己的输出成立，清洗用户输入等于篡改用户的话。
@@ -591,8 +596,27 @@ function serializeTraeMessages(
       flushToolImages()
       wire.push({ role: 'user', content: parts ?? text })
     }
-    flushToolImages()
+    // ⚠️⚠️ 2026-10-19 修（4027 真实缺陷 · 多工具调用漏网场景）：
+    // **这里绝不能无条件 flush**。原实现在每条 user 消息末尾都调 `flushToolImages()`，
+    // 而 DSH 0.1.7 起工具结果是**一等 `role:'tool'` 消息**（`normalizeHarnessMessages`
+    // 把每条都转成**独立的** `role:'user'` + 内嵌 tool-result 块）⇒ 当一个 assistant
+    // 发了 **≥2 个 tool_call**、且**不是最后一个**的结果内嵌图片时，图片会在处理第一条
+    // 工具结果的消息末尾就被 flush 成一条 user 消息，**插到下一条 `role:'tool'` 之前**
+    // ⇒ assistant(tool_calls) 与 tool 之间插了 user ⇒ 上游恒定回
+    // `code=4027 Messages with role 'tool' must be a response to a preceding message
+    // with 'tool_calls'`。
+    //
+    // 旧回归用例（trae-adapter.spec.ts「工具结果内嵌图片不得插在 role:tool 之前」）
+    // 只覆盖了 **1 个** tool_call，故这条路径从未被测到 —— 实测在模型一次并发发出
+    // `read_image` + `read` 时即触发，且坏报文落库后会话**永久卡死**。
+    //
+    // 修法：图片挂起**跨消息累积**，只在两处落地 ——
+    //   ① 进入下一条 assistant 之前（`flushToolImages()` 已在循环顶部）；
+    //   ② 整个循环结束后（见函数末尾）。
+    // 这样保证同一批工具结果的全部 `role:'tool'` 消息**紧密相邻**，图片统一排在其后。
   }
+  // 循环收尾：把最后一批挂起的图片发出去（此时所有 tool 消息已下发完毕）。
+  flushToolImages()
   return wire
 }
 

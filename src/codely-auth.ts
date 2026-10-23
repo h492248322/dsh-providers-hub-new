@@ -557,6 +557,42 @@ export async function readCodelyCredential(
 }
 
 /**
+ * 换发 `cli_api_key` 的**结果**（带失败原因，2026-10-22 对抗审计 A1 修）。
+ *
+ * ## ⚠️⚠️ 为什么必须带原因，不能只返回 `undefined`
+ *
+ * 原签名是 `… | undefined`，而它在**任何**失败下都返回 `undefined`：
+ * 401（凭据真失效）、5xx（上游故障）、`fetch` 抛异常（DNS 抖动 / 连接重置）、
+ * 响应体缺 `cli_api_key`（协议变更）—— **四类完全不同的事挤成同一个值**。
+ *
+ * 调用方（`codely-adapter.ts` 的换号循环）因此**无法分档**，只能对全部情形做
+ * 同一件事。原实现选的是「记一笔到次日 0 点的冷却 + 换号」，后果是：
+ * 一次 5 秒的 DNS 抖动就把池里**每一个**账号锁到次日 0 点（实测 11.15 小时），
+ * 而文案还告诉用户「访问令牌可能已过期，请**删除该账号**」（删除不可逆）。
+ *
+ * ⇒ 判据必须下沉到**这里**：只有本函数知道 HTTP 状态码与异常类型。
+ *
+ * ## 分档口径（每档对应调用方一个不同动作）
+ *
+ * | `kind` | 触发条件 | 调用方应做 |
+ * |---|---|---|
+ * | `ok` | 拿到非空 `cli_api_key` | 正常推理 |
+ * | `credential` | **401 / 403** —— 该号的 access_token 确实不可用 | 换号 + 记账 |
+ * | `transient` | 网络异常 / 5xx / 429 / 其它非 2xx | **不换号、不记账**，如实报错让用户重试 |
+ * | `malformed` | 2xx 但缺 `cli_api_key`（协议变更） | 不换号、不记账，报内部错误 |
+ *
+ * ⚠️ **`transient` 绝不能进冷却记账**：那是「上游/网络此刻不好」，不是
+ *   「这个账号不好」。记进去就等于把一次抖动变成一整天的封号。
+ * ⚠️ **429 归 `transient` 而非 `credential`**：换发端点的 429 是网关限流，
+ *   与「该号没额度」无关（额度问题在**推理**端点报 402，那条另有分档）。
+ */
+export type CodelyCliApiKeyResult =
+  | { kind: 'ok'; cliApiKey: string; userId?: string }
+  | { kind: 'credential'; status: number }
+  | { kind: 'transient'; status?: number; reason: string }
+  | { kind: 'malformed'; reason: string }
+
+/**
  * 换发推理用的 `cli_api_key`（`sk-…`）。
  *
  * ## 端点与实测（2026-10-20）
@@ -572,13 +608,13 @@ export async function readCodelyCredential(
  * （`codelySigningKey`），用 A 的 key 签名配 B 的 Bearer 会 401。
  * 故本函数与适配器必须把返回值**成对**使用。
  *
- * ⚠️ 读不到一律返回 `undefined`（不抛错）：调用方在推理路径上，
- * 抛错会把「换发失败」误报成「推理失败」。
+ * ⚠️ 仍**不抛错**（调用方在推理路径上，抛错会把「换发失败」误报成「推理失败」），
+ * 但返回 {@link CodelyCliApiKeyResult} 而不是裸 `undefined` —— 理由见该类型的注释。
  */
 export async function fetchCodelyCliApiKey(
   accessToken: string,
   options: { fetcher?: typeof fetch; signal?: AbortSignal } = {},
-): Promise<{ cliApiKey: string; userId?: string } | undefined> {
+): Promise<CodelyCliApiKeyResult> {
   const fetcher = options.fetcher ?? fetch
   try {
     const res = await fetcher(`${CODELY_API_BASE}/api/api-token/cli-api-key`, {
@@ -588,17 +624,37 @@ export async function fetchCodelyCliApiKey(
         'X-User-Agent': CODELY_USER_AGENT_HEADER,
         Accept: 'application/json',
       },
-      ...options.signal === undefined ? {} : { signal: options.signal },
+      // ⚠️⚠️ **必须带超时**（2026-10-22 对抗审计 A3）：本函数在**推理路径**上
+      //    （每次请求都会先换发一次 key），而 `options.signal` 只在宿主**主动取消**时才存在
+      //    —— 用户不点「停止」时（最常见）这里没有任何时限 ⇒ 上游半开连接 / 网关挂住
+      //    就是**永久转圈**，用户以为模型在思考。
+      //    ⚠️ 同文件其余 5 处（登录三步 / me / 目录）早就都带 `AbortSignal.timeout`，唯独这处漏了。
+      //    ⚠️ `options.signal` 优先（保留宿主取消能力）；`AbortSignal.any` 让两者同时生效。
+      signal: options.signal === undefined
+        ? AbortSignal.timeout(CODELY_HTTP_TIMEOUT_MS)
+        : AbortSignal.any([options.signal, AbortSignal.timeout(CODELY_HTTP_TIMEOUT_MS)]),
     })
-    if (!res.ok) return undefined
+    if (!res.ok) {
+      // ⚠️ **分档在这里**（2026-10-22 A1 修）：只有 401/403 才算「该号的凭据
+      //    确实不可用」；5xx / 429 / 其它状态码都是「上游此刻不好」，
+      //    **不得**让调用方把它记成账号级冷却（那会一次抖动锁死整池）。
+      if (res.status === 401 || res.status === 403) return { kind: 'credential', status: res.status }
+      return { kind: 'transient', status: res.status, reason: `HTTP ${res.status}` }
+    }
     const payload = await res.json().catch(() => undefined) as
       | { cli_api_key?: unknown; user_id?: unknown }
       | undefined
     const key = payload?.cli_api_key
-    if (typeof key !== 'string' || key.length === 0) return undefined
+    // 2xx 但缺字段 = 协议变更（既不是凭据问题、也不是网络问题）。
+    if (typeof key !== 'string' || key.length === 0) {
+      return { kind: 'malformed', reason: '响应缺少 cli_api_key' }
+    }
     const userId = typeof payload?.user_id === 'number' ? String(payload.user_id) : undefined
-    return { cliApiKey: key, ...userId === undefined ? {} : { userId } }
-  } catch {
-    return undefined
+    return { kind: 'ok', cliApiKey: key, ...userId === undefined ? {} : { userId } }
+  } catch (error) {
+    // ⚠️ 网络异常（DNS / ECONNRESET / 超时）**一律 transient**：它与账号好坏无关。
+    //    沿 `cause` 链取真因（本仓库 `minimax` 那轮记过：`fetch failed` 的真因在 cause 里）。
+    const reason = error instanceof Error ? error.message : String(error)
+    return { kind: 'transient', reason }
   }
 }
