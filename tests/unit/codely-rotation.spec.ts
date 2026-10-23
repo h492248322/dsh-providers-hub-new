@@ -38,10 +38,21 @@ const sseOk = (text = 'ok') => () => new Response(
   { status: 200 },
 )
 
-/** 真实 402 报文（用户报障截图同形）。 */
-const budgetExceeded = () => new Response(JSON.stringify({
+/**
+ * 真实 402 报文（用户报障截图同形）。
+ *
+ * ⚠️ `cost` 参数（2026-10-24 加）是用来**区分两种预算耗尽**的：
+ *
+ * | 调用 | 报文 | 语义 |
+ * |---|---|---|
+ * | 各账号都 `budgetExceeded()`（不传参） | 逐字**相同** | **团队级** —— 换号无用 |
+ * | 各账号 `budgetExceeded(1.5)` / `(2.5)` | 逐字**不同** | **账号级** —— 换号有用 |
+ *
+ * 缺省值保持原样 ⇒ 不传参的既有调用点仍然描述团队级场景，语义不变。
+ */
+const budgetExceeded = (cost = 54.708759999999994) => new Response(JSON.stringify({
   error: {
-    message: 'Budget has been exceeded! Current cost: 54.708759999999994, Max budget: -1.0.',
+    message: `Budget has been exceeded! Current cost: ${cost}, Max budget: -1.0.`,
     type: 'budget_exceeded',
     param: null,
     code: '402',
@@ -165,7 +176,11 @@ describe('Codely 请求级换号 + 冷却', () => {
       { id: 'acc-1', credential: cred('TOK-A') },
       { id: 'acc-2', credential: cred('TOK-B') },
     ])
-    const { adapter, chatCalls } = makeAdapter({ pool, chatQueue: [budgetExceeded(), budgetExceeded()] })
+    // ⚠️ 两个账号的 `Current cost` 不同 ⇒ 报文逐字不同 ⇒ **账号级**预算耗尽，
+    //    换号有用，所以两个都得记账（这是本用例要钉的语义）。
+    //    若这里写成两次 `budgetExceeded()`（报文相同），语义就变成团队级了 ——
+    //    那种场景由下面「团队预算耗尽」那条用例覆盖。
+    const { adapter, chatCalls } = makeAdapter({ pool, chatQueue: [budgetExceeded(1.5), budgetExceeded(2.5)] })
     const { error } = await run(adapter)
 
     expect((error as { code?: string }).code, '402 必须归 QUOTA_EXCEEDED：'
@@ -177,12 +192,39 @@ describe('Codely 请求级换号 + 冷却', () => {
     expect(marks.map((m) => m.accountId)).toEqual(['acc-1', 'acc-2'])
   })
 
+  it('★ 团队预算耗尽 ⇒ 第 2 个号就停止，且后续账号不被连坐记账', async () => {
+    const { pool, marks } = makePool([
+      { id: 'acc-1', credential: cred('TOK-A') },
+      { id: 'acc-2', credential: cred('TOK-B') },
+      { id: 'acc-3', credential: cred('TOK-C') },
+    ])
+    // ⚠️ 三个账号返回**逐字相同**的预算报文 ⇒ 团队级：换号撞的是同一堵墙。
+    const { adapter, chatCalls } = makeAdapter({
+      pool,
+      chatQueue: [budgetExceeded(), budgetExceeded(), budgetExceeded()],
+    })
+    const { error } = await run(adapter)
+
+    expect((error as { code?: string }).code).toBe('QUOTA_EXCEEDED')
+    // 决定性①：第 2 个号撞同一份报文就停，不去试第 3 个。
+    expect(chatCalls(), '团队级：撞同一份报文的第 2 个号之后立即停止').toBe(2)
+    // 决定性②：**只记第 1 个**。第 2 个号没被记账 —— 它本身是好的，只是撞了团队墙；
+    //          把它记进冷却表等于把一个好号封到次日 0 点（本次修复的核心）。
+    expect(marks.map((m) => m.accountId), '第 2 个号不得被连坐记账').toEqual(['acc-1'])
+    // 文案必须挑明是团队层面、换号无用，否则用户会去做一个注定无效的动作。
+    expect(String((error as Error).message), '需说明是团队层面').toMatch(/团队/)
+    expect(String((error as Error).message), '团队级不该再建议签到（领的是个人积分）').not.toMatch(/签到/)
+  })
+
   it('★ 换号预算上限：账号再多也只试 5 个（不得无限换号）', async () => {
     const accounts = Array.from({ length: 8 }, (_, i) => ({ id: `acc-${i}`, credential: cred(`TOK-${i}`) }))
     const { pool, marks } = makePool(accounts)
     const { adapter, chatCalls } = makeAdapter({
       pool,
-      chatQueue: Array.from({ length: 8 }, () => budgetExceeded()),
+      // ⚠️ 8 个账号各自 `Current cost` 不同 ⇒ 都是**账号级**预算耗尽 ⇒ 换号有用
+      //    ⇒ 应当一直换到 5 个上限。若这里 8 份报文逐字相同（团队级），适配器会
+      //    在第 2 个号就停止（那是下面「团队预算耗尽」用例的预期，不是这条的）。
+      chatQueue: Array.from({ length: 8 }, (_, i) => budgetExceeded(i + 1)),
     })
     const { error } = await run(adapter)
 

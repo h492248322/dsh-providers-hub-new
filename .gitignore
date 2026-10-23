@@ -27,16 +27,6 @@ commit-msg.tmp
 # 其它任务的本地取证目录（非本插件运行时依赖）。
 .minimax-forensics/
 
-# AI CLI 的会话自动导出（含**本机绝对路径**、会话 ID、项目 hash、模型用量）。
-#
-# ⚠️ 曾经入库过：`.codely-cli/auto-saves/` 下 6 个文件被 `git add .` 带进索引，
-#    其中 17 处命中本机路径 `AIProject\dsh-providers-hub`。已用
-#    `git rm -r --cached .codely-cli` 移出索引（工作区副本不再保留）。
-#
-# ⚠️ **单靠这一条不够**：已经 push 过的历史里仍然带着这些文件。要真正抹掉需要
-#    `git filter-repo --path .codely-cli --invert-paths` 重写历史并强推 ——
-#    那是破坏性操作，必须由你确认且所有协作者重新克隆，故此处只做"不再新增"。
-.codely-cli/
 .research/
 
 # Codely 官方 CLI 的**本地会话导出**（`auto-saves/`）。
