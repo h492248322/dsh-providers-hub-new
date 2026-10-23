@@ -68,12 +68,166 @@ import { isFilterActive, matchesModelQuery } from './model-filter.js';
 import { formatGatewayHost, gatewayHttpUrl, isLoopbackHost, isWildcardHost } from '../../src/openai-gateway/config.js';
 
 export async function copyToClipboard(value) {
+  // 1) 首选 Clipboard API（安全上下文 / 有权限时）。
+  //    ⚠️ 捕获后**必须继续降级**，不能直接 return false —— 见下方 legacyCopy 的说明。
   try {
-    if (typeof navigator === 'undefined' || !navigator.clipboard?.writeText) return false;
-    await navigator.clipboard.writeText(value);
+    if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(value);
+      return true;
+    }
+  } catch {
+    // 权限被拒 / 非用户手势调用 → 落到 legacyCopy
+  }
+  // 2) 降级：execCommand('copy')
+  if (legacyCopy(value)) return true;
+  // 3) 兜底：自动复制用不了就把文本摊出来让用户自己 Ctrl+C。
+  //    ⚠️ 返回 false（自动复制确实失败，调用方该展开列表/提示），但**同时**弹窗，
+  //    保证用户在任何环境下都能拿到文本 —— 「点了没反应」比「丑一点的弹窗」糟得多。
+  showManualCopy(value);
+  return false;
+}
+
+/**
+ * 手动复制兜底面板：把文本摊进一个自动全选的 textarea。
+ *
+ * ## 为什么必须有这一层（2026-10-23 二次报障）
+ *
+ * 前两层都失效的环境是真实存在的：
+ *
+ * - 非安全上下文（`http://<内网 IP>`）→ 无 `navigator.clipboard`
+ * - iframe 未授予 `allow="clipboard-write"` → `execCommand('copy')` 静默返回 false
+ * - 浏览器隐私策略 / 企业策略禁用剪贴板写入
+ *
+ * 这些情况下前端能做的最后一件事就是**把文本交给用户**。`window.prompt` 也能做到，
+ * 但它对「复制全部 605 个 ID」这种长文本会被截断（各浏览器上限约 2000 字符），
+ * 所以这里自己搭一个小面板。
+ *
+ * ⚠️ 用原生 DOM 而不是 React 状态：`copyToClipboard` 是被 `jet-hub.js` 里多个
+ * 非组件函数调用的纯工具，为了一个罕见的兜底路径把整个调用链改成受控组件不值得。
+ * z-index 取 `2147483647` —— DSH 的浮层栈很深，兜底面板必须压在最上面才有意义。
+ *
+ * @param {string} value
+ * @returns {boolean} 是否成功渲染出面板
+ */
+function showManualCopy(value) {
+  if (typeof document === 'undefined' || !document.body) return false;
+  try {
+    const overlay = document.createElement('div');
+    overlay.setAttribute('role', 'dialog');
+    overlay.setAttribute('aria-modal', 'true');
+    overlay.style.cssText = [
+      'position:fixed', 'inset:0', 'z-index:2147483647',
+      'display:flex', 'align-items:center', 'justify-content:center', 'padding:24px',
+      'background:rgba(0,0,0,.45)', 'font-family:inherit',
+    ].join(';');
+
+    const box = document.createElement('div');
+    box.style.cssText = [
+      'background:#fff', 'border-radius:12px', 'box-shadow:0 12px 40px rgba(0,0,0,.28)',
+      'width:min(720px,100%)', 'max-height:80vh', 'display:flex',
+      'flex-direction:column', 'padding:16px', 'gap:12px',
+    ].join(';');
+
+    const title = document.createElement('div');
+    title.textContent = '浏览器阻止了自动复制，请按 Ctrl+C 复制（内容已全选）';
+    title.style.cssText = 'font-size:13px;font-weight:600;color:#1f2329';
+
+    const textarea = document.createElement('textarea');
+    textarea.value = value;
+    textarea.setAttribute('readonly', '');
+    textarea.style.cssText = [
+      'flex:1', 'min-height:220px', 'box-sizing:border-box',
+      'font-family:ui-monospace,Consolas,monospace', 'font-size:12px', 'line-height:1.5',
+      'border:1px solid #d9dce2', 'border-radius:8px', 'padding:8px', 'resize:vertical',
+    ].join(';');
+
+    const close = document.createElement('button');
+    close.type = 'button';
+    close.textContent = '关闭';
+    close.style.cssText = [
+      'align-self:flex-end', 'padding:6px 16px', 'border-radius:6px',
+      'border:1px solid #d9dce2', 'background:#fff', 'cursor:pointer',
+      'font-size:13px', 'font-family:inherit',
+    ].join(';');
+
+    const dismiss = () => { overlay.remove(); };
+    close.addEventListener('click', dismiss);
+    overlay.addEventListener('click', (event) => { if (event.target === overlay) dismiss(); });
+
+    box.append(title, textarea, close);
+    overlay.append(box);
+    document.body.appendChild(overlay);
+    textarea.focus();
+    textarea.select();
+    textarea.setSelectionRange(0, value.length);
     return true;
   } catch {
     return false;
+  }
+}
+
+/**
+ * `document.execCommand('copy')` 降级实现。
+ *
+ * ## ⚠️ 这个降级不是可选项（2026-10-23 报障：本地用户复制不了，服务器端正常）
+ *
+ * `navigator.clipboard` **只在安全上下文存在**：
+ *
+ * | 打开方式 | 安全上下文 | `navigator.clipboard` |
+ * |---|---|---|
+ * | `https://host/...` | 是 | 有 |
+ * | `http://localhost:3000`、`http://127.0.0.1:3000` | 是 | 有 |
+ * | **`http://192.168.1.20:3000`**（局域网地址） | **否** | **`undefined`** |
+ *
+ * 所以同一份产物，在服务器本机用 `localhost` 打开时复制正常，同事从局域网用
+ * `http://<内网 IP>` 打开时「复制本组 / 复制全部 ID / 复制对照表」全部静默失效 ——
+ * 现象就是"服务端能复制、本地不能"，极易被误判成权限或后端问题。
+ *
+ * `execCommand('copy')` 已废弃但**所有浏览器仍支持**，且**不要求安全上下文**，
+ * 是这条路径上唯一的出路。
+ *
+ * ## 几个必须的细节
+ *
+ * - 隐藏用 `opacity: 0` 而**不是** `display: none`：后者不在渲染树里，选不中，复制必失败。
+ * - `position: fixed` + 1px：避免插入元素把页面顶出滚动条或抖动。
+ * - `readonly`：否则移动端弹出软键盘。
+ * - `setSelectionRange(0, len)`：iOS Safari 上 `select()` 对 textarea 有时选不全。
+ * - **还原焦点**：`select()` 会把焦点抢到 textarea，不还回去会让键盘用户的操作位置丢失
+ *   （例如 Tab 到复制按钮、按回车、焦点跳到页面顶部）。
+ *
+ * @param {string} value
+ * @returns {boolean} 是否成功
+ */
+function legacyCopy(value) {
+  if (typeof document === 'undefined' || typeof document.body === 'undefined') return false;
+  const previousFocus = typeof document.activeElement !== 'undefined' ? document.activeElement : null;
+  let textarea = null;
+  try {
+    textarea = document.createElement('textarea');
+    textarea.value = value;
+    textarea.setAttribute('readonly', '');
+    textarea.style.position = 'fixed';
+    textarea.style.top = '0';
+    textarea.style.left = '0';
+    textarea.style.width = '1px';
+    textarea.style.height = '1px';
+    textarea.style.padding = '0';
+    textarea.style.border = 'none';
+    textarea.style.outline = 'none';
+    textarea.style.boxShadow = 'none';
+    textarea.style.background = 'transparent';
+    textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+    textarea.select();
+    textarea.setSelectionRange(0, value.length);
+    return document.execCommand('copy');
+  } catch {
+    return false;
+  } finally {
+    if (textarea && textarea.parentNode) textarea.parentNode.removeChild(textarea);
+    if (previousFocus && typeof previousFocus.focus === 'function') {
+      try { previousFocus.focus(); } catch { /* 元素可能已被卸载 */ }
+    }
   }
 }
 
@@ -637,6 +791,28 @@ export function gatewayLoopbackOnly(status) {
 }
 
 /**
+ * `running: true` 但 `address === null`。
+ *
+ * ⚠️ **这是合法组合**（2026-10-22 对抗审计 m-1）：宿主侧 `running`（`isGatewayRunning()`）
+ * 与 `address`（`gatewayAddress()`）是**两次独立 `degrade`**，任一次抛错都会让对应字段为空
+ * ⇒「在跑」与「拿不到地址」可以同时成立。
+ *
+ * 旧实现在这种情况下会：
+ * - `isWildcardHost(undefined)` 抛 `TypeError` ⇒ **整个状态面板崩**（已修：
+ *   `normalizeHostForCompare` 对非字符串返回空串）；
+ * - 修了不崩之后仍会输出「只绑定 127.0.0.1」—— 而开关可能是**开着的**
+ *   ⇒ 又一条与事实相反的安全声明（IKL7UN 那条纪律：暴露面变了就必须明说）。
+ *
+ * ⇒ 判据：**地址未知时不得声称任何暴露面**，只能如实说「拿不到地址」。
+ */
+function gatewayAddressUnknown(status) {
+  if (status?.running !== true) return false;
+  const address = status?.address;
+  return address === null || address === undefined
+    || typeof (address).host !== 'string' || (address).host.trim() === '';
+}
+
+/**
  * 绑了**非回环**地址时的提示行（issue IKL7UN）。
  *
  * ## 为什么这条必须存在
@@ -694,6 +870,13 @@ export function nonLoopbackNotice(status) {
  * @returns {string}
  */
 export function gatewayFootnote(status) {
+  // ⚠️ **地址未知时不得声称任何暴露面**（2026-10-22 m-1）：
+  //    旧实现会落到最后那句「只绑定 127.0.0.1」，而开关可能开着 ⇒
+  //   与事实相反的安全声明。
+  if (gatewayAddressUnknown(status)) {
+    return '网关正在运行，但本次读不到它的监听地址 —— 无法确认它只绑了回环。'
+      + '若你打开了「允许局域网访问」，请按已开启对待（隔离只靠密钥）。';
+  }
   if (status?.running && !gatewayLoopbackOnly(status)) {
     const host = typeof status.address?.host === 'string' ? status.address.host : '非回环地址';
     return `网关绑定在 ${host}，同一网络内的其它设备与宿主都能连到该端口 —— 隔离只靠密钥，`
@@ -800,9 +983,27 @@ export function gatewayAllowLanHint(status) {
     return '已由环境变量 DSH_OPENAI_GATEWAY_HOST 显式指定监听地址，本开关此刻不生效；'
       + '删除该环境变量并重启 DSH 后才能用这里的选择。'
   }
-  if (status.allowLan) {
+  // ⚠️⚠️ **必须同时判 `running`**（2026-10-22 对抗审计 P2）。
+  //
+  // 只判 `allowLan` 会在「用户打开了开关、但网关总开关关着 / 端口被占 / env 停用」时
+  // 输出「**已监听**全部网卡」—— 而那是**错误的安全陈述**（谎报暴露），并把它与同一
+  // 弹窗里另外两条文案直接矛盾起来：
+  //   - `gatewayStatusLines` 说「网关已关闭，不会监听任何端口」；
+  //   - `gatewayFootnote` 说「网关只绑定 127.0.0.1」。
+  // ⇒ 三条文案对「现在到底在不在监听」给出三种答案。
+  //
+  // ⚠️ 这正是本仓 IKL7UN 反复记的那种「面板输出它自己声称要消除的错误安全陈述」，
+  //   只是方向反了（这次是**谎报暴露**而不是谎报安全）。
+  // ⚠️ 同一文件里 `gatewayAllowLanToggleNotice` **已经**判了 `running` ⇒ 这是
+  //   「同一语义两套判据」的实例，本次把 hint 这条补齐到同口径。
+  if (status.allowLan && status.running) {
     return '已监听全部网卡（0.0.0.0）：同一局域网内的设备都能连到网关，隔离只靠 API Key'
       + '——不要把它配置进任何浏览器端工具或扩展。'
+  }
+  if (status.allowLan) {
+    // 已选择但**没在监听** ⇒ 如实说「还没生效」，绝不谎报「已监听」。
+    return '已选择允许局域网访问（0.0.0.0），但网关当前没有在监听：'
+      + '打开网关总开关后才会真正绑定全部网卡。'
   }
   return '默认只绑定 127.0.0.1，仅本机能访问。打开后网关改绑 0.0.0.0，'
     + '同一局域网内的设备可凭 API Key 连到网关。'
