@@ -13,7 +13,7 @@
  *   锁的是**形状**（block-start → delta… → block-end → finish）。
  */
 
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { Readable } from 'node:stream'
 import { CodelyAdapter, type CodelyAdapterOptions } from '../../src/codely-adapter.js'
 import { CODERLY } from '../../src/codely-product.js'
@@ -626,6 +626,7 @@ describe('Codely 停滞续拉：流式正文必须等于落盘正文', () => {
 describe('Codely 推理与换发必须带超时', () => {
   it('★★ 推理 POST 与换发 GET 都必须有 signal（用户不取消时也要有上限）', async () => {
     const signals: Array<{ url: string; signal: unknown }> = []
+    const timeoutSpy = vi.spyOn(AbortSignal, 'timeout')
     const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)
       signals.push({ url, signal: init?.signal })
@@ -652,8 +653,21 @@ describe('Codely 推理与换发必须带超时', () => {
     expect(exchange, '必须真发过换发请求').toBeDefined()
     expect(chat, '必须真发过推理请求').toBeDefined()
     // ⚠️ 决定性断言：两处都必须有 signal（A3 原缺陷：两处都是 ABSENT）
-    expect(exchange!.signal, '换发请求必须带 signal（否则上游挂住即永久转圈）').toBeDefined()
-    expect(chat!.signal, '推理请求必须带 signal（否则上游挂住即永久转圈）').toBeDefined()
+    //
+    // ⚠️ 只断言 `toBeDefined()` **锁不住任何东西**（与 `codely-auth-service.spec.ts`
+    //    同型）：实现若改成传一个**永不超时**的 `new AbortController().signal`，
+    //    这里照样全绿，而那正是本用例要防的 —— 上游挂住即永久转圈。
+    //    ⇒ 拦住 `AbortSignal.timeout`，断言两处都真的挂了正数毫秒的超时。
+    const timeoutCalls = timeoutSpy.mock.calls.map((args) => args[0])
+    expect(timeoutCalls.length, '换发与推理各挂一次超时（不能只挂一处）').toBeGreaterThanOrEqual(2)
+    for (const ms of timeoutCalls) {
+      expect(ms, '超时期限必须是正数毫秒（0 / 负数等于立刻超时）').toBeGreaterThan(0)
+    }
+    for (const [name, entry] of [['换发', exchange], ['推理', chat]] as const) {
+      expect(entry!.signal, `${name}请求必须带 signal`).toBeInstanceOf(AbortSignal)
+      expect((entry!.signal as AbortSignal).aborted, `${name} signal 刚发出时不该是已中止`).toBe(false)
+    }
+    timeoutSpy.mockRestore()
   })
 
   it('★ 推理超时必须长于目录/登录那档（30s 撑不住正常长回答）', async () => {

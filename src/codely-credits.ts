@@ -118,6 +118,16 @@ export async function fetchCodelyBalanceDetailed(
     }
   }
 
+  // ⚠️ 其它非 2xx 必须**在这里**拦掉（2026-10-24 补）：原实现只判了 401 一档，
+  //    之后就直接 `JSON.parse`。上游 5xx 若返回的是合法 JSON（如 `{"detail":...}`），
+  //    解析会成功，但 `details` / `remaining_points` 都缺席 ⇒ 一路落到末尾的
+  //    「响应里没有可读的积分数字（上游可能改版）」—— 把一次**上游故障**说成
+  //    **协议变更**，排障方向被彻底带偏。同文件的 `postCheckIn` 有 `!response.ok`
+  //    保护，本函数漏了。
+  if (!response.ok) {
+    return { balance: null, error: `Codely 积分查询失败：HTTP ${response.status}` }
+  }
+
   const text = await response.text().catch(() => '')
   let body: RawUsageSummary
   try {
