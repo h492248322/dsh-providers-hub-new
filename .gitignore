@@ -51,6 +51,10 @@ scripts/*
 !scripts/build-standalone.mjs
 !scripts/build-bootstrap.mjs
 !scripts/local-agent.mjs
+# ⚠️ 由 package.json 的 build:all / prepare **直接调用**，属交付链的一环：
+#    不入库 ⇒ 别人 clone 后 `npm run build:all` 会因找不到该脚本直接失败
+#    （`scripts/*` 只挡新增文件，已入库的不受影响，所以必须显式加进来）。
+!scripts/sync-bootstrap-lib.mjs
 !scripts/templates/
 !scripts/templates/install-bootstrap.ps1
 .minimax-forensics/
