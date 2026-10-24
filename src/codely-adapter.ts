@@ -741,6 +741,14 @@ export class CodelyAdapter extends LlmAdapter {
     let lastBudgetDetail: string | null = null
     let teamBudgetExhausted = false
     /**
+     * 本轮已因「预算耗尽」记过冷却的账号。
+     *
+     * ⚠️ 为什么要记：命中团队级时，前面那些号**已经被记账了**（判定只能发生在
+     *    第 2 个号之后，那时第 1 个号早已写进冷却表）。不回滚 ⇒ 本次修复「别把
+     *    撞团队墙的好号封到明天」只做到了一半 —— 漏掉的第一个号恰恰也是好号。
+     */
+    const budgetMarked: string[] = []
+    /**
      * 是否**至少有一次**因为「换发 `cli_api_key` 失败」而退出循环。
      *
      * ⚠️ 用来与「一次请求都没发起」区分开：两者 `res` 都是 `undefined`，
@@ -914,6 +922,21 @@ export class CodelyAdapter extends LlmAdapter {
           // 两个不同账号撞逐字相同的预算报文 ⇒ 团队级。
           // 直接 break 且**不记账本号**（上面 ②那步还没执行到）。
           teamBudgetExhausted = true
+          // ⚠️ 回滚本轮已记的预算账：这些号撞的是**同一堵团队墙**，本身都是好的。
+          //    留在冷却表里就等于把它们封到次日 0 点，与「团队级不连坐」的立意自相
+          //    矛盾 —— 第 1 个号不该因为「它是第一个撞上去的」就被牺牲。
+          //
+          //    回滚失败只忽略、不抛：用户仍可在面板点「重测」解冻，而抛出去会让
+          //    本次请求连一条错误说明都拿不到。
+          for (const markedId of budgetMarked) {
+            // ⚠️ 必须用 `try` 而不是 `.catch()`：方法缺失时是**同步**抛
+            //    `TypeError`（`pool.clearModelRateLimits is not a function`），
+            //    而 `.catch` 只接得住 Promise 拒绝 —— 用它会让异常冒泡出换号循环，
+            //    最终变成「请求没有任何 error、也没有任何内容」这种最难的排查形态。
+            try {
+              await pool.clearModelRateLimits(markedId, [model])
+            } catch { /* 回滚失败不阻断本次报错，用户仍可点「重测」解冻 */ }
+          }
           break
         }
         // 第一个号：还无法区分「它自己的额度」与「团队预算」，先记报文继续换号。
@@ -929,6 +952,7 @@ export class CodelyAdapter extends LlmAdapter {
       //    注释）：先 break 再记账会让「预算用尽退出」时的最后一个失败账号永远漏记
       //    ⇒ 它下次仍被选中、又撞一次同样的墙（minimax 的「8 号只记 7」同型缺陷，
       //    本条由 codely-rotation.spec.ts 的「预算上限」用例钉住）。
+      const budgetFailure = res.status === 402 || isCodelyBudgetExceeded(detail)
       try {
         await pool.updateModelRateLimit(
           currentAccountId,
@@ -937,6 +961,9 @@ export class CodelyAdapter extends LlmAdapter {
             ? Date.now() + CODERLY_RATE_LIMIT_COOLDOWN_MS
             : nextUtc8DayStartMs(),
         )
+        // 只有**预算类**失败才需要回滚：429 是账号级 RPM 超发，撞的不是团队墙，
+        // 那种冷却本就该留着（别家 soft-rate 同档）。
+        if (budgetFailure) budgetMarked.push(currentAccountId)
       } catch {
         // ③ 记账失败不中断换号（accio P2-1 同款）：少记一次冷却的代价
         //    远小于「整池轮换被一次写盘失败掐断」。
@@ -1000,7 +1027,7 @@ export class CodelyAdapter extends LlmAdapter {
             + `（上游 ${res.status}${body}）。`
             + (teamBudgetExhausted
               ? '这是**团队层面**的上限，换任何账号结果都一样 —— 需由团队充值，或等次日 0 点自动恢复。'
-                + '（第 1 个账号在判定前已被记账到次日 0 点，可在面板点「重测」立即解冻）'
+                + '（本轮已试账号的冷却标记均已回滚，不会连坐到明天）'
               : '可先在面板「一键签到」领积分；签到 / 充值后点该账号的「重测」立即解冻，'
                 + '或等次日 0 点自动恢复'),
           'QUOTA_EXCEEDED',

@@ -65,6 +65,8 @@ const rateLimited = () => new Response(JSON.stringify({ error: { message: 'rate 
 function makePool(records: Array<{ id: string; credential?: CodelyCredential }>) {
   const picks: Array<{ model: string; exclude: string[] }> = []
   const marks: Array<{ accountId: string; modelId: string; resetAtMs: number }> = []
+  /** 回滚记录：适配器判定为团队级后清掉的冷却标记。 */
+  const clears: Array<{ accountId: string; modelIds: string[] }> = []
   const limits = new Map<string, Record<string, number>>()
   const accounts = records.map((r) => ({ id: r.id, credential: r.credential ?? cred(`TOK-${r.id}`) }))
   const pool = {
@@ -89,12 +91,30 @@ function makePool(records: Array<{ id: string; credential?: CodelyCredential }>)
       marks.push({ accountId, modelId, resetAtMs })
       limits.set(accountId, { ...(limits.get(accountId) ?? {}), [modelId]: resetAtMs })
     },
+    /**
+     * 与真实 `AccountPool` 同形：清冷却标记，返回清除条数。
+     *
+     * ⚠️ 替身**必须**提供这个：适配器判定团队级后要用它**回滚**已记的预算账。
+     *    缺了它，实现侧的 `try/catch` 会把失败静默吞掉 ⇒ 回滚到底有没有发生
+     *    变得不可观测，这条链就成了「看起来对、其实没做事」。
+     */
+    clearModelRateLimits: async (accountId: string, modelIds?: readonly string[]) => {
+      const current = limits.get(accountId)
+      if (current === undefined) return 0
+      const targets = modelIds === undefined
+        ? Object.keys(current)
+        : modelIds.filter((m) => Object.prototype.hasOwnProperty.call(current, m))
+      clears.push({ accountId, modelIds: targets })
+      for (const m of targets) delete current[m]
+      if (Object.keys(current).length === 0) limits.delete(accountId)
+      return targets.length
+    },
     /** 预置某账号处于冷却中（模拟「上一轮已被 402 标记」）。 */
     preset: (accountId: string, modelId: string, resetAtMs: number) => {
       limits.set(accountId, { ...(limits.get(accountId) ?? {}), [modelId]: resetAtMs })
     },
   }
-  return { pool, picks, marks }
+  return { pool, picks, marks, clears }
 }
 
 interface Harness {
@@ -193,7 +213,7 @@ describe('Codely 请求级换号 + 冷却', () => {
   })
 
   it('★ 团队预算耗尽 ⇒ 第 2 个号就停止，且后续账号不被连坐记账', async () => {
-    const { pool, marks } = makePool([
+    const { pool, marks, clears } = makePool([
       { id: 'acc-1', credential: cred('TOK-A') },
       { id: 'acc-2', credential: cred('TOK-B') },
       { id: 'acc-3', credential: cred('TOK-C') },
@@ -211,6 +231,11 @@ describe('Codely 请求级换号 + 冷却', () => {
     // 决定性②：**只记第 1 个**。第 2 个号没被记账 —— 它本身是好的，只是撞了团队墙；
     //          把它记进冷却表等于把一个好号封到次日 0 点（本次修复的核心）。
     expect(marks.map((m) => m.accountId), '第 2 个号不得被连坐记账').toEqual(['acc-1'])
+    // 决定性③：第 1 个号在判定**之前**就被记账了（判定只能在第 2 个号之后发生），
+    //    所以它必须被**回滚** —— 否则「团队级不连坐」只做了一半：撞同一堵墙的
+    //    好号里，第一个仍然被封到次日 0 点，只因为它排在第一位。
+    expect(clears.map((c) => c.accountId), '第 1 个号已记的账必须被回滚').toEqual(['acc-1'])
+    expect(clears[0]?.modelIds, '回滚只针对本次模型，不得清掉该账号的其它冷却').toHaveLength(1)
     // 文案必须挑明是团队层面、换号无用，否则用户会去做一个注定无效的动作。
     expect(String((error as Error).message), '需说明是团队层面').toMatch(/团队/)
     expect(String((error as Error).message), '团队级不该再建议签到（领的是个人积分）').not.toMatch(/签到/)
