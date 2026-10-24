@@ -1346,6 +1346,47 @@ describe('model.list / model.setDisabled 端点', () => {
     { id: 'hy3', name: 'Hy3' },
   ]
 
+  /**
+   * 「面板入口」端点（`plugin-src/client/settings-card.js` 的唯一数据来源）。
+   *
+   * ⚠️ 用例判据是**写后读回**，不是「set 返回了什么」：这条偏好最可能的缺陷形态
+   * 是 set 只改了进程内副本、没有落盘，下次启动入口又变回默认。
+   */
+  describe('panelEntry 端点', () => {
+    it('get 默认返回「仅侧栏」', async () => {
+      const { call } = registerEndpoints({ models: MODELS })
+
+      const result = await call('panelEntry.get', {})
+
+      expect(result.ok).toBe(true)
+      expect(result.value).toEqual({ entry: 'sidebar' })
+    })
+
+    it('set 写入后 get 读回', async () => {
+      const { call } = registerEndpoints({ models: MODELS })
+
+      const setResult = await call('panelEntry.set', { entry: 'settings' })
+
+      expect(setResult.ok).toBe(true)
+      // ⚠️ 回传的是**落盘后重读**的值，客户端一律以后端回传为准（不做乐观更新）。
+      expect(setResult.value).toEqual({ entry: 'settings' })
+      expect((await call('panelEntry.get', {})).value).toEqual({ entry: 'settings' })
+    })
+
+    it('⚠️ 非枚举 entry 一律 bad-request，不猜默认值', async () => {
+      const { call } = registerEndpoints({ models: MODELS })
+
+      for (const bad of [undefined, null, true, false, 'off', 'both', 'Sidebar', 1]) {
+        const result = await call('panelEntry.set', { entry: bad })
+        expect(result.ok, `entry=${JSON.stringify(bad)} 不该被接受`).toBe(false)
+        expect(result.error).toMatchObject({ code: 'bad-request' })
+      }
+
+      // 非法写入不得改动已存的值。
+      expect((await call('panelEntry.get', {})).value).toEqual({ entry: 'sidebar' })
+    })
+  })
+
   it('model.list 回传 llm 的模型目录，并把黑名单回填为 disabled', async () => {
     const { call } = registerEndpoints({
       models: MODELS,

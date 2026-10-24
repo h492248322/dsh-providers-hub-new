@@ -69,11 +69,11 @@ function narrowPopBlock(styles: string): string {
   expect(start, '找不到浮层窄屏段的注释标题（可能被改名或删除）').toBeGreaterThan(-1)
   // ⚠️ 结束锚点必须是一个**独立段落**的标题，不能用模板闭合反引号 ——
   // 后者会把「本段之后、模板结束之前」的一切都算进本段（见上面第 3 条）。
-  // 当前本段是全文件最后一段，故结束锚点取模板闭合处；但**同时**要求
-  // 两者之间不含另一个段落标题（否则说明有人在本段之后插了新段，
-  // 那时必须改这个锚点，而不是让断言静默地跨段匹配）。
-  const end = styles.indexOf('\n`', start)
-  expect(end, '找不到 STYLES 模板的闭合位置').toBeGreaterThan(start)
+  // 本段（窄屏浮层）之后紧跟的是「插件详情页设置卡片」段（2026-10-24 新增），
+  // 故锚点取那一段的标题。该标题若被改名，下面的 expect 会直接红 —— 不设兜底，
+  // 兜底会让断言静默跨段（那正是上面第 3 条记录过的假绿）。
+  const end = styles.indexOf('── 插件详情页', start)
+  expect(end, '找不到紧随「窄屏浮层」之后的「插件详情页」段落标题：请改 narrowPopBlock 的结束锚点').toBeGreaterThan(start)
   const raw = styles.slice(start, end)
   const strayHeader = raw.indexOf('── ', raw.indexOf('\n'))
   expect(
@@ -1029,7 +1029,7 @@ describe('用量徽标：弹窗的紧凑布局（信息一项不少）', () => {
 })
 
 describe('用量徽标：依赖与样式', () => {
-  it('package.json 声明三个客户端依赖（含提供 modelDirectories 的那个包）', () => {
+  it('package.json 声明四个客户端依赖（含 modelDirectories 与 plugin-manager）', () => {
     const pkg = JSON.parse(read('package.json')) as {
       dsh?: { client?: { platform?: string; inject?: string[] } }
     }
@@ -1038,6 +1038,10 @@ describe('用量徽标：依赖与样式', () => {
       '@deepseek-ai/dsh-client-connection',
       '@deepseek-ai/dsh-client-ui-settings',
       '@deepseek-ai/dsh-client-ui-model-selection',
+      // ⚠️ 第 4 项（2026-10-24 新增）：插件详情页的 `plugins.bundle.config` 卡片
+      // 由 plugin-manager 提供，不声明的话本 bundle 可能先于它到达、
+      // `slots.inject` 一直等服务 ⇒ 卡片永不出现，且不报错。
+      '@deepseek-ai/dsh-client-ui-plugin-manager',
     ])
   })
 

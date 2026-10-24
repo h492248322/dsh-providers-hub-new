@@ -336,8 +336,21 @@ service.bat install -Mode bootstrap  -BundleDir <产物目录> -Profile prod   :
 3. 需要多个账号时重复第 2 步（账号池会自动选号）；
 4. 回到 dsh 的模型选择器，选中该渠道的模型即可开始对话。
 
-页头的「**侧栏**」开关可以随时把那一行从主导航里收起来（设置页入口照旧）；偏好
-存在宿主侧而不是浏览器存储，重启后保持 —— 理由见 `docs/agent-notes/client-ui.md`。
+### 「面板入口」：两个入口二选一
+
+上面那两条进入路径是**互斥**的，只能保留一条。改法在**插件详情页**：
+「设置 → 插件 → dsh-providers-hub」，页面里有一张设置卡，卡里一个「**面板入口**」
+下拉：
+
+| 选项 | 结果 |
+|---|---|
+| **仅侧栏**（默认） | 主导航里多一行「Jet Hub」；设置弹层里**没有** Jet Hub 那一节 |
+| **仅设置页** | 只剩「设置 → 插件 → Jet Hub」；主导航那一行消失 |
+
+⚠️ 默认是「仅侧栏」，所以**设置弹层里默认找不到 Jet Hub 一节**，这不是插件没装好。
+想从设置里进，就把下拉切成「仅设置页」——切换后主导航那一行会消失。
+
+偏好存在宿主侧而不是浏览器存储，重启后保持 —— 理由见 `docs/agent-notes/client-ui.md`。
 
 「+ 新建账号」是**两步式**的：先返回 `loginUrl` 由前端弹窗打开，后台再轮询换取
 令牌 —— 这样不会阻塞浏览器手势窗口，弹窗不会被拦截。
@@ -392,6 +405,22 @@ service.bat install -Mode bootstrap  -BundleDir <产物目录> -Profile prod   :
   不带验证头先发一发，被 `3007` 拒了才产）；一旦服务端翻成 `false`，
   插件会**自动改为首发直接带上**，不再白吃那发注定失败的往返
   （判据是三态：缺席 = 不知道 = 保持先探，见 `requiresCaptchaUpfront`）。
+  ⚠️ **找不到浏览器时用 `ZCODE_CHROME_PATH` 指定**（Gitee issue IKQ4JN）：
+  这是该链路**唯一**的人工出口，值是 chromium 内核浏览器的**绝对路径**
+  （如 `C:\Program Files\Google\Chrome\Application\chrome.exe`）。
+  候选链按优先级为 `ZCODE_CHROME_PATH` → `SCOOP` / `SCOOP_GLOBAL` →
+  **从 `PATH` 反推的 scoop 根** → `~/scoop` → 系统 Chrome / Chromium /
+  **Brave** / Edge。
+  ⚠️ **设完必须重启 `dsh web`，且新进程要继承新环境** —— 从**旧终端**重启时
+  新进程继承的仍是旧 shell 的环境快照，变量实际为空。找不到浏览器时的报错
+  会回显「本进程看到的 `ZCODE_CHROME_PATH` = …」与**逐条候选路径**，
+  照着它能立刻分清「变量没生效」与「路径写错」。
+  ⚠️ **scoop 装在非默认根时不必设变量**：从 `PATH` 的 `<root>\shims` 反推
+  已覆盖（用 `root_path` 把 scoop 挪到 D 盘的机器上 `SCOOP` 是空的，
+  旧版因此一个 chromium 都找不到）。
+  ⚠️ **不支持两类「看着能用」的封装**：Chrome++ 之类**外层 exe 启动后自行退出**
+  （CDP 端口会正常起来，但退出码 0 被判为异常退出）；以及
+  `chrome-headless-shell`（headless 一律 `F001`，必须 headful）。
 - **`zcode` 的领取有「两个来源」，签到会同时查、一起去领**（2026-10-23）：
   ① 每日赠送 —— `GET /api/v1/zcode-plan/billing/preview` 的 `plans`；
   ② **营销活动投放** —— `GET /api/v1/marketing/touch` 里横幅按钮的

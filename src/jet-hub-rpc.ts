@@ -13,7 +13,7 @@
  *           载体页见 src/zcode-carrier-page.ts 与 src/captcha-carrier-server.ts）/
  *           backup.export / backup.import / backup.status /
  *           nativeSearch.getEnabled / nativeSearch.setEnabled /
- *           sidebarEntry.getEnabled / sidebarEntry.setEnabled /
+ *           panelEntry.get / panelEntry.set /
  * 另有一条 GET 路由 `/api/jet-hub/captcha-carrier`：渲染内部载体的载体页
  * （⚠ 手工诊断用；guest 加载不到它，见该路由注释里的主进程取证）。
  */
@@ -99,7 +99,7 @@ import { isMinimaxRefreshable, minimaxCredentialExpiresAtMs } from './minimax.js
 // ⚠️ `sanitizeMinimaxXff` 与存储层**同一份判据**：RPC 层必须在写盘**之前**用它
 //    判合法性（非法即不写），否则「先写后判」会静默清掉用户原有的有效设置。
 //    ⚠️ 不要在这里另写一份 IP 校验（同义判据分两处必然漂移）。
-import { sanitizeMinimaxXff } from './jet-hub-store.js'
+import { PANEL_ENTRY_VALUES, sanitizeMinimaxXff } from './jet-hub-store.js'
 import { GEMINI, geminiAccountLabel, geminiCredentialExpiresAtMs, isGeminiRefreshable } from './gemini.js'
 import type { GeminiAuth, StartedGeminiLoginFlow } from './gemini-auth.js'
 // OfficeAce（华为 MaaS 云端直连）：面板状态探测 / 登录流程 / 余额查询所需的
@@ -263,7 +263,10 @@ import { pickTestModel,
 import { exportBackup, importBackup } from './backup.js'
 import { handleOpencodeRpc } from './opencode-rpc.js'
 import { geminiFetchForAccount } from './gemini-proxy.js'
+import { minimaxIntlFetchForAccount } from './minimax-proxy.js'
+import { normalizeProxy } from './minimax-proxy.js'
 import { handleGeminiRpc } from './gemini-rpc.js'
+import { handleMinimaxIntlRpc } from './minimax-rpc.js'
 import { handleModelscopeRpc } from './modelscope-rpc.js'
 import { clearDeadModels, deadModelIdsFor } from './dead-model-store.js'
 import { OPENCODE } from './opencode-product.js'
@@ -353,9 +356,9 @@ import type {
   RpcNativeSearchGetEnabledResponse,
   RpcNativeSearchSetEnabledRequest,
   RpcNativeSearchSetEnabledResponse,
-  RpcSidebarEntryGetEnabledResponse,
-  RpcSidebarEntrySetEnabledRequest,
-  RpcSidebarEntrySetEnabledResponse,
+  RpcPanelEntryGetResponse,
+  RpcPanelEntrySetRequest,
+  RpcPanelEntrySetResponse,
   RpcGatewayModel,
   RpcCaptchaDemandResponse,
   RpcCaptchaCarrierUrlResponse,
@@ -2298,6 +2301,14 @@ function registerJetHubEndpoints(
     // 是**用户点一下就等**的主路径，配了账号代理却不接 ⇒ 积分行恒报
     // 「配额查询网络失败」，而推理路径却正常 —— 症状割裂、极难对应。
     geminiFetchFor: (accountId) => geminiFetchForAccount(accountId),
+    // ⚠️⚠️ **MiniMax 国际站的按账号 fetcher**（PR !145 审计 P0 修法）：
+    // 与上面 `geminiFetchFor` **逐格同因** —— 积分行是用户点一下就等的主路径，
+    // 而 `agent.minimax.io` 按出口 IP 国别分流（大陆直连恒 307 → 中国站 → 401）。
+    // 不接它 ⇒ 配好代理后对话能用、**积分行与一键签到却仍失败**，
+    // 症状与 issue IKMEVG 逐字相同。
+    // ⚠️ 与 `src/index.ts` 的 `creditsTable` 是**两个独立调用**，必须同改
+    //（本仓库记过「只接一处」的复发形态：minimaxXff 就漏过一次）。
+    minimaxIntlFetchFor: (accountId) => minimaxIntlFetchForAccount(accountId),
   })
   /**
    * **一次性奖励**能力表（Loomy 新手任务 / raccoon 登录奖励）。
@@ -3954,6 +3965,14 @@ function registerJetHubEndpoints(
       const handled = await handleGeminiRpc(ctx, pool, method, payload)
       if (handled !== undefined) return handled
     }
+    // ⚠️ MiniMax 国际站的**出口代理**端点同款前缀改道（写 `setMinimaxIntlProxy`）。
+    //    前缀用 `minimaxintl.` 而不是 `minimax.`：① 与 provider id 逐字一致；
+    //    ② `minimax.` 前缀一旦被这里接管，将来中国站若加同名端点就会被本分支
+    //    误吞（两家语义不同，见 `minimax-proxy.ts` 的模块头）。
+    if (method.startsWith('minimaxintl.')) {
+      const handled = await handleMinimaxIntlRpc(ctx, pool, method, payload)
+      if (handled !== undefined) return handled
+    }
     // ⚠️ **本 fork 独有**（modelscope，2026-10-17 审计 P0 修复）：魔搭与 opencode
     //    同属「不跳浏览器、手工粘贴 API Key」的 provider ⇒ 走各自的前缀改道分支。
     //    ⚠️ 本分支此前**不存在**，而 `handleModelscopeRpc` 已导出却零调用点 ⇒
@@ -4478,9 +4497,96 @@ function registerJetHubEndpoints(
             createdAt: Date.now(),
           })
 
+          /**
+           * ⚠️⚠️ **国际站：登录前必须让占位条目带上代理**（与 Gemini 的
+           * IKLTZ2 审计 P2-1 是同一个死锁形态）。
+           *
+           * 设备码申请与轮询换 token 都发生在凭据落盘**之前**，此时**只有这条
+           * 占位条目**认得这个账号 ⇒ 代理只能从这里读。不带 ⇒ 大陆网络下国际站
+           * **登录恒失败**，而用户**没法给一个还不存在的账号配代理**（面板的
+           * 「代理」按钮按 `accountId` 打开）⇒ 只能导出 `HTTPS_PROXY` 绕过。
+           *
+           * 触发路径很常见：refresh_token 失效的既定动作就是「删号重登」，
+           * 而重登造的是**全新 id** ⇒ 旧号上的代理配置必然丢失。
+           *
+           * **代理来源两级**（与 Gemini 同款）：
+           * ① 载荷显式带（将来 UI 提供输入时用）；
+           * ② **从同 provider 的已有账号继承** —— 当前的实际生效路径。
+           *    ⚠️ 只在**恰好一个账号带代理**时生效（多账号时无法判断该继承
+           *    哪个，宁可直连也不要猜错出口把凭据发到错误的代理上）。
+           *
+           * ⚠️ **只对国际站做**（中国站直连才是最优），且走
+           * `setMinimaxIntlProxy` 而不是直接塞字段：那里有「空串删键」的口径。
+           *
+           * ⚠️ 查池必须过 `typeof pool.listAccountsByProvider === 'function'`
+           * （与 `minimaxXff` 同款防御）：单测/旧接线可能传**只实现了一部分方法**
+           * 的池替身，直接调会在那种替身上抛 `TypeError`（实测：
+           * `minimax-intl.spec.ts` 的登录组替身只有 `listAccounts`）——
+           * 读不到池时**宁可跳过继承**，也不能让登录直接崩。
+           */
+          if (minimaxProduct.id === MINIMAX_INTL.id
+            && typeof pool.listAccountsByProvider === 'function') {
+            const existingIntlProxies = new Set(
+              (await pool.listAccountsByProvider(MINIMAX_INTL.id))
+                .map((e) => asProxyText(e.minimaxIntlProxy))
+                .filter((p) => p.trim() !== ''),
+            )
+            // ⚠️ `typeof` 与 `trim()` 是**防御**：载荷无 schema 校验
+            // （同 `accioRegion` 的注释）。不传时 `req.minimaxIntlProxy`
+            // 是 `undefined` ⇒ 走继承那一级。
+            const requestedIntlProxy = typeof req.minimaxIntlProxy === 'string'
+              ? req.minimaxIntlProxy.trim()
+              : ''
+            const inheritedIntlProxy = existingIntlProxies.size === 1
+              ? [...existingIntlProxies][0]!
+              : ''
+            const intlProxyInput = requestedIntlProxy !== '' ? requestedIntlProxy : inheritedIntlProxy
+            /**
+             * ⚠️⚠️ **必须过 `normalizeProxy` 才能写池**（PR !145 审计 P1 修法）。
+             *
+             * `types.ts` 的 `RpcCreateAccountRequest.minimaxIntlProxy` 注释明文承诺
+             * 「来自客户端自报的 RPC 载荷（无 schema 校验）⇒ 读取侧必须过
+             * `normalizeProxy` 归一，非法值一律拒绝（与 `accioRegion` 同一条纪律）」，
+             * 而原实现只 `trim()` 就写池 —— **注释与实现相反**。
+             *
+             * 后果（**不可自愈**）：非法串（如 `ftp://host:21`）落盘后，该账号的
+             * **每一条链路**（登录 / 续期 / 目录 / 身份 / 推理 / 积分 / 探测）都会在
+             * `createMinimaxFetcherResolver` 的 `normalizeProxy` 处**抛错**
+             * （见 `minimax-proxy.ts` 的模块头：那里刻意选择抛错而非静默直连）。
+             * 用户只能手动改代理或删号重登；而登录期那条抛错还会被 `catch` 成
+             * 「无法启动 MiniMax 登录（设备码申请失败）」——**文案指错了方向**。
+             *
+             * ⚠️ 与 `minimaxintl.setProxy` 端点（`minimax-rpc.ts`）**必须同口径**：
+             * 那里早就归一化了。同一字段两个写入入口两套判据，正是本仓库
+             * 「同义判据两份实现必然漂移」红线。
+             *
+             * ⚠️ 继承来的值来自池、而池里的值已由 `setProxy` 归一化 ⇒ 它**必然合法**，
+             * 故归一化失败只可能是载荷那条腿（用户/脚本手填），
+             * 此时**拒绝整个登录**并给出可操作原因，而不是把脏值写进池。
+             */
+            if (intlProxyInput !== '') {
+              const normalized = normalizeProxy(intlProxyInput)
+              if (!normalized.ok) {
+                // ⚠️ 删掉刚建的占位条目：不留「有账号但配置非法」的幽灵卡片。
+                void pool.removeAccount(id).catch(() => {})
+                return {
+                  ok: false,
+                  error: {
+                    code: 'bad-request',
+                    message: `出口代理地址无效：${normalized.reason}`,
+                  },
+                }
+              }
+              await pool.setMinimaxIntlProxy(id, normalized.proxy.url)
+            }
+          }
+
           let minimaxStarted: StartedMinimaxLoginFlow
           try {
-            minimaxStarted = await minimaxAuth.startLogin()
+            // ⚠️ **必须传 `accountId`**：换 token 那一次请求发生在凭据落盘
+            // **之前**，此时只有池里的占位条目认得这个账号 —— 不传就拿不到它的
+            // 代理 ⇒ 大陆网络下国际站**登录恒失败**，症状与「凭据无效」同形。
+            minimaxStarted = await minimaxAuth.startLogin({ accountId: id })
           } catch (error) {
             // 设备码申请失败：删掉占位条目，不留幽灵账号。
             void pool.removeAccount(id).catch(() => {})
@@ -4489,7 +4595,8 @@ function registerJetHubEndpoints(
           }
 
           minimaxStarted.result.then(async (credential) => {
-            const result = await minimaxAuth.persistLogin(credential, { refName })
+            // ⚠️ 同 `startLogin`：身份查询也要走该账号的出口。
+            const result = await minimaxAuth.persistLogin(credential, { refName, accountId: id })
             /**
              * 昵称：两站必须可区分（同一面板左右没有，但**账号列表与用量徽标**
              * 都会显示它，而两站账号可能出现在同一个聚合候选里）。
@@ -8057,35 +8164,39 @@ function registerJetHubEndpoints(
         return { ok: true, value }
       }
 
-      // ── 「侧栏入口」开关（Jet Hub 页头的「侧栏」开关）──
+      // ── 「面板入口」（插件详情页设置卡片里的下拉）──
       //
-      // 语义：**开** = 主导航（`sidebar.panellist`）里显示「Jet Hub」一行，
-      // 点它把 Jet Hub 页渲染进中央主面板（`main` 槽的 `jet-hub` key）；
-      // **关** = 该行消失，进入路径只剩「设置 → Jet Hub」。
+      // 语义：Jet Hub 的**唯一**入口位置，两个取值严格互斥 ——
+      // `'sidebar'` = 主导航（`sidebar.panellist`）里显示「Jet Hub」一行，点它把
+      // 页面渲染进中央主面板（`main` 槽的 `jet-hub` key），同时 `settings.section`
+      // 那一节注销；`'settings'` = 该行注销，进入路径只剩「设置 → 插件 → Jet Hub」。
       //
-      // 消费方是客户端：`plugin-src/client/sidebar-entry.js` 在 `apply` 里先读
-      // 一次本端点，再决定注不注入那行；页头开关写回后由同一份进程内副本
-      // 通知两侧（设置页与主面板）重新渲染。
-      case 'sidebarEntry.getEnabled': {
-        const value: RpcSidebarEntryGetEnabledResponse = { enabled: pool.sidebarEntryEnabled() }
+      // 消费方是客户端：`plugin-src/client/panel-entry.js` 在 `apply` 里先读一次
+      // 本端点，再决定注不注入那两处入口；卡片写回后由同一份进程内副本通知两处
+      // 注册逻辑重新求值。
+      case 'panelEntry.get': {
+        const value: RpcPanelEntryGetResponse = { entry: pool.panelEntry() }
         return { ok: true, value }
       }
 
-      case 'sidebarEntry.setEnabled': {
-        const req = payload as RpcSidebarEntrySetEnabledRequest
+      case 'panelEntry.set': {
+        const req = payload as RpcPanelEntrySetRequest
         // ⚠️ 与 `nativeSearch.setEnabled` 同约定：**不做默认值猜测** ——
-        // 默认成 true 会静默打开用户特意关闭的入口。
-        if (typeof req.enabled !== 'boolean') {
-          return { ok: false, error: { code: 'bad-request', message: '非空布尔 enabled 必填' } }
+        // 把非法值当成某个合法值会静默改掉用户的入口。校验表用
+        // `PANEL_ENTRY_VALUES`（与 store 的 sanitize 同一份真源），不在这里
+        // 另写一套字面量比较。
+        if (!PANEL_ENTRY_VALUES.includes(req.entry)) {
+          return { ok: false, error: { code: 'bad-request', message: 'entry 必须是 sidebar 或 settings' } }
         }
-        await pool.setSidebarEntryEnabled(req.enabled)
+        await pool.setPanelEntry(req.entry)
         // 不刷新任何缓存：客户端的注册逻辑读的是**同一个**进程内副本，
-        // 写完由客户端自己按返回值（落盘后重读）同步两侧 UI。
+        // 写完由客户端自己按返回值（落盘后重读）同步两处 UI。
         ctx.logger.info(
-          `[jet-hub] ${req.enabled ? '显示' : '隐藏'}主导航侧栏入口`
-          + `${req.enabled ? '' : '（仍可从「设置 → Jet Hub」进入）'}`,
+          req.entry === 'sidebar'
+            ? '[jet-hub] 面板入口：仅侧栏（主导航一行；设置页那一节已注销）'
+            : '[jet-hub] 面板入口：仅设置页（主导航那一行已注销）',
         )
-        const value: RpcSidebarEntrySetEnabledResponse = { enabled: pool.sidebarEntryEnabled() }
+        const value: RpcPanelEntrySetResponse = { entry: pool.panelEntry() }
         return { ok: true, value }
       }
 

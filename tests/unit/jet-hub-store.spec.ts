@@ -23,7 +23,8 @@ import {
   sanitizePermanentLocks,
   sanitizeProviderClosed,
   sanitizeProviderOrder,
-  sanitizeSidebarEntryEnabled,
+  jetHubSchema as storeSchema,
+  sanitizePanelEntry,
   withAllowed,
   withoutAllowed,
 } from '../../src/jet-hub-store.js'
@@ -78,18 +79,29 @@ describe('sanitizeNativeWebSearchEnabled', () => {
   })
 })
 
-describe('sanitizeSidebarEntryEnabled', () => {
-  it('只有显式 false 才算关闭，其余一律按显示（与网关/原生搜索逐字同构）', () => {
-    // ⚠️ 方向不能反：丢键 / 脏值都必须回到**默认显示**。反过来（只认 true）
-    // 会让任何一次读取失败都变成「侧栏入口被静默藏起来」，而用户从来没关过它
-    // —— 而且入口藏起来后，页头那个开关就成了唯一入口，属于双重伤害。
-    expect(sanitizeSidebarEntryEnabled(false)).toBe(false)
-    expect(sanitizeSidebarEntryEnabled(undefined)).toBe(true)
-    expect(sanitizeSidebarEntryEnabled(null)).toBe(true)
-    expect(sanitizeSidebarEntryEnabled(true)).toBe(true)
-    expect(sanitizeSidebarEntryEnabled('false')).toBe(true)
-    expect(sanitizeSidebarEntryEnabled(0)).toBe(true)
-    expect(sanitizeSidebarEntryEnabled({})).toBe(true)
+describe('sanitizePanelEntry', () => {
+  it('两个合法字面量原样返回', () => {
+    expect(sanitizePanelEntry('sidebar')).toBe('sidebar')
+    expect(sanitizePanelEntry('settings')).toBe('settings')
+  })
+
+  it('缺键 / null / 脏值一律回默认「仅侧栏」', () => {
+    // ⚠️ 方向不能反：丢键 / 脏值都必须回到**默认仅侧栏**。反过来会让任何一次
+    // 读取失败都变成「侧栏入口被静默藏起来」，而用户从来没改过它。
+    expect(sanitizePanelEntry(undefined)).toBe('sidebar')
+    expect(sanitizePanelEntry(null)).toBe('sidebar')
+    expect(sanitizePanelEntry('off')).toBe('sidebar')
+    expect(sanitizePanelEntry(0)).toBe('sidebar')
+    expect(sanitizePanelEntry({})).toBe('sidebar')
+  })
+
+  it('⚠️ 老布尔迁移：只有明确 false 才是「仅设置页」', () => {
+    expect(sanitizePanelEntry(undefined, false)).toBe('settings')
+    expect(sanitizePanelEntry(undefined, true)).toBe('sidebar')
+    // 脏值不当 false 用：字符串 'false' 是脏数据，不是用户意图。
+    expect(sanitizePanelEntry(undefined, 'false')).toBe('sidebar')
+    // 新键优先：两个都在时以新枚举为准。
+    expect(sanitizePanelEntry('settings', true)).toBe('settings')
   })
 })
 
@@ -122,6 +134,49 @@ describe('后端选路', () => {
 
   it('settings 服务缺失时仍走文件后端（headless 也可持久化）', () => {
     expect(createJetHubStore(makeCtx(undefined)).kind).toBe('file')
+  })
+
+  /**
+   * ⚠️⚠️ **真实缺陷守卫（2026-10-24 复核 C1）**：老布尔迁移必须在
+   * **过 schema 的** SettingsStore 路径上也成立。
+   *
+   * 上面那些 `scope.get()` 都是**裸替身**（直接返回对象、不经过 schemastery），
+   * 于是它们绕开了「schema 给缺键填默认值」这一步 —— 而真实 SettingsStore 的
+   * `scope.get()` 会过一遍 schema。
+   *
+   * 当时的写法 `Schema.string().default(DEFAULT_PANEL_ENTRY)` 正是在这里出问题：
+   * schema 把 `panelEntry` 填成 `'sidebar'`，`sanitizePanelEntry` 第一层（新键
+   * 合法即返回）随即命中，第二层的老布尔迁移**永远不执行** ⇒ 老用户明确关掉的
+   * 侧栏入口升级后静默变回「仅侧栏」，且此后每次 save 都写死 `'sidebar'`。
+   *
+   * 本用例用**真实的 store schema** 编解码，因此 `schema.default` 的回归会立刻变红。
+   */
+  it('⚠️ 老契约后端：老布尔 false 经 schema 后仍迁移成「仅设置页」', () => {
+    const written: Record<string, unknown>[] = []
+    let raw: unknown = { accounts: [], disabledModels: {}, sidebarEntryEnabled: false }
+    const store = createJetHubStore(makeCtx({
+      register: () => ({
+        // ⚠️ 关键：`get()` 走真实 schema，复刻 SettingsStore 的行为。
+        get: () => storeSchema(raw),
+        replace: async (value: object) => {
+          written.push(value as Record<string, unknown>)
+          raw = value
+        },
+      }),
+      describe: () => [],
+    }))
+
+    expect(store.load()?.panelEntry).toBe('settings')
+  })
+
+  it('⚠️ 老契约后端：没有新键也没有旧键时经 schema 回默认「仅侧栏」', () => {
+    const raw: unknown = { accounts: [], disabledModels: {} }
+    const store = createJetHubStore(makeCtx({
+      register: () => ({ get: () => storeSchema(raw), replace: async () => {} }),
+      describe: () => [],
+    }))
+
+    expect(store.load()?.panelEntry).toBe('sidebar')
   })
 })
 
@@ -157,8 +212,8 @@ describe('老契约后端（SettingsStore）', () => {
       gatewayAllowLan: false,
       // save 未携带原生搜索开关 → 写出启用（缺省），读回同值。
       nativeWebSearchEnabled: true,
-      // save 未携带侧栏入口开关 → 写出显示（缺省），读回同值。
-      sidebarEntryEnabled: true,
+      // save 未携带面板入口 → 写出「仅侧栏」（缺省），读回同值。
+      panelEntry: 'sidebar',
       // save 未携带顺序 → 写出空数组（未自定义），读回同值。
       providerOrder: [],
       // 关闭意图缺省空表（没有任何供应商被关闭）：读回同值（Gitee IKP8OF）。
@@ -323,8 +378,8 @@ describe('文件后端（FileStore）', () => {
       gatewayAllowLan: false,
       // 原生搜索开关缺省启用 —— 与升级前行为一致
       nativeWebSearchEnabled: true,
-      // 侧栏入口开关缺省显示 —— 与升级前行为一致
-      sidebarEntryEnabled: true,
+      // 面板入口缺省「仅侧栏」—— 与升级前行为一致
+      panelEntry: 'sidebar',
       // 顺序缺省空数组（未自定义）—— 与升级前行为一致
       providerOrder: [],
       // 关闭意图缺省空表（没有任何供应商被关闭）：读回同值（Gitee IKP8OF）。
@@ -414,38 +469,74 @@ describe('文件后端（FileStore）', () => {
   })
 
   /**
-   * 「侧栏入口」偏好的**持久化**守卫（与上面原生搜索那组同构）。
+   * 「面板入口」偏好的**持久化**守卫（与上面原生搜索那组同构）。
    *
-   * 判据必须是**跨实例读回**：`JS` 里断言 `sanitizeSidebarEntryEnabled` 的返回值
-   * 是同义反复 —— 真正的缺陷形态是「有 sanitize、没生产调用者」，用户关掉入口、
-   * 重启后又冒出来一行。所以这里走**真实的** `save()` / `load()`。
+   * 判据必须是**跨实例读回**：断言 `sanitizePanelEntry` 的返回值是同义反复 ——
+   * 真正的缺陷形态是「有 sanitize、没生产调用者」，用户改了入口、重启后又变回去。
+   * 所以这里走**真实的** `save()` / `load()`。
    */
-  it('⚠️ 侧栏入口关闭可跨实例读回（关了就是关了，含老契约后端）', async () => {
+  it('⚠️ 面板入口改「仅设置页」可跨实例读回（改了就是改了）', async () => {
     const writer = createJetHubStore(makeCtx(undefined))
-    await writer.save({ accounts: [], disabledModels: {}, sidebarEntryEnabled: false })
+    await writer.save({ accounts: [], disabledModels: {}, panelEntry: 'settings' })
 
     const reader = createJetHubStore(makeCtx(undefined))
-    expect(reader.load()?.sidebarEntryEnabled).toBe(false)
+    expect(reader.load()?.panelEntry).toBe('settings')
   })
 
-  it('老文档没有侧栏入口开关时缺省为显示（= 升级前行为）', () => {
+  it('老文档没有面板入口键时缺省为「仅侧栏」', () => {
     mkdirSync(join(dir, 'jet-hub'), { recursive: true })
     writeFileSync(
       join(dir, 'jet-hub', 'state.json'),
       JSON.stringify({ accounts: [], disabledModels: {} }),
       'utf-8',
     )
-    expect(createJetHubStore(makeCtx(undefined)).load()?.sidebarEntryEnabled).toBe(true)
+    expect(createJetHubStore(makeCtx(undefined)).load()?.panelEntry).toBe('sidebar')
   })
 
-  it('侧栏入口开关落盘时脏值被归一化为显示', () => {
+  it('面板入口落盘时脏值被归一化为「仅侧栏」', () => {
     mkdirSync(join(dir, 'jet-hub'), { recursive: true })
     writeFileSync(
       join(dir, 'jet-hub', 'state.json'),
-      JSON.stringify({ accounts: [], disabledModels: {}, sidebarEntryEnabled: 'off' }),
+      JSON.stringify({ accounts: [], disabledModels: {}, panelEntry: 'off' }),
       'utf-8',
     )
-    expect(createJetHubStore(makeCtx(undefined)).load()?.sidebarEntryEnabled).toBe(true)
+    expect(createJetHubStore(makeCtx(undefined)).load()?.panelEntry).toBe('sidebar')
+  })
+
+  it('⚠️ 老文档只有布尔键时跨实例读回映射成枚举', () => {
+    mkdirSync(join(dir, 'jet-hub'), { recursive: true })
+    writeFileSync(
+      join(dir, 'jet-hub', 'state.json'),
+      JSON.stringify({ accounts: [], disabledModels: {}, sidebarEntryEnabled: false }),
+      'utf-8',
+    )
+    expect(createJetHubStore(makeCtx(undefined)).load()?.panelEntry).toBe('settings')
+  })
+
+  it('⚠️ 写入后文档里不得再出现 sidebarEntryEnabled 键', async () => {
+    const writer = createJetHubStore(makeCtx(undefined))
+    await writer.save({ accounts: [], disabledModels: {}, panelEntry: 'settings' })
+    const raw = JSON.parse(readFileSync(join(dir, 'jet-hub', 'state.json'), 'utf-8')) as Record<string, unknown>
+    expect(raw.panelEntry).toBe('settings')
+    expect(raw).not.toHaveProperty('sidebarEntryEnabled')
+  })
+
+  /**
+   * ⚠️⚠️ **落盘前必须过 sanitize**（2026-10-24 审计 M7）。
+   *
+   * 两个后端的 `save` 写的是同一份文档形状，但此前只有 `SettingsStore.save`
+   * 归一化入参，`FileStore.save` **原样落盘** ⇒ 脏值被写进文档、下次启动再被
+   * 读侧 sanitize 纠正。写侧没判据时，「脏值只可能来自读路径」这个假设全靠
+   * 调用方约定维持（本仓库红线 PR !62 的幼苗形态）。
+   *
+   * ⚠️ 判据必须**真的写一次脏值再读文件**，不能只查源码里有没有
+   *    `sanitizePanelEntry` —— 那种写法对「只加在注释里」完全失明。
+   */
+  it('⚠️⚠️ FileStore 落盘前归一化 panelEntry（脏值不得写进文档）', async () => {
+    const writer = createJetHubStore(makeCtx(undefined))
+    await writer.save({ accounts: [], disabledModels: {}, panelEntry: 'GARBAGE' as never })
+    const raw = JSON.parse(readFileSync(join(dir, 'jet-hub', 'state.json'), 'utf-8')) as Record<string, unknown>
+    expect(raw.panelEntry, '脏值被原样写进了 state.json ⇒ 写侧缺 sanitize').toBe('sidebar')
   })
 
   /**
@@ -663,8 +754,8 @@ describe('文件后端（FileStore）', () => {
       gatewayAllowLan: false,
       // 原生搜索开关同理：写盘时缺省即启用，读回同值。
       nativeWebSearchEnabled: true,
-      // 侧栏入口开关同理：写盘时缺省即显示，读回同值。
-      sidebarEntryEnabled: true,
+      // 面板入口同理：写盘时缺省即「仅侧栏」，读回同值。
+      panelEntry: 'sidebar',
       // 顺序缺省空数组（未自定义）：读回同值。
       providerOrder: [],
       // 关闭意图缺省空表（没有任何供应商被关闭）：读回同值（Gitee IKP8OF）。

@@ -102,6 +102,22 @@ import { fetchAutoclawCreditBalance } from './autoclaw-credits.js'
 import type { RaccoonCredential } from './raccoon.js'
 import { MinimaxAuth } from './minimax-auth.js'
 import { registerMinimaxLlm } from './minimax-adapter.js'
+// ⚠️ MiniMax 国际站的**账号出口代理**解析器（与 gemini 同款：实例住在被依赖
+//    方向的下游，避免 `index → jet-hub-rpc → index` 的 ESM 环 —— 那条环会把
+//    引用变成 TDZ ⇒ 静默恒直连）。
+//
+// ⚠️ `minimaxIntlXffForProbe` 也住在那里（PR !145 审计 P1 修法）：初版在**本文件**
+//    另开了一个 `globalThis.__jetHubMinimaxXffPool` 全局槽来给探测槽取 XFF ——
+//    同一个「池在 `apply()` 才就绪」的问题，代理用模块级 ref、XFF 用全局槽，
+//    两套机制。全局槽还有两个模块级 `let` 没有的代价：跨包副本串号
+//    （两个路径的包各有一份模块实例，但 `globalThis` 共享）、以及 dispose 后
+//    永不清理（`setMinimaxProxyPool(undefined)` 清不掉它）。
+//    ⇒ 收敛到 `minimax-proxy.ts` 的同一个 `minimaxPoolRef`，与 gemini 逐格同构。
+import {
+  minimaxIntlFetchForAccount,
+  minimaxIntlXffForProbe,
+  setMinimaxProxyPool,
+} from './minimax-proxy.js'
 import { MINIMAX, MINIMAX_INTL } from './minimax-product.js'
 // ⚠️ `PROVIDER_REGISTRY` 供 namespace 清单派生（`registerProviderSettings` 的实参）；
 //    `descriptorOf` 供**能力注册表**逐项取元数据（见下面的注册段）。
@@ -777,12 +793,30 @@ export const probeById: Record<string, NonNullable<ProviderRuntime['probe']>> = 
   // MiniMax Code 国际版 —— 与中国版同因（它同样会写 `modelRateLimits`），
   // 只是 product 换成 `MINIMAX_INTL`（探测请求必须打到 `agent.minimax.io`，
   // 否则国际站账号的「重测」会用国内站主机发凭据、必然 401 ⇒ 标记永远清不掉）。
+  //
+  // ⚠️⚠️ **国际站的探测必须走该账号的出口**（第三个形参 `entry` 不能丢）：
+  // 探测路径**刻意不传 `accountPool`**（`account-probe.ts` 的既定语义：只测
+  // 这一个账号、且不写任何标记）⇒ 适配器内那条「按 access_token 反查账号 id」
+  // 的路**根本不存在** ⇒ 出口解析器拿到空 id、按「直连」处理 ⇒ **该账号的代理
+  // 被完全绕过**。症状与报障同形：国际站「测试 / 重测」恒失败，而这个失败与
+  // 「账号已失效」在 UI 上完全同形 ⇒ 用户会去误删好号（与 Gemini 的
+  // `accountIdOverride` 是同一个缺陷形态）。
   minimaxintl: {
-    createProbeAdapter: (ref, credential) => new MinimaxAdapter({
+    createProbeAdapter: (ref, credential, entry) => new MinimaxAdapter({
       credentialRef: credentialRef(ref),
       resolveCredential: async () => credential as MinimaxCredential,
       refresh: async () => {},
       product: MINIMAX_INTL,
+      fetchFor: minimaxIntlFetchForAccount,
+      accountIdOverride: entry?.id ?? '',
+      // ⚠️ 探测**无池** ⇒ `send()` 里从池读 `minimaxXff()` 那条腿恒空 ⇒
+      //    用户设好的 XFF 在「测试 / 重测」上不生效，大陆出口的探测恒
+      //    307 → 401（与「凭据失效」同形；2026-10-24 活体实测）。
+      //    这里显式带上池的当前值（只读，不违反「探测不写状态」）。
+      //    ⚠️ probeById 是**模块级常量**（`pool` 在 `apply()` 里才存在），
+      //    故经可后填的取值函数现读（与 `minimaxIntlFetchForAccount` 同一模式），
+      //    池未就绪时返回 undefined = 不附 XFF（与既有行为一致）。
+      xffOverride: minimaxIntlXffForProbe(),
     }),
   },
   // Accio（阿里）→ 自己的网关端点。
@@ -2921,8 +2955,17 @@ export function apply(ctx: Context): void {
   const minimaxIntlBalanceSelector = new BuddyBalanceSelector({
     product: MINIMAX_INTL,
     resolveCredential: resolveMinimaxCredentialByRef,
-    fetchBalance: (credential, product) =>
-      fetchMinimaxCreditBalance(credential, fetch, product, pool.minimaxXff()),
+    // ⚠️ `fetchFor`：余额端点也在 `agent.minimax.io` 上 ⇒ 大陆出口恒 307
+    //    ⇒ 折算恒失败 ⇒ 该渠道在聚合轮换里被**静默剔除**（面板却还能刷新，
+    //    因为那走的是另一条带了 XFF 的链路）。
+    fetchFor: minimaxIntlFetchForAccount,
+    fetchBalance: (credential, product, ctx) =>
+      fetchMinimaxCreditBalance(
+        credential,
+        ctx?.fetchFor?.(ctx.accountId ?? '') ?? fetch,
+        product,
+        pool.minimaxXff(),
+      ),
   })
   const minimax = new MinimaxAuth(ctx)
   const minimaxAdapter = registerMinimaxLlm(ctx, {
@@ -3035,7 +3078,16 @@ export function apply(ctx: Context): void {
   //    推理路径与签到端点形状**已真机验证通过**（2026-10-15，真实国际站账号，
   //    推理 200 + 真实 SSE、签到/积分 200）；**只有兜底模型表**未按国际站远端采集
   //   （它与国内站共用同一份，只在远端失败时兜底）。
-  const minimaxIntl = new MinimaxAuth(ctx, { product: MINIMAX_INTL })
+  //
+  // ⚠️ **国际站是唯一需要「按账号换出口」的那一站**：`agent.minimax.io` 按出口
+  //    IP 国别分流，大陆来源恒 307 到中国站 ⇒ 与「凭据失效」同形的 401。
+  //    ⇒ 登录 / 续期 / 目录 / 身份 / 推理 / 积分**六条链路**都要走
+  //    `minimaxIntlFetchForAccount`（中国站**刻意不注入**：它直连才是最优，
+  //    出海反而更慢且可能被引导到国际站）。
+  const minimaxIntl = new MinimaxAuth(ctx, {
+    product: MINIMAX_INTL,
+    fetchFor: minimaxIntlFetchForAccount,
+  })
   const minimaxIntlAdapter = registerMinimaxLlm(ctx, {
     credentialRef: credentialRef(MINIMAX_INTL.defaultCredentialRef),
     // ⚠️ provider 实参必须是 MINIMAX_INTL：写死 MINIMAX 会让国际站永远查不到
@@ -3082,6 +3134,9 @@ export function apply(ctx: Context): void {
     fetchRemoteModels: () => minimaxIntl.fetchRemoteModelsOnly(pool),
     readImage: makeReadImage(ctx),
     accountPool: pool,
+    // ⚠️ **推理主路径必须走该账号的出口**（国际站代理）。适配器会在换号后
+    // 按 `activeAccountId` **每次现取**，故传的是**解析器**而不是一份 fetcher。
+    fetchFor: minimaxIntlFetchForAccount,
     product: MINIMAX_INTL,
   })
 
@@ -3112,6 +3167,16 @@ export function apply(ctx: Context): void {
   // ⚠️ Gitee issue IKLTZ2：Gemini 全部端点都在墙外，而 undici 既不读 Windows
   // 系统代理、也不读 `HTTP(S)_PROXY` ⇒ 「浏览器授权成功、面板里账号一直不出现」。
   // 这里接上**按账号取 fetcher** 的解析器（与 `probeById` 共用同一份）。
+  // ⚠️ 与 Gemini 同款：池子在 `apply()` 里才就绪，而 `probeById` 是模块级常量
+  //    （可能在 `apply()` 之前就被求值）⇒ 走可变引用，未注入时恒直连。
+  //
+  // ⚠️ 一次注入同时喂**两条腿**（PR !145 审计 P1 修法）：
+  //    ① 按账号取出口（`minimaxIntlFetchForAccount`）；
+  //    ② 探测槽的 XFF（`minimaxIntlXffForProbe`）。
+  //    初版给 ② 另开了 `globalThis.__jetHubMinimaxXffPool`，两套机制、且 dispose
+  //    后不清理。现在两者共用 `minimaxPoolRef` —— **传 `undefined` 即可整体重置**
+  //    （插件卸载路径若将来需要，直接调 `setMinimaxProxyPool(undefined)`）。
+  setMinimaxProxyPool(pool)
   setGeminiProxyPool(pool)
   const gemini = new GeminiAuth(ctx, { fetchFor: geminiFetchForAccount })
   const geminiSigStore = createGeminiSigStore(ctx)
@@ -5116,6 +5181,12 @@ async function fetchBalanceReading(
     // 否则「面板能刷新、聚合候选却恒折算失败」—— 与上面 minimaxXff 同型陷阱
     // （这里也正是它第一次被引入的同一个 `createProviderCredits` 调用）。
     geminiFetchFor: geminiFetchForAccount,
+    // ⚠️⚠️ **MiniMax 国际站的按账号 fetcher**（PR !145 审计 P0 修法，真实缺陷）：
+    // 与上面 `geminiFetchFor` **逐格同因** —— 积分行是用户点一下就等的主路径，
+    // 而 `agent.minimax.io` 按出口 IP 国别分流（大陆直连恒 307 → 中国站 → 401）。
+    // 不接它 ⇒ 用户配好代理后对话能用、**积分行却仍报「余额查询失败」**，
+    // 症状与 issue IKMEVG 逐字相同（PR !145 当时只接了选号器，本文件这处漏了）。
+    minimaxIntlFetchFor: minimaxIntlFetchForAccount,
   })
   /**
    * **一次性奖励**能力表（Loomy 新手任务 / raccoon 登录奖励）。
@@ -5163,6 +5234,13 @@ async function fetchBalanceReading(
     //
     // ⚠️ 惰性读（用户随时可能改设置），不能固化成字符串。
     minimaxXff: () => pool.minimaxXff(),
+    // ⚠️⚠️ **按账号出口也必须在这里接**（PR !145 审计 P0 修法，与上面
+    //    `minimaxXff` **逐格同因**）。`credits` 与 `expiry` 是两个独立消费域，
+    //    通道各走各的：只接 credits 那处 ⇒ 积分行能刷新、**聚合候选却恒折算失败**；
+    //    只接 expiry 那处 ⇒ 反过来。
+    //    ⇒ 两条腿缺一不可，这正是本仓库记过 6 次的那类静默陷阱。
+    //    ⚠️ 惰性（按 `accountId` 现取），不能固化成一份 fetcher。
+    minimaxIntlFetchFor: minimaxIntlFetchForAccount,
   })
 
 

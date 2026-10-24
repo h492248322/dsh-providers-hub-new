@@ -1583,11 +1583,29 @@ export async function minimaxExpiry(
    * 到期折算恒失败 ⇒ 该渠道在聚合轮换里被静默剔除。
    */
   xff?: string,
+  /**
+   * 该账号的出口 fetcher（**仅国际站**需要，PR !145 审计 P0 修法）。
+   *
+   * ## ⚠️⚠️ 为什么折算路径也必须换出口
+   *
+   * 本函数是**聚合轮换候选可见性的闸门**：折算拿不到读数 ⇒ `sharedPackageExpiry`
+   * 返回 `UNUSABLE` ⇒ `rankCandidates` 把该候选剔除。而
+   * `agent.minimax.io` 按出口 IP 国别分流（大陆直连恒 307 → 中国站 → 401），
+   * ⇒ 用户配好代理、对话能用了，**该渠道仍从轮换里静默消失**，零报错。
+   *
+   * PR !145 的注释点了这个症状，但只把 fetcher 接进了选号器与适配器 ——
+   * 本函数当时仍是**裸 `fetch` 字面量**。
+   *
+   * ⚠️ 省略 ⇒ 全局 `fetch`，与修复前**逐字节等价**（中国版永远省略）。
+   */
+  fetcher?: typeof fetch,
 ): Promise<number> {
   return sharedPackageExpiry(() => fetchBalanceWithCache(
     cached,
     async () => {
-      const result = await fetchMinimaxCreditBalanceDetailed(credential, fetch, product, xff)
+      const result = await fetchMinimaxCreditBalanceDetailed(
+        credential, fetcher ?? fetch, product, xff,
+      )
       // ⚠️ 同 autoclaw / astudio：失败形态是 `balance: null + error`，
       //    `sharedPackageExpiry` 认「`null` ⇒ UNUSABLE」⇒ 只取 `balance`。
       return result.balance

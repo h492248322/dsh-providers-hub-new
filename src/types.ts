@@ -1,6 +1,14 @@
 import type { DpopPrivateJwk } from './oauth.js'
 import type { BadgePreference } from './badge-preferences.js'
 import type { TokenLedgerSnapshot, TokenLedgerHistoryDay, TokenLedgerModelRow } from './token-ledger.js'
+/**
+ * ⚠️ 反向的类型环，但是安全的：`jet-hub-store.ts` 以 `import type` 引入本模块的
+ * `ProviderAccountEntry`，这里也以 `import type` 引入它的 `PanelEntry`。
+ * 两处都是 type-only ⇒ 编译后**完全擦除**，不产生运行时边，也没有初始化顺序问题。
+ * 定义留在 `jet-hub-store.ts`：那里同时持有该枚举的运行时取值表与 sanitize，
+ * 拆开会让「三个真源分居两个文件」，正是本仓库反复记录的漂移形态。
+ */
+import type { PanelEntry } from './jet-hub-store.js'
 
 /** snap-manager ticket 端点响应的传输格式。 */
 export interface CodeArtsCredentialResponse {
@@ -141,6 +149,24 @@ export interface ProviderAccountEntry {
    * 「未设置」混为一谈 —— 那会让面板上的「清除代理」点了没反应。
    */
   geminiProxy?: string
+  /**
+   * **minimaxintl**（MiniMax 国际站）账号的出口代理（空/缺省 = 直连）。
+   *
+   * ⚠️ `agent.minimax.io` 按**出口 IP 所在国家**分流：中国大陆来源会被 307 到
+   * 中国站 `agent.minimaxi.com`，而中国站不认国际站 token ⇒ 报出与「凭据失效」
+   * **逐字同形**的 401（issue IKMEVG）。本字段存在的理由就是换一个海外出口。
+   *
+   * ⚠️ 与既有的 `X-Forwarded-For` 设置（`pool.minimaxXff()`）**互补而非替代**：
+   * XFF 只是**声明**一个海外 IP（上游若不信任该头即失效），本字段是**真正**
+   * 改出口。两者可叠加。
+   *
+   * ⚠️ 与 `geminiProxy` / `opencodeProxy` **刻意分成三个字段**：三家语义不同
+   * （分份额度 / 能不能连通 / 绕地理分流），共用会让「清掉一家」连带清掉别家。
+   *
+   * 空串是合法值（= 用户显式清除，回到直连），**不可**用 falsy 判据把它与
+   * 「未设置」混为一谈 —— 那会让面板上的「清除代理」点了没反应。
+   */
+  minimaxIntlProxy?: string
 }
 
 /** 账号详细状态（返回给 Client 展示） */
@@ -224,6 +250,21 @@ export interface RpcCreateAccountRequest {
    * 行为必须逐字节不变。
    */
   zcodeProvider?: 'bigmodel' | 'zai'
+  /**
+   * **minimaxintl** 账号的出口代理（**仅 MiniMax 国际站需要**）。
+   *
+   * ⚠️ 用途是**登录期**：换 token 那一次请求发生在凭据落盘**之前**，此时只有
+   * 池里那条**占位条目**认得这个账号 ⇒ 代理只能从载荷带（或从同 provider 的
+   * 既有账号继承，见 `jet-hub-rpc.ts` 的 minimax 分支）。不带 ⇒ 大陆网络下
+   * 国际站**登录恒失败**，而用户**没法给一个还不存在的账号配代理** ⇒ 死锁。
+   *
+   * ⚠️ 与 `ProviderAccountEntry.minimaxIntlProxy` 是**同一个语义的两个入口**：
+   * 那一个是「账号存在后」的面板设置，本字段是「账号还没建立时」的一次性输入。
+   *
+   * ⚠️ 来自客户端自报的 RPC 载荷（无 schema 校验）⇒ 读取侧必须过
+   * `normalizeProxy` 归一，非法值一律拒绝（与 `accioRegion` 同一条纪律）。
+   */
+  minimaxIntlProxy?: string
   /**
    * 登录区域（**仅 Accio 需要**）。
    *
@@ -1680,33 +1721,34 @@ export interface RpcNativeSearchSetEnabledResponse {
 }
 
 /**
- * RPC: 「侧栏入口」开关的读取响应（Jet Hub 页头的「侧栏」开关）。
+ * RPC: 「面板入口」的读取响应（插件详情页设置卡片里的下拉）。
  *
- * 语义：`true` = 在**主导航**里显示「Jet Hub」入口（点它把 Jet Hub 页渲染进
- * 中央主面板）；`false` = 只保留「设置 → Jet Hub」这一条进入路径。
+ * 语义：Jet Hub 的**唯一**入口位置，两个取值严格互斥 ——
+ * `'sidebar'` = 主导航里那一行（`settings.section` 那一节注销）；
+ * `'settings'` = 只剩「设置 → 插件 → Jet Hub」（主导航那一行注销）。
  *
  * ⚠️ 为什么这个偏好住**宿主**（`state.json`）而不是浏览器 `localStorage`：
  * 本插件的三条进入路径（Web / 桌面 / headless）共用同一份 `~/.dsh` 状态，
  * 而 Web 侧的 origin 是 `127.0.0.1:<随机端口>` —— **每次启动端口都变**，
- * `localStorage` 会随旧 origin 一起被抛弃，表现为「关掉的入口下次启动又回来了」。
+ * `localStorage` 会随旧 origin 一起被抛弃，表现为「改掉的入口下次启动又变回来了」。
  */
-export interface RpcSidebarEntryGetEnabledResponse {
-  enabled: boolean
+export interface RpcPanelEntryGetResponse {
+  entry: PanelEntry
 }
 
-/** RPC: 「侧栏入口」开关写入请求。 */
-export interface RpcSidebarEntrySetEnabledRequest {
-  enabled: boolean
+/** RPC: 「面板入口」写入请求。 */
+export interface RpcPanelEntrySetRequest {
+  entry: PanelEntry
 }
 
 /**
- * RPC: 「侧栏入口」开关写入响应。
+ * RPC: 「面板入口」写入响应。
  *
  * ⚠️ 与 `nativeSearch.setEnabled` 同取向：回传的是**落盘后重读的值**，
  * 客户端一律以后端回传为准，不做乐观更新（宿主侧可能因为脏文档把值归一）。
  */
-export interface RpcSidebarEntrySetEnabledResponse {
-  enabled: boolean
+export interface RpcPanelEntrySetResponse {
+  entry: PanelEntry
 }
 
 /**

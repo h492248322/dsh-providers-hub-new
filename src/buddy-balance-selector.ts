@@ -149,14 +149,43 @@ export type BuddySelectionResult
  * `undefined/...` 的畸形请求 → 余额恒查不到 → 未锁定时换号优化静默失效、
  * 锁定时永远报「无法确认是否有可用账号」。这条漏洞比烧积分更难归因。
  */
+/**
+ * 余额查询回调的**第二、三参**（账号 id / 按账号取出口）。
+ *
+ * ## 为什么需要它
+ *
+ * 出口代理是**账号维度**的，而选号器在给某个候选查余额时**知道**那是哪个账号
+ * ⇒ 必须把它传给 `fetchBalance`，否则国际站那类「端点按出口 IP 分流」的渠道
+ * 会恒查不到余额（症状：聚合轮换里被**静默剔除**，而面板走另一条带 XFF 的
+ * 链路却还能刷新 —— 极难归因）。
+ *
+ * ⚠️ 之所以是**可选对象**而不是再添一个位置参数：既有 6 处 `fetchBalance`
+ * 都是两参箭头（buddy / trae / loomy / raccoon / minimax 两站），加必填第三参
+ * 会让它们全部要改；而它们是**合法且正确**的（那几家不需要按账号换出口）。
+ */
+export interface BalanceFetchContext {
+  /** 正在查余额的账号 id（拿不到时为空串 = 无账号维度）。 */
+  accountId: string
+  /** 按账号 id 取出口（未注入 = 直连）。 */
+  fetchFor?: (accountId: string) => typeof fetch
+}
+
 type FetchBalanceRule<TProduct, TCredential> = TProduct extends BuddyProduct
   ? {
     /** 余额查询（缺省走真实的 `fetchCreditBalance`）。 */
-    fetchBalance?: (credential: TCredential, product: TProduct) => Promise<CreditBalance | null>
+    fetchBalance?: (
+      credential: TCredential,
+      product: TProduct,
+      ctx?: BalanceFetchContext,
+    ) => Promise<CreditBalance | null>
   }
   : {
     /** ⚠️ 非 buddy provider **必填** —— 缺省会拼出畸形 URL 并静默失效。 */
-    fetchBalance: (credential: TCredential, product: TProduct) => Promise<CreditBalance | null>
+    fetchBalance: (
+      credential: TCredential,
+      product: TProduct,
+      ctx?: BalanceFetchContext,
+    ) => Promise<CreditBalance | null>
   }
 
 /**
@@ -187,6 +216,12 @@ export type BuddySelectionDeps<
   errorTtlMs?: number
   /** 「临时积分」窗口覆盖（测试用）。 */
   windowMs?: number
+  /**
+   * 按**账号 id** 取出口（可选；仅「端点按出口 IP 分流」的渠道需要，
+   * 如 MiniMax 国际站）。未注入时不出现在 {@link BalanceFetchContext} 里，
+   * 既有 provider 的行为**逐字节不变**。
+   */
+  fetchFor?: (accountId: string) => typeof fetch
 } & FetchBalanceRule<TProduct, TCredential>
 
 /**
@@ -344,7 +379,14 @@ export class BuddyBalanceSelector<
       balance = await (injected
         ?? ((cred: TCredential, product: TProduct) =>
           fetchCreditBalance(cred as unknown as BuddyCredential, product as unknown as BuddyProduct, this.deps.fetcher ?? fetch)))(
-        credential, this.deps.product,
+        /**
+         * ⚠️ **第三参带上账号上下文**：出口代理是**账号维度**的，而本方法
+         * 手上正有 `account.id` —— 不传下去，按出口 IP 分流的渠道（MiniMax
+         * 国际站）会恒查不到余额 ⇒ 在聚合轮换里被**静默剔除**。
+         */
+        credential,
+        this.deps.product,
+        { accountId: account.id, ...this.deps.fetchFor === undefined ? {} : { fetchFor: this.deps.fetchFor } },
       )
     } catch (error) {
       return { ok: false, error: `余额查询异常：${error instanceof Error ? error.message : String(error)}` }

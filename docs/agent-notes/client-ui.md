@@ -3063,20 +3063,36 @@ PR #102 合并后跑了对抗性审计，它用 **5 条 `if (false)` 型变异**
 Jet Hub 之前只有 `settings.section` 一个入口。加成主导航一行之后，**同一个页面**有
 两条入口路径（设置弹层 / 中央主面板），组件与 `rpcCall` 都只有一份。
 
+> **2026-10-24 更新**：两条入口已改为**互斥**，由插件详情页设置卡片的
+> 「面板入口」下拉（`仅侧栏` / `仅设置页`）决定保留哪一条。偏好键从布尔
+> `sidebarEntryEnabled` 换成枚举 `panelEntry`，RPC 换成 `panelEntry.get` /
+> `panelEntry.set`，客户端文件名相应改成 `panel-entry-store.js` /
+> `panel-entry.js`。**下面 1-3 条的结论全部仍然成立**，只把文件名与端点名更新了。
+
 ### ⚠️ 1. `sidebar.panellist.id` == `main.key` == `settings.section.id`
 
 宿主按「侧栏行的 id」去 `main` 槽里查 key（`layout.selectPanel(id)`）。三者不一致时
 界面看起来**完全正常**，只有点下去才会发现「面板没换」—— 而且 `selectPanel` 对未注册
 的 key 是**抛错**，被兜底成「什么都不发生」。本实现统一用
-`JET_HUB_PANEL_KEY = 'jet-hub'`（`plugin-src/client/sidebar-entry-store.js`）。
+`JET_HUB_PANEL_KEY = 'jet-hub'`（`plugin-src/client/panel-entry-store.js`）。
+
+⚠️ 正因如此，`main` key **必须无条件注册**：入口切到「仅设置页」之后，用户仍可能
+把面板停在 Jet Hub 上，少了这个 key `selectPanel('jet-hub')` 就会抛错。
 
 ### ⚠️ 2. 偏好必须落宿主，不能落浏览器存储
 
 Web 端 origin 是 `http://127.0.0.1:<随机端口>`（每次启动都变）⇒ 浏览器存储随旧
-origin 一起被抛弃，症状是「关掉的入口下次启动又回来了」。故走
-`sidebarEntry.getEnabled` / `setEnabled` + `AccountPool` 的内存副本 + **两个**持久化
+origin 一起被抛弃，症状是「改掉的入口下次启动又变回来了」。故走
+`panelEntry.get` / `panelEntry.set` + `AccountPool` 的内存副本 + **两个**持久化
 后端。⚠️ `SettingsStore.save` 是**整体替换白名单**：漏掉本键时，任何一次账号/黑名单/
 顺序写入都会把它从文档里删掉（与拒绝表、原生搜索开关同型的历史缺陷）。
+
+⚠️⚠️ **schema 不许加 `.default()`**（2026-10-24 实测缺陷）：schemastery 的
+`.default()` 会在 `scope.get()` 返回的文档里**填入**默认值，于是
+`sanitizePanelEntry(value.panelEntry, value.sidebarEntryEnabled)` 第一层（新键合法
+即返回）直接命中，**老布尔迁移永远不执行** ⇒ 老用户明确关掉的入口升级后静默变回
+「仅侧栏」，且此后每次 save 都把 `'sidebar'` 写死，原设置永久丢失。
+缺键由 sanitize 自己兜底，schema 不需要再给默认值。
 
 ### ⚠️ 3. 关掉入口时若面板正停在本插件上，要主动 `selectPanel(null)`
 
@@ -3108,7 +3124,8 @@ origin 一起被抛弃，症状是「关掉的入口下次启动又回来了」�
 ### 5. 客户端状态模块必须无 React
 
 客户端单测是 `environment: 'node'` 且 devDependencies **没有 react** ⇒ 任何 import
-react 的客户端模块都**无法单测**。故把偏好状态拆成 `sidebar-entry-store.js`
-（无 React，可单测），React 组件与槽注册留在 `sidebar-entry.js`；`jet-hub.js` 只
-import store。顺带避免了 `sidebar-entry.js → jet-hub.js → sidebar-entry.js` 的循环。
+react 的客户端模块都**无法单测**。故把偏好状态拆成 `panel-entry-store.js`
+（无 React，可单测），React 组件与槽注册留在 `panel-entry.js`；插件详情页的设置卡片
+（`settings-card.js`）也只 import store。顺带避免了
+`panel-entry.js → jet-hub.js → panel-entry.js` 的循环。
 

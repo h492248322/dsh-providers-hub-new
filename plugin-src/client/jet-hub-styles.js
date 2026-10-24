@@ -1366,6 +1366,31 @@ const STYLES = `
   }
 }
 
+/* ── 插件详情页（plugins.bundle.config）的自有设置卡片 ──
+
+   最外层必须自成 column 且 gap 为 0：宿主 detailSection 给直接子元素
+   12px 间隔（PluginManagerPage.module.css 的 .detailSection），官方插件卡
+   （终端 / 网页搜索）都包了一层内层 column，容器只看到一个子元素。
+   间距改由每块自己的 padding 提供。
+
+   下列几何与字号全部照抄官方设置行与官方插件卡实测值，不要凭感觉改。 */
+.dim-jh-cardStack { display: flex; flex-direction: column; gap: 0; }
+.dim-jh-cardRow { display: flex; align-items: center; gap: 8px; padding: 16px 0; }
+.dim-jh-cardRowText { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px; padding-right: 48px; }
+.dim-jh-cardTitle { font-size: 13px; font-weight: 500; line-height: 19.5px; color: var(--dsw-alias-label-primary); }
+.dim-jh-cardDesc { font-size: 12px; font-weight: 400; line-height: 18px; color: var(--dsw-alias-label-tertiary); }
+/* 下拉触发按钮：几何与官方设置页选择器一致（高 36 / 圆角 md / 13px 500）。 */
+.dim-jh-cardSelector { display: inline-flex; align-items: center; gap: 12px; height: 36px; padding: 0 14px; border: none; border-radius: var(--dsw-radius-md); background: var(--dsw-alias-bg-module-platform); font: inherit; font-size: 13px; font-weight: 500; line-height: 19.5px; color: var(--dsw-alias-label-primary); cursor: pointer; }
+.dim-jh-cardSelector:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-hover); }
+/* 提交中压暗整个控件，而不是只改文字色：官方对带背景控件就是这么做的
+   （Switch 用 opacity 0.5，SegmentedControl 用 0.4）。 */
+.dim-jh-cardSelector:disabled { cursor: default; opacity: 0.5; }
+.dim-jh-cardChevron { flex: none; }
+/* 焦点环：跟随本文件既有约定（outline:none + box-shadow），与 .dim-jh-switch /
+   .dim-jh-zcSelect 一致。官方设置页的选择器**没有** outline 规则，故这里也不加，
+   否则同一张插件页上本卡片会比其他控件多一圈描边。 */
+.dim-jh-cardSelector:focus-visible { outline: none; box-shadow: 0 0 0 2px color-mix(in srgb, #1677ff 30%, transparent); }
+
 `
 
 /**

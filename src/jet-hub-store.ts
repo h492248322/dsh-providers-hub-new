@@ -113,6 +113,21 @@ export type AggregateOrderMode = 'expiry' | 'manual'
 /** 各 provider 的「锁定永久积分」开关：provider id → 已锁定。 */
 export type PermanentLockMap = Record<string, boolean>
 
+/**
+ * Jet Hub 的**唯一**入口位置。
+ *
+ * 两个取值严格互斥，任一时刻只有一个入口存在（见 {@link JetHubState.panelEntry}）。
+ * 用字符串枚举而不是布尔，是为了将来加第三个位置时只需在 {@link PANEL_ENTRY_VALUES}
+ * 里多一项 + 一条渲染分支，不动文档形状、不写迁移。
+ */
+export type PanelEntry = 'sidebar' | 'settings'
+
+/** {@link PanelEntry} 的合法取值，也是 RPC 写入侧的校验表（唯一真源）。 */
+export const PANEL_ENTRY_VALUES: readonly PanelEntry[] = ['sidebar', 'settings']
+
+/** 缺键 / 脏值 / 老文档迁移时的默认入口。 */
+export const DEFAULT_PANEL_ENTRY: PanelEntry = 'sidebar'
+
 /** 持久化文档结构（两种后端共用）。 */
 export interface JetHubState {
   accounts: ProviderAccountEntry[]
@@ -206,21 +221,25 @@ export interface JetHubState {
    */
   nativeWebSearchEnabled?: boolean
   /**
-   * 「侧栏入口」开关（`false` = 主导航不显示 Jet Hub 入口）。
+   * 「面板入口」：Jet Hub 的**唯一**入口位置（{@link PanelEntry}）。
    *
-   * 打开时，Jet Hub 在**主导航**（`sidebar.panellist`）里多一行，点它把 Jet Hub
-   * 页面渲染进中央主面板；关闭时只剩「设置 → Jet Hub」一条进入路径。
+   * 两个取值**严格互斥**，任一时刻只有一个入口存在：
+   * - `'sidebar'`（默认）= 主导航里多一行，点它把 Jet Hub 渲染进中央主面板；
+   *   `settings.section` 那一节随之注销。
+   * - `'settings'` = 只剩「设置 → 插件 → Jet Hub」；主导航那一行随之注销。
    *
    * ⚠️ **必须住宿主**，不能放浏览器 `localStorage`：Web 侧的 origin 是
    * `127.0.0.1:<随机端口>`，每次启动端口都变 ⇒ `localStorage` 会随旧 origin
-   * 一起被抛弃，表现为「关掉的入口下次启动又回来了」。而它又与
+   * 一起被抛弃，表现为「改掉的入口下次启动又变回来了」。而它又与
    * `gatewayEnabled` 同级：老版本代码整体重写 `state.json` 时会丢掉本键，
-   * 后果仅仅是**入口回到默认显示**（可逆，用户再关一次即可），没有不可逆后果。
+   * 后果仅仅是**入口回到默认「仅侧栏」**（可逆，用户再改一次即可），没有不可逆后果。
    *
-   * 缺键语义为**启用**：老用户升级后行为与升级前完全一致（升级前本来就
-   * 没有这一行，缺键时把入口显示出来正是用户想要的「装上就能用」）。
+   * 缺键语义为 `'sidebar'`：老用户升级后行为与升级前一致（升级前默认就显示那一行）。
+   *
+   * ⚠️ **本键取代了旧的布尔 `sidebarEntryEnabled`**：老文档里只有旧键时按
+   * {@link sanitizePanelEntry} 迁移（只有明确 `false` 才映射成 `'settings'`）。
    */
-  sidebarEntryEnabled?: boolean
+  panelEntry?: PanelEntry
   /**
    * 供应商自定义显示顺序（「供应商开关」弹窗的拖拽排序，2026-10-06）。
    *
@@ -343,8 +362,24 @@ interface SettingsScopeLike {
   replace(section: object): Promise<void>
 }
 
-/** 老契约的 schema：必须是 schemastery（`plainSchema` 会调 `toJSON()`）。 */
-const jetHubSchema = Schema.object({
+/**
+ * 持久化文档的 schema（两种后端共用）。
+ *
+ * ⚠️ 必须是 schemastery（`plainSchema` 会调它的 `toJSON()`）。
+ *
+ * ⚠️ **导出仅供测试**：老契约后端（SettingsStore，**≤0.1.6 的
+ * `settings.register` 契约**）的 `scope.get()` 按「schema defaults →
+ * registrant 的 base → 用户文档」三层解析，也就是**会过一遍本 schema**；
+ * 而单测里那些 `scope.get()` 替身默认不过。`tests/unit/jet-hub-store.spec.ts`
+ * 的「老契约后端」组用本导出复刻真实行为 —— 否则「schema 的 `.default()` 把
+ * 迁移短路」这类缺陷会整组躲过去（2026-10-24 复核 C1 实测如此）。
+ *
+ * ⚠️ 上面的版本限定是必要的：0.1.7 起 `settings` 换成 `SettingsForms`（没有
+ * `register`），本插件在那里走 FileStore，**不经过**本 schema。
+ *
+ * 生产代码不要直接用它做校验，走 sanitize 函数。
+ */
+export const jetHubSchema = Schema.object({
   accounts: Schema.array(Schema.any()).default([]),
   disabledModels: Schema.dict(Schema.any()).default({}),
   loomyPermanentLocked: Schema.boolean().default(false),
@@ -352,9 +387,21 @@ const jetHubSchema = Schema.object({
   // 「允许局域网访问」：默认关闭（暴露面变大必须是显式选择）。
   gatewayAllowLan: Schema.boolean().default(false),
   nativeWebSearchEnabled: Schema.boolean().default(true),
-  // 缺键 = 显示侧栏入口（升级前的行为是「没有这一行」，但缺键时显示它
-  // 才是用户装上就看到入口的默认；关掉是一个显式动作，见 `sanitizeSidebarEntryEnabled`）。
-  sidebarEntryEnabled: Schema.boolean().default(true),
+  // 缺键 = 「仅侧栏」（升级前的默认就是显示那一行；改掉是显式动作）。
+  // ⚠️ 用 `Schema.string()` 而不是 `Schema.union([...])`：schema 只负责类型，
+  // 取值合法性由 `sanitizePanelEntry` 在**读写两侧**统一判（老契约后端不经过
+  // schema，只靠那个函数；两处用同一份判据才不会漂移）。与下面 `minimaxXff` 同款。
+  //
+  // ⚠️⚠️ **绝不能加 `.default()`**（真实缺陷，2026-10-24 复核实测）：
+  //    schemastery 的 `.default()` 会在 `scope.get()` 返回的文档里**填入**默认值，
+  //    于是 `sanitizePanelEntry(value.panelEntry, …)` 第一层（新键合法即返回）
+  //    直接命中，第二层的**老布尔迁移永远不执行** ⇒ 老用户明确关掉的侧栏入口
+  //    在升级后静默变回「仅侧栏」，且此后每次 save() 都把 `'sidebar'` 写进文档，
+  //    原设置**永久丢失**。
+  //    实测（schemastery 3.18.4）：`{ sidebarEntryEnabled: false }` 经 `.default()`
+  //    后 `panelEntry === 'sidebar'`（错误），去掉后经 sanitize 得 `'settings'`（正确）。
+  //    缺键时由 `sanitizePanelEntry` 自己兜底成 `DEFAULT_PANEL_ENTRY`，不需要这里再给。
+  panelEntry: Schema.string(),
   providerOrder: Schema.array(Schema.string()).default([]),
   // ⚠️ 用 `Schema.string()` 而不是自定义 IP 校验：schema 只负责类型，
   // 取值合法性由 `sanitizeMinimaxXff` 在**读写两侧**统一判（老契约后端不经过
@@ -411,18 +458,26 @@ export function sanitizeNativeWebSearchEnabled(raw: unknown): boolean {
 }
 
 /**
- * 归一化「侧栏入口」开关（{@link JetHubState.sidebarEntryEnabled}）。
+ * 归一化「面板入口」（{@link JetHubState.panelEntry}）。
  *
- * 判据与 {@link sanitizeNativeWebSearchEnabled} **逐字同构**：**只有显式 `false`
- * 才算关闭**，其余（缺键 / `true` / 字符串 / 对象 / 数组）一律按启用处理。
+ * 判据两层，顺序不能反：
+ * 1. `raw` 命中 {@link PANEL_ENTRY_VALUES} 就原样返回（新文档 / 合法值优先）；
+ * 2. 否则看老布尔 `legacySidebarEnabled` —— **只有显式 `false`** 才算
+ *    `'settings'`，其余（`undefined` / `true` / 字符串 / 对象 / 数组）一律
+ *    回 {@link DEFAULT_PANEL_ENTRY}。
  *
  * ⚠️ 方向不能反。文档缺失、被手工编辑成脏值、或老版本代码整体重写时丢了本键，
- * 都必须**回到默认显示入口** —— 反过来（只认 `true`）会让任何一次读取失败都
- * 变成「用户明明开着入口却静默消失」，而主面板那条进入路径会跟着一起消失，
- * 用户只剩设置页一条路且不知道发生了什么。
+ * 都必须**回到默认「仅侧栏」** —— 反过来会让任何一次读取失败都变成「侧栏入口
+ * 被静默藏起来」，而用户从来没改过它。
+ *
+ * ⚠️ 字符串 `'false'` **不算** `false`：它是脏数据，不是用户意图。这一条与
+ * {@link sanitizeNativeWebSearchEnabled} 的判据同构（那边也是 `raw !== false`）。
  */
-export function sanitizeSidebarEntryEnabled(raw: unknown): boolean {
-  return raw !== false
+export function sanitizePanelEntry(raw: unknown, legacySidebarEnabled?: unknown): PanelEntry {
+  if (typeof raw === 'string' && (PANEL_ENTRY_VALUES as readonly string[]).includes(raw)) {
+    return raw as PanelEntry
+  }
+  return legacySidebarEnabled === false ? 'settings' : DEFAULT_PANEL_ENTRY
 }
 
 /**
@@ -972,7 +1027,9 @@ class SettingsStore implements JetHubStore {
         gatewayEnabled?: unknown
         gatewayAllowLan?: unknown
         nativeWebSearchEnabled?: unknown
+        // ⚠️ 老键，只为迁移而读（新文档不再写它）：见 sanitizePanelEntry 的第二参。
         sidebarEntryEnabled?: unknown
+        panelEntry?: unknown
         providerOrder?: unknown
         minimaxXff?: unknown
         providerClosed?: unknown
@@ -996,8 +1053,8 @@ class SettingsStore implements JetHubStore {
       gatewayAllowLan: sanitizeGatewayAllowLan(value.gatewayAllowLan),
       // 老文档没这个键 → 启用（原生搜索本就是新功能，默认开启才符合「装上就能用」）。
       nativeWebSearchEnabled: sanitizeNativeWebSearchEnabled(value.nativeWebSearchEnabled),
-      // 老文档没这个键 → 显示侧栏入口（见 `sanitizeSidebarEntryEnabled` 的方向说明）。
-      sidebarEntryEnabled: sanitizeSidebarEntryEnabled(value.sidebarEntryEnabled),
+      // 老文档没新键 → 按老布尔迁移（只有明确 false 才是「仅设置页」）；两者都没有 → 仅侧栏。
+      panelEntry: sanitizePanelEntry(value.panelEntry, value.sidebarEntryEnabled),
       // 老文档没这个键 → 空数组（未自定义），展示侧按声明顺序渲染。
       providerOrder: sanitizeProviderOrder(value.providerOrder),
       // 老文档没这个键 ⇒ `undefined` ⇒ 不附 XFF（与修复前行为逐字节一致）。
@@ -1048,10 +1105,11 @@ class SettingsStore implements JetHubStore {
       //    replace 载荷里根本没有本键，新实例读回 `true`。
       nativeWebSearchEnabled: state.nativeWebSearchEnabled !== false,
       // ⚠️ **必须带上本键**（与 `nativeWebSearchEnabled` 同因，是同一个
-      //    `replace` 整体替换陷阱的第二个受害者）：漏键会让用户明确关闭的
-      //    「侧栏入口」在**任何**一次账号/黑名单/网关/顺序写入时被抹掉，
-      //    重启后入口**静默回来**（用户本以为关掉了它）。
-      sidebarEntryEnabled: state.sidebarEntryEnabled !== false,
+      //    `replace` 整体替换陷阱的第二个受害者）：漏键会让用户改过的
+      //    「面板入口」在**任何**一次账号/黑名单/网关/顺序写入时被抹掉，
+      //    重启后**静默回到默认「仅侧栏」**（用户本以为改过了它）。
+      //    过一遍 sanitize：入参可能来自任何调用方，脏值不该被写进文档。
+      panelEntry: sanitizePanelEntry(state.panelEntry),
       // 顺序丢失只会回到声明顺序（可逆，重拖一次即恢复），同理接受丢失。
       providerOrder: state.providerOrder ?? [],
       // ⚠️ **必须带上本键**：`replace` 是整体替换语义 ⇒ 漏键会让用户设置的
@@ -1295,7 +1353,9 @@ class FileStore implements JetHubStore {
         gatewayEnabled?: unknown
         gatewayAllowLan?: unknown
         nativeWebSearchEnabled?: unknown
+        // ⚠️ 老键，只为迁移而读（新文档不再写它）：见 sanitizePanelEntry 的第二参。
         sidebarEntryEnabled?: unknown
+        panelEntry?: unknown
         providerOrder?: unknown
         minimaxXff?: unknown
         providerClosed?: unknown
@@ -1317,8 +1377,8 @@ class FileStore implements JetHubStore {
         gatewayAllowLan: sanitizeGatewayAllowLan(value.gatewayAllowLan),
         // 老文档没这个键 → 启用，与升级前行为一致。
         nativeWebSearchEnabled: sanitizeNativeWebSearchEnabled(value.nativeWebSearchEnabled),
-        // 老文档没这个键 → 显示侧栏入口（与 `SettingsStore` 同一判据）。
-        sidebarEntryEnabled: sanitizeSidebarEntryEnabled(value.sidebarEntryEnabled),
+        // 老文档没新键 → 按老布尔迁移（与 `SettingsStore` 同一判据）；两者都没有 → 仅侧栏。
+        panelEntry: sanitizePanelEntry(value.panelEntry, value.sidebarEntryEnabled),
         // 老文档没这个键 → 空数组（未自定义），展示侧按声明顺序渲染。
         providerOrder: sanitizeProviderOrder(value.providerOrder),
         // 老文档没这个键 ⇒ `undefined` ⇒ 不附 XFF（与修复前行为逐字节一致）。
@@ -1333,7 +1393,17 @@ class FileStore implements JetHubStore {
   }
 
   async save(state: JetHubState): Promise<void> {
-    this.write(state)
+    // ⚠️ **过一遍 sanitize，与 `SettingsStore.save` 对齐**（2026-10-24 审计 M7）。
+    //
+    // 两个后端写的是同一份文档形状，但此前只有 `SettingsStore.save` 归一化入参，
+    // 本方法原样落盘 ⇒ 同一语义两套判据（本仓库红线 PR !62 的幼苗形态）。
+    // 生产影响低（`AccountPool.queueStoreSave` 传入的都是已归一的缓存），
+    // 但「脏值只可能从读路径进来」这个假设不该靠约定维持 —— 读侧有
+    // `sanitizePanelEntry`，写侧也必须有。
+    //
+    // ⚠️ 只归一**本键**：其余键的归一化各有自己的守卫与事故史（见
+    // `SettingsStore.save` 的逐键注释），在这里顺手全做会越过那些判据。
+    this.write({ ...state, panelEntry: sanitizePanelEntry(state.panelEntry) })
   }
 
   private write(state: JetHubState): void {
@@ -1380,8 +1450,8 @@ class FileStore implements JetHubStore {
         gatewayAllowLan: false,
         // 同上：恢复出的文档不含原生搜索开关信息 → 启用（与全新安装一致）。
         nativeWebSearchEnabled: true,
-        // 同上：恢复出的文档不含侧栏入口开关信息 → 显示入口（与全新安装一致）。
-        sidebarEntryEnabled: true,
+        // 同上：恢复出的文档不含面板入口信息 → 默认「仅侧栏」（与全新安装一致）。
+        panelEntry: DEFAULT_PANEL_ENTRY,
         // 凭据文件里也没有顺序信息 → 空数组（未自定义，与全新安装一致）。
         providerOrder: [],
         // 凭据文件里没有 XFF 设置 → 不附头（与全新安装一致）。

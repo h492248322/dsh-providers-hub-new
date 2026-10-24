@@ -2715,58 +2715,58 @@ describe('AccountPool · setAccountsEnabled（供应商级批量启停）', () =
   })
 
   /**
-   * 「侧栏入口」总开关（与上面「渠道原生搜索」那组逐条同构）。
+   * 「面板入口」（与上面「渠道原生搜索」那组逐条同构）。
    *
-   * ⚠️ 本组存在的理由与那组相同：这类偏好开关最常见的缺陷形态**不是**开关点不动，
-   * 而是「只接了内存副本与 RPC、两个持久化后端都没接」—— 用户关掉入口，重启后
-   * 那一行又冒出来。所以判据一律是**跨实例读回**，而不是同实例断言。
+   * ⚠️ 本组存在的理由与那组相同：这类偏好最常见的缺陷形态**不是**下拉点不动，
+   * 而是「只接了内存副本与 RPC、两个持久化后端都没接」—— 用户改了入口，重启后
+   * 又变回去。所以判据一律是**跨实例读回**，而不是同实例断言。
    */
-  describe('侧栏入口总开关', () => {
-    it('默认显示（老用户升级后多出一行，但不会把已有布局改坏）', () => {
-      expect(new AccountPool(createMockContext() as never).sidebarEntryEnabled()).toBe(true)
+  describe('面板入口（仅侧栏 / 仅设置页）', () => {
+    it('默认「仅侧栏」（老用户升级后行为不变）', () => {
+      expect(new AccountPool(createMockContext() as never).panelEntry()).toBe('sidebar')
     })
 
-    it('⚠️ 关闭后可读回，且跨实例落盘（关了就是关了）', async () => {
+    it('⚠️ 切换后可读回，且跨实例落盘（改了就是改了）', async () => {
       const seeded = createMockContext([makeMockAccount()])
       const writer = new AccountPool(seeded as never)
-      expect(writer.sidebarEntryEnabled()).toBe(true)
-      await writer.setSidebarEntryEnabled(false)
-      expect(writer.sidebarEntryEnabled()).toBe(false)
+      expect(writer.panelEntry()).toBe('sidebar')
+      await writer.setPanelEntry('settings')
+      expect(writer.panelEntry()).toBe('settings')
 
       // 新实例从同一后端载入 —— 证明不是只改了内存副本。
-      expect(new AccountPool(seeded as never).sidebarEntryEnabled()).toBe(false)
+      expect(new AccountPool(seeded as never).panelEntry()).toBe('settings')
     })
 
-    it('重新打开后可读回 true', async () => {
+    it('切回「仅侧栏」后可读回', async () => {
       const seeded = createMockContext()
       const pool = new AccountPool(seeded as never)
-      await pool.setSidebarEntryEnabled(false)
-      await pool.setSidebarEntryEnabled(true)
-      expect(pool.sidebarEntryEnabled()).toBe(true)
+      await pool.setPanelEntry('settings')
+      await pool.setPanelEntry('sidebar')
+      expect(pool.panelEntry()).toBe('sidebar')
     })
 
     it('⚠️ 改开关不得抹掉同一文档里的账号与黑名单', async () => {
       const seeded = createMockContext([makeMockAccount()])
       const pool = new AccountPool(seeded as never)
-      await pool.setSidebarEntryEnabled(false)
+      await pool.setPanelEntry('settings')
 
       const raw = seeded.replacePayloads.at(-1) as
-        { accounts?: ProviderAccountEntry[]; disabledModels?: Record<string, unknown>; sidebarEntryEnabled?: boolean }
+        { accounts?: ProviderAccountEntry[]; disabledModels?: Record<string, unknown>; panelEntry?: string }
       expect(raw.accounts).toHaveLength(1)
       expect(raw.disabledModels).toBeDefined()
-      expect(raw.sidebarEntryEnabled).toBe(false)
+      expect(raw.panelEntry).toBe('settings')
     })
 
-    it('⚠️ 另一次无关写入不得把已关闭的本开关抹回显示', async () => {
+    it('⚠️ 另一次无关写入不得把已改的入口抹回默认', async () => {
       // `SettingsStore.save` 是整体替换白名单：漏掉本键时任何一次账号/黑名单/
-      // 顺序写入都会把它从文档里删掉，症状是「改个账号顺序，侧栏入口又回来了」。
+      // 顺序写入都会把它从文档里删掉，症状是「改个账号顺序，入口又变回去了」。
       const seeded = createMockContext([makeMockAccount()])
       const writer = new AccountPool(seeded as never)
-      await writer.setSidebarEntryEnabled(false)
+      await writer.setPanelEntry('settings')
       const other = new AccountPool(seeded as never)
       await other.setProviderOrder(['buddy'])
 
-      expect(new AccountPool(seeded as never).sidebarEntryEnabled()).toBe(false)
+      expect(new AccountPool(seeded as never).panelEntry()).toBe('settings')
     })
   })
 

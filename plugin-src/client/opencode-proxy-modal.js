@@ -340,6 +340,174 @@ export function GeminiProxyModal({ ctx, accountId, current, onClose }) {
 }
 
 /**
+ * MiniMax **国际站**账号的「设置出口代理」弹窗。
+ *
+ * ## ⚠️ 为什么不能直接复用 {@link OpencodeProxyModal} / {@link GeminiProxyModal}
+ *
+ * 三家**形态相同、语义不同**，而 UI 上必须说清的那句「不设置会怎样」也
+ * **完全不同**：
+ *
+ * - opencode：「不设代理 = 与其它账号共用同一出口 IP = 共用同一份额度」；
+ * - Gemini：「不设代理 = 墙外服务可能**根本连不上**」；
+ * - **minimaxintl：「不设代理 ≠ 连不上，而是**连得上却被转到中国站**」
+ *   —— 上游按出口 IP 国别分流，大陆来源恒 307 到 `agent.minimaxi.com`，
+ *   而中国站不认国际站 token ⇒ 与「凭据失效」**逐字同形**的 401。
+ *
+ * 复用一个组件却按 provider 换文案，等于把三套语义塞进一个函数 ——
+ * 正是本仓库反复记录的那类漂移。故独立成组件，**复用**输入形态预设
+ * （`LOCAL_PORT_PRESETS`），**不复用**组件。
+ *
+ * ## ⚠️⚠️ 「测试连接」的回显必须区分「通」与「通了但仍在大陆」
+ *
+ * 这是本家与另两家**唯一实质不同**的一格：另两家只要拿到 HTTP 响应就算通，
+ * 而本家拿到 HTTP 响应**也可能仍是被分流**（307 到中国站）。宿主侧
+ * `minimaxintl.testProxy` 因此额外回 `geoRouted`，这里必须显示成
+ * **警告**而不是绿色 —— 否则用户看到「已连通」以为配好了，实际照样 401。
+ *
+ * ⚠️ 复用了 `src/minimax-rpc.ts` 的探测端点（国际站公开目录端点，无 token 也
+ * 回 200）⇒ 点「测试连接」**不消耗任何凭据**，不会烧掉用户的 refresh_token
+ * （本仓库在 MiniMax 上有过「诊断脚本对真实凭据 refresh 而烧账号」的事故）。
+ *
+ * ⚠️ 同样必须用 `React.createElement` 渲染（hook 计数事故，见上方
+ * {@link OpencodeProxyModal} 的说明）。
+ *
+ * @param props { ctx: { rpc(payload) }, accountId, current, onClose }
+ */
+export function MinimaxIntlProxyModal({ ctx, accountId, current, onClose }) {
+  const [mode, setMode] = React.useState(guessMode(current))
+  const [url, setUrl] = React.useState(current || '')
+  const [busy, setBusy] = React.useState(false)
+  const [testing, setTesting] = React.useState(false)
+  const [error, setError] = React.useState('')
+  const [result, setResult] = React.useState(null)
+
+  const close = () => { if (onClose) onClose() }
+
+  const save = async (value) => {
+    setBusy(true)
+    setError('')
+    try {
+      await ctx.rpc({ method: 'minimaxintl.setProxy', payload: { accountId, proxy: value } })
+      close()
+    } catch (err) {
+      setError(err && err.message ? err.message : String(err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const test = async () => {
+    setTesting(true)
+    setError('')
+    setResult(null)
+    try {
+      const r = await ctx.rpc({ method: 'minimaxintl.testProxy', payload: { proxy: url } })
+      setResult(r)
+    } catch (err) {
+      setError(err && err.message ? err.message : String(err))
+    } finally {
+      setTesting(false)
+    }
+  }
+
+  const activeHint = (MODES.find((m) => m.id === mode) || {}).hint || ''
+
+  return React.createElement('div', {
+    className: 'dim-jh-modalOverlay dim-jh-modalOverlay--top',
+    onClick: (e) => { if (e.target === e.currentTarget) close() },
+  },
+    React.createElement('div', {
+      className: 'dim-jh-modal',
+      role: 'dialog',
+      'aria-modal': 'true',
+      style: { maxWidth: '520px' },
+    },
+      React.createElement('div', { className: 'dim-jh-modalHead' },
+        React.createElement('div', { className: 'dim-jh-modalTitle' }, '设置 MiniMax 国际站出口代理'),
+        React.createElement('span', { className: 'dim-jh-modalSubtitle' },
+          current ? '当前：已配置' : '当前：直连（本机出口）'),
+      ),
+      // ⚠️ 这段提示是本功能的存在理由，且必须**诚实**：本家的失败不是「连不上」
+      // 而是「连上了却被转到中国站」，与另两家的措辞不同，别照抄。
+      React.createElement('p', { className: 'dim-jh-modalHint' },
+        '国际站（agent.minimax.io）按出口 IP 所在国家分流：中国大陆来源会被转到中国站，'
+        + '而中国站不认国际站账号 ⇒ 报出与「凭据失效」一模一样的错误，凭据本身却是好的。'
+        + '设置这里的代理后，该账号的登录、续期、积分与对话都会走它。'),
+      // ⚠️ 必须说清与 XFF 的关系：两者可叠加，但 XFF 是兜底而非替代。
+      React.createElement('p', { className: 'dim-jh-hint' },
+        '另有「MiniMax 国际站分流设置」（X-Forwarded-For）：它只是**声明**一个海外 IP，'
+        + '上游不认即失效；本设置是**真正**换出口，两者可叠加。'),
+      React.createElement('div', { className: 'dim-jh-modalBody' },
+        React.createElement('div', { className: 'dim-jh-fieldRow' },
+          MODES.map((m) => React.createElement('label', { key: m.id, className: 'dim-jh-radio' },
+            React.createElement('input', {
+              type: 'radio',
+              name: 'minimaxintl-proxy-mode',
+              checked: mode === m.id,
+              onChange: () => {
+                setMode(m.id)
+                setError('')
+                setResult(null)
+              },
+            }),
+            m.label,
+          )),
+        ),
+        React.createElement('p', { className: 'dim-jh-hint' }, activeHint),
+        mode === 'local' && React.createElement('div', { className: 'dim-jh-presetRow' },
+          LOCAL_PORT_PRESETS.map((p) => React.createElement('button', {
+            key: p.port,
+            type: 'button',
+            className: 'dim-jh-btn',
+            title: p.hint,
+            onClick: () => { setUrl(p.url); setError(''); setResult(null) },
+          }, p.label)),
+        ),
+        React.createElement('input', {
+          className: 'dim-jh-input',
+          placeholder: mode === 'socks5' ? 'socks5://user:pass@host:port' : 'http://user:pass@host:port',
+          value: url,
+          // ⚠️ 含认证信息时用 password 类型：代理口令不该裸显在屏幕上。
+          type: url.includes('@') ? 'password' : 'text',
+          onChange: (e) => { setUrl(e.target.value); setResult(null) },
+        }),
+        result && React.createElement('p', {
+          className: 'dim-jh-hint',
+          // ⚠️⚠️ **被分流时不能显示成正常的绿**：那是用户真正想问的答案。
+          style: result.geoRouted ? { color: 'var(--dim-warn, #d9a441)' } : undefined,
+        }, result.geoRouted
+          ? `代理可用，但出口仍被判定为中国大陆（HTTP ${result.status}）· ${result.latencyMs}ms`
+            + ' —— 换个海外出口的代理再试'
+          : `出口已在海外，未被分流（HTTP ${result.status}）· ${result.latencyMs}ms`),
+        error && React.createElement('p', { className: 'dim-jh-error' }, error),
+      ),
+      React.createElement('div', { className: 'dim-jh-modalActions' },
+        React.createElement('button', {
+          type: 'button',
+          className: 'dim-jh-btn',
+          disabled: testing || busy || url.trim().length === 0,
+          onClick: test,
+        }, testing ? '测试中…' : '测试连接'),
+        // 只有已配置过才显示「清除」：没配过就没有可清除的东西。
+        current ? React.createElement('button', {
+          type: 'button',
+          className: 'dim-jh-btn',
+          disabled: busy,
+          onClick: () => save(''),
+        }, '清除代理') : null,
+        React.createElement('button', {
+          type: 'button',
+          className: 'dim-jh-btn dim-jh-btnPrimary',
+          disabled: busy || url.trim().length === 0,
+          onClick: () => save(url),
+        }, '保存'),
+        React.createElement('button', { type: 'button', className: 'dim-jh-btn', onClick: close }, '取消'),
+      ),
+    ),
+  )
+}
+
+/**
  * 「添加 OpenCode 账号」弹窗（**组件**，用 `React.createElement(OpencodeKeyModal, props)` 渲染）。
  *
  * ## ⚠️⚠️ 同样是组件，不能直接函数调用

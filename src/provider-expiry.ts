@@ -132,6 +132,26 @@ export interface ProviderExpiryDeps {
    *    国际站在被地理分流到中国站时折算失败（那正是 IKMEVG 的形态）。
    */
   readonly minimaxXff?: () => string | undefined
+  /**
+   * MiniMax **国际站**的按账号 fetcher（PR !145 审计 P0 修法）。
+   *
+   * ## ⚠️⚠️ 为什么必须有它
+   *
+   * `agent.minimax.io` 按出口 IP 国别分流：大陆出口直连恒 307 到中国站，中国站
+   * 不认国际站 token ⇒ 401。而**聚合轮换的候选可见性由折算决定**
+   *（`aggregate-expiry.ts` 的 `credentialExpiry` 拿不到读数 ⇒ `UNUSABLE`
+   * ⇒ 该候选被 `rankCandidates` 剔除）⇒ 没接这条腿时，用户配好代理、
+   * 对话能用了，但**该渠道仍从聚合轮换里静默消失**，且零报错。
+   *
+   * PR !145 的注释自己点了这个症状，却只把 fetcher 接进了选号器
+   *（`BuddyBalanceSelector`）与适配器 —— **折算路径一行没改**。
+   *
+   * ⚠️ 与 {@link minimaxXff} 的关系：**两者互补**。XFF 只是「声明」一个海外 IP
+   *（上游不认该头即失效），本字段是**真正**换出口。
+   *
+   * ⚠️ 必须**惰性**调用（按 `accountId` 现取）：账号可能随时在面板里改代理。
+   */
+  readonly minimaxIntlFetchFor?: (accountId: string) => typeof fetch
 }
 
 /**
@@ -358,6 +378,23 @@ function minimaxFamilyExpiry(product: MinimaxProduct, deps: ProviderExpiryDeps):
         ? undefined
         : () => context.cachedBalance!(context.accountId) as Promise<CreditBalance | null | undefined>,
       deps.minimaxXff?.(),
+      /**
+       * ⚠️ **按账号取出口**（PR !145 审计 P0 修法）。
+       *
+       * 判据：只有国际站需要（中国站直连才是最优 —— 给它挂代理反而让流量绕境外
+       * 一圈，且可能被引到国际站）；且必须拿到账号 id 才取，否则退回全局 `fetch`
+       *（不知道是谁就不该猜一个账号去用它的出口）。
+       *
+       * ⚠️ 这与 `createProviderCredits` 的 `minimaxIntlFetcher` 是**同一份判据的
+       * 两处消费**（两条链路各自有 deps 类型，无法共享函数体）——
+       * 一致性由 `expiry-runtime-parity.spec.ts` 的真跑 `apply()` 锁住。
+       */
+      product.id === 'minimaxintl'
+        && deps.minimaxIntlFetchFor !== undefined
+        && context?.accountId !== undefined
+        && context.accountId !== ''
+        ? deps.minimaxIntlFetchFor(context.accountId)
+        : undefined,
     ),
   }
 }
