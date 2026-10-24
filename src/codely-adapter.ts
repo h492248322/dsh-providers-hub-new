@@ -353,6 +353,8 @@ export class CodelyAdapter extends LlmAdapter {
    */
   async *stream(options: GenerateOptions): AsyncGenerator<StreamChunk> {
     if (this.options.cliSpawner !== undefined) {
+      // ⚠️ 测试专用：本路径与 HTTP 路径**行为不同**（不换号 / 不记账 / 不续拉），
+      //    差异见 `streamViaCli` 的注释 —— 别用它验证换号与冷却类行为。
       yield* this.streamViaCli(options)
       return
     }
@@ -1440,7 +1442,29 @@ export class CodelyAdapter extends LlmAdapter {
     yield { type: 'finish', reason: { kind } }
   }
 
-  /** 旧的 CLI 驱动路径（仅测试注入 `cliSpawner` 时使用，生产不走）。 */
+  /**
+   * 旧的 CLI 驱动路径（仅测试注入 `cliSpawner` 时使用，生产不走）。
+   *
+   * ## ⚠️ 与 `streamViaHttp` 的**行为差异**（2026-10-24 显式记录）
+   *
+   * 这条路径**不具备** HTTP 路径的请求级能力，别照着 HTTP 那套去理解它：
+   *
+   * | 能力 | HTTP 路径 | 本路径 |
+   * |---|---|---|
+   * | 换发 `cli_api_key` | ✅ | ❌ 不换发 |
+   * | 从池选号 / 换号重试 | ✅（上限 `CODERLY_MAX_ROTATE`） | ❌ 不选号，无换号 |
+   * | 失败记账（`updateModelRateLimit`） | ✅ | ❌ 完全不记账 |
+   * | 目录前置校验 | ✅ | ❌ |
+   * | 停滞续拉 | ✅ | ❌ 一次跑完 |
+   *
+   * ⇒ **别拿这条路径去验证换号 / 冷却 / 团队级判定**：它压根不走那些分支，
+   *   在那里写断言会得到「看起来通过了、其实什么都没测」的假绿。那些行为请走
+   *   `codely-rotation.spec.ts`（注入的是 HTTP 路径）。
+   *
+   * 保留它的唯一理由：保住 `codely-cli.ts` 的调用点（零调用点是本仓库记过的
+   * 陷阱）与既有用例。生产由 `stream()` 的 `cliSpawner === undefined` 挡住，
+   * 永远走 HTTP。
+   */
   private async *streamViaCli(options: GenerateOptions): AsyncGenerator<StreamChunk> {
     const prompt = buildCliPrompt(options)
     if (prompt.length === 0) {
