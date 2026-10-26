@@ -1,8 +1,27 @@
 /**
- * OpenCode V2 chat 请求：read 门禁 + 客户端工具双向别名。
+ * OpenCode V2 chat 请求：read 门禁 + 官方形态提示词 + 客户端工具双向别名。
  * 上游只把内置 `read`（名字 + 参数 schema）当必需门禁；描述不参与校验。
  * 客户端工具（包括 read/shell/edit/write）全部走别名隔离，参数、调用 ID、正文与结果不改写。
+ *
+ * ## ⚠️⚠️ 2026-10-26：system 必须带「官方形态提示词」（真机实测）
+ *
+ * 改前本文件的 system 只是把 DSH 自己的提示词原样塞成第一条消息。配上
+ * Bun 传输层指纹之后逐格对照（同一份 TLS 参数、同一套头、同一个出口）：
+ *
+ * | system 内容 | 结果 |
+ * |---|---|
+ * | 官方提示词（含 `<env>` 块）+ DSH system | **200** |
+ * | 只有 DSH system（改前形态） | **429 `FreeUsageLimitError`** |
+ * | 官方提示词但截掉前半 | **429** |
+ * | 官方提示词只留尾部 `<env>` 块 | **200** |
+ *
+ * ⇒ 门禁要三样**同时**成立：Bun 的 TLS 指纹、提示词里有 `<env>`
+ * （至少 `Working directory`）、tools 非空且含门禁 `read`。
+ * 模板与渲染在 `opencode-official-prompt.ts`；**DSH 自己的提示词仍原样保留在
+ * 官方提示词之后**（不改写、不删除，`mergeSystemWithOfficialPrompt`）。
  */
+import { mergeSystemWithOfficialPrompt, renderOpencodeOfficialPrompt } from './opencode-official-prompt.js'
+
 export interface OpencodeHarnessTool {
   name: string
   description: string
@@ -185,8 +204,13 @@ export interface OpencodePayloadInput {
 export function buildOpencodeRequest(input: OpencodePayloadInput): OpencodeRequestShape {
   return adaptPayload({
     model: input.model,
-    // chat 协议没有顶层 system；只转发 DSH 自己的提示，不注入 OpenCode 身份模板。
-    messages: input.system ? [{ role: 'system', content: input.system }, ...input.messages] : input.messages,
+    // chat 协议没有顶层 system；**恒发**一条 system，且第一条消息必须是它
+    // （⚠️ 实测：官方提示词在但不在首位 ⇒ 429）。内容 = 官方形态提示词 + DSH 自己的提示，
+    // 两者用空行拼接；DSH 的提示**原样保留**，见 `opencode-official-prompt.ts`。
+    messages: [
+      { role: 'system', content: mergeSystemWithOfficialPrompt(renderOpencodeOfficialPrompt(input.model), input.system) },
+      ...input.messages,
+    ],
     tools: buildOpencodeTools(input.tools),
     ...typeof input.temperature === 'number' && Number.isFinite(input.temperature) ? { temperature: input.temperature } : {},
     // 不擅自使用模型上限作默认预算；仅在调用方明确指定时下发 max_tokens。
