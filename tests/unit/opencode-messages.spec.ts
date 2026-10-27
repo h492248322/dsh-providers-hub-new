@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest'
 import { buildOpencodePayload, buildOpencodeTools, ensureFreeLaneShape } from '../../src/opencode-messages.js'
+import { RESERVED_BUILTIN_TOOL_NAMES, RESERVED_TOOL_DESCRIPTION } from '../../src/opencode-official-tools.js'
 
 const namesOf = (payload: Record<string, unknown>): string[] =>
   (payload.tools as Array<{ function: { name: string } }>).map((tool) => tool.function.name)
 
 const base = { model: 'big-pickle', messages: [{ role: 'user', content: '你好' }] }
+const builtinNames = [...RESERVED_BUILTIN_TOOL_NAMES]
 
 describe('buildOpencodeTools', () => {
   it('DSH 工具映射为 OpenAI function 形态，schema 不改写', () => {
@@ -21,17 +23,28 @@ describe('buildOpencodeTools', () => {
 })
 
 describe('OpenCode V2 门禁', () => {
-  it('只补 read 门禁，不注入 shell/bash 或显式 tool_choice:none', () => {
+  it('补齐全套内置工具集，不注入显式 tool_choice:none', () => {
     const payload = buildOpencodePayload(base)
-    expect(namesOf(payload)).toEqual(['read'])
+    // ⚠️ 2026-10-27：整套发送（形状的一部分），不只是 read。
+    expect(namesOf(payload)).toEqual(builtinNames)
+    expect(namesOf(payload)).toEqual(expect.arrayContaining(['edit', 'read', 'write', 'shell']))
     expect(payload.tool_choice).toBeUndefined()
     expect(payload.stream).toBe(true)
     expect(payload.stream_options).toEqual({ include_usage: true })
   })
-  it('read 门禁保留参数 schema，描述只提示禁止调用', () => {
+  it('全部内置工具的顶层描述都换成禁止调用，参数 schema 原样保留', () => {
+    const tools = buildOpencodePayload(base).tools as Array<{ function: { name: string; description?: string; parameters?: { type?: string } } }>
+    for (const tool of tools) {
+      expect(tool.function.description).toBe(RESERVED_TOOL_DESCRIPTION)
+      expect(tool.function.parameters?.type).toBe('object')
+    }
+    expect(tools).toHaveLength(builtinNames.length)
+    expect(tools.map((tool) => tool.function.name)).toEqual(builtinNames)
+  })
+  it('read 内置工具保留参数 schema，描述只提示禁止调用', () => {
     const tools = buildOpencodePayload(base).tools as Array<{ function: { name: string; description: string; strict: boolean; parameters: { required: string[]; properties: Record<string, { type: string; minimum?: number }>; additionalProperties: boolean } } }>
     const fn = tools.find((tool) => tool.function.name === 'read')!.function
-    expect(fn.description).toBe('Reserved for the host runtime; do not call or select this function. Use tools explicitly supplied by the user instead.')
+    expect(fn.description).toBe(RESERVED_TOOL_DESCRIPTION)
     expect(fn.parameters.required).toEqual(['path'])
     expect(fn.parameters.properties.path!.type).toBe('string')
     expect(fn.parameters.properties.offset).toMatchObject({ type: 'integer', minimum: 0 })
@@ -45,12 +58,19 @@ describe('OpenCode V2 门禁', () => {
     const tools = ['read', 'shell', 'edit', 'write', 'glob', 'grep'].map((name) => ({ name, description: '客户端工具', parameters }))
     const payload = buildOpencodePayload({ ...base, tools })
     const wire = payload.tools as Array<{ function: { name: string; parameters: unknown; description: string } }>
-    expect(namesOf(payload)).toEqual([...tools.map((tool) => `dsh_${tool.name}`), 'read'])
+    expect(namesOf(payload)).toEqual([...tools.map((tool) => `dsh_${tool.name}`), ...builtinNames])
     for (const fn of wire.slice(0, tools.length).map((tool) => tool.function)) {
       expect(fn.parameters).toBe(parameters)
       expect(fn.description).toContain('客户端工具')
     }
     expect(payload.tool_choice).toBeUndefined()
+  })
+  it('客户端工具与内置工具同名时互不碰撞：客户端走 dsh_ 前缀', () => {
+    const tools = ['read', 'shell', 'edit', 'write'].map((name) => ({ name, description: '' }))
+    const names = namesOf(buildOpencodePayload({ ...base, tools }))
+    expect(names.slice(0, tools.length)).toEqual(tools.map((tool) => `dsh_${tool.name}`))
+    expect(names.slice(tools.length)).toEqual(builtinNames)
+    expect(new Set(names).size).toBe(names.length)
   })
   it('长名字、规范化重名和已有别名不会碰撞', () => {
     const tools = ['read', 'dsh_read', 'dsh_read_1', 'a.b', 'a_b', 'x'.repeat(64), 'x'.repeat(63) + 'y']
@@ -92,7 +112,7 @@ describe('OpenCode V2 门禁', () => {
   })
   it('显式 none 移除客户端工具，不透传 none，响应层负责禁用语义', () => {
     const payload = ensureFreeLaneShape({ messages: [], tools: [{ type: 'function', function: { name: 'read' } }], tool_choice: 'none' })
-    expect(namesOf(payload)).toEqual(['read'])
+    expect(namesOf(payload)).toEqual(builtinNames)
     expect(payload.tool_choice).toBeUndefined()
   })
   it('非 chat body 不改写', () => {

@@ -15,8 +15,8 @@
  * | 官方提示词只剩尾部 `<env>` 块 | 有 | **200** |
  *
  * ⇒ 两条都必需：**提示词里必须有 `<env>` 块（至少要 `Working directory`）**、
- *   **tools 非空且含门禁 `read`**。工具改名不影响（客户端工具一律 `dsh_` 前缀，
- *   见 `opencode-messages.ts`），门禁 `read` 则**必须保持原名与参数 schema**。
+ *   **tools 含整套内置工具（`read` 是必需项）**。客户端工具一律走 `dsh_` 前缀
+ *   （见 `opencode-messages.ts`），内置工具则**必须保持原名与参数 schema**。
  *
  * ## 本文件只管「prose 形状」
  *

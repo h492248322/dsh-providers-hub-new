@@ -23,7 +23,7 @@
  * ## 边界：只换「一次 HTTP 事务」，协议逻辑一行不动
  *
  * 本模块只做「发请求 → 拿回一个原生 `Response`」，**不理解** OpenCode 协议。
- * session id 算法、`dsh_` 工具别名、门禁 `read`、响应归一、错误分类、槽轮换
+ * session id 算法、`dsh_` 工具别名、内置工具集门禁、响应归一、错误分类、槽轮换
  * 全部仍在原处（`opencode.ts` / `opencode-messages.ts` / `opencode-stream.ts` /
  * `opencode-adapter.ts`）。⇒ 不会出现「两套协议判据」。
  *
