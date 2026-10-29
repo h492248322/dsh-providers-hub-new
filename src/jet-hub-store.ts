@@ -1276,6 +1276,14 @@ const REF_PREFIX_TO_PROVIDER: ReadonlyArray<readonly [string, string]> = [
   //    上游整套反代命名空间都不存在，且 `account.create` 生成的账号 ref 恒为
   //    `${provider.toUpperCase()}_ACCOUNT_${suffix}` —— 两者必须对上，否则本表认不出它。
   ['MODELSCOPE', 'modelscope'],
+  // ⚠️ **本 fork 独有**的 provider（qiniu，2026-10-29）—— 同款坑第 **六** 次。
+  // 漏加 = `QINIU_ACCOUNT_*` 的账号在 `state.json` 缺失时**静默消失**
+  //（凭据还在 `.credentials.yaml` 里，只是索引建不出来，用户只能重新粘贴 Key）。
+  //
+  // ⚠️ 前缀取 `QINIU`：`account.create` 生成的账号 ref 恒为
+  //    `${provider.toUpperCase()}_ACCOUNT_${suffix}`（见 `qiniu-rpc.ts` 的
+  //    `qiniuSlotNamesOf`），两者必须对上，否则本表认不出它。
+  ['QINIU', 'qiniu'],
   // ⚠️ 第 14 个 provider（gemini，2026-10-03）—— 同款坑第 **三** 次。
   // 漏加 = `GEMINI_ACCOUNT_*` 的账号在 `state.json` 缺失时静默消失
   //（凭据还在 `.credentials.yaml` 里，只是索引建不出来，用户只能重新授权）。

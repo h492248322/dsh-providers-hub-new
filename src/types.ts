@@ -243,6 +243,13 @@ export interface ProviderAccountStatus extends ProviderAccountEntry {
    * 且客户端那份一旦漏判形状就会回显原文。
    */
   modelscopeKeyMask?: string
+  /**
+   * 七牛云 API Key 的**打码串**（宿主侧 `maskQiniuKey` 生成，形如 `sk-a…wxyz`）。
+   *
+   * ⚠️ 只下发打码串，**绝不下发明文**（凭据经 RPC 明文下发等于把它摊到客户端的
+   * devtools / 日志 / 崩溃上报里）。与 `modelscopeKeyMask` 同款。
+   */
+  qiniuKeyMask?: string
 }
 
 /** Jet Hub 在 ctx.settings 中的 schema */

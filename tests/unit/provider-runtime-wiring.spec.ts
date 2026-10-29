@@ -98,6 +98,9 @@ const AUTH_SERVICE_OF: ReadonlyArray<readonly [string, string]> = [
   //    派生 ⇒ `modelscopeAuth`。同款坑：本表由**真跑 apply() 的探针**验证过，
   //    不凭注释推断。
   ['modelscope', 'modelscopeAuth'],
+  // ⚠️ **本 fork 独有**（qiniu，2026-10-29）。服务名由 `${product.id}Auth` 派生
+  //    ⇒ `qiniuAuth`。同款坑：本表由**真跑 apply() 的探针**验证过，不凭注释推断。
+  ['qiniu', 'qiniuAuth'],
 ]
 
 /**
@@ -313,6 +316,17 @@ describe('★ index.ts 的能力注册表接线（行为断言，替代源码文
     for (const d of PROVIDER_REGISTRY) {
       const runtime = runtimeOf(d.id)
       if (runtime === undefined) continue // 非 channel provider（aggregate）不在此表
+      // ⚠️ 2026-10-29 **本 fork**：`qiniu`（七牛云）是全仓首例
+      //    「`channel: true` 且 `credits.balance: false`」—— 七牛云**没有**
+      //    余额/额度 REST 端点（用量与计费只在控制台可见），故它如实不声明
+      //    余额能力、`src/index.ts` 也不给它挂 `credits:` 域。
+      //    ⇒ 本循环的语义严格按**本条用例的名字**取「有余额能力的渠道」：
+      //    `balance !== true` 的家不做「必须挂 credits」的断言（挂了反而错）。
+      //    ⚠️ 这条 `continue` **不削弱**守卫：原判据 `runtime !== undefined`
+      //    对 `aggregate` 之外的家恒真，也就等于「凡注册了 runtime 就必须有
+      //    credits」—— 那是把「有余额能力」错当成了「有 runtime」；
+      //    `qiniu` 一进来就把它照出来了（它注册 runtime 但确实没有余额端点）。
+      if (d.credits.balance !== true) continue
       if (CREDITS_TABLE_EXEMPT.has(d.id)) {
         expect(
           runtime.credits,
@@ -413,7 +427,8 @@ describe('★ index.ts 的能力注册表接线（行为断言，替代源码文
     //    减去 AUTH_EXEMPT 两项（opencode / aggregate）⇒ 19 个 auth 键。
     // ⚠️ 2026-10-20 加 autoclawintl（AutoClaw 国际版）：19 → 20 个 auth 键。
     // ⚠️ 2026-10-22（A6）：codely 翻 `channel: true`：20 → 21。
-    expect(shouldRegister, 'channel 集合变了，请复核 opencode 豁免是否仍成立').toHaveLength(21)
+    // ⚠️ 2026-10-29 加 qiniu（七牛云）：21 → 22 个 auth 键。
+    expect(shouldRegister, 'channel 集合变了，请复核 opencode 豁免是否仍成立').toHaveLength(22)
     expect(
       registeredRuntimeIds().sort(),
       'registry 里有账号的 provider 必须都注册进能力注册表（左侧多出 = 清单里多了僵尸项，' +
@@ -470,6 +485,10 @@ describe('★ index.ts 的 probe 域接线（Task 8 复审补齐：此前零守�
     //    —— 见 `modelscope-adapter.ts` 的 `modelscopeRetryAfterMs`（429 指数退避 /
     //    额度耗尽对齐 UTC+8 零点），与 registry 里**省略 `rateLimit`（= true）** 自洽。
     ['modelscope-adapter.ts', ['modelscope']],
+    // ⚠️ **本 fork 独有**（qiniu，2026-10-29）：它会写 `modelRateLimits`
+    //    （`qiniu-adapter.ts` 的 `qiniuRetryAfterMs`：429 指数退避 / 额度类对齐
+    //    UTC+8 次日零点）⇒ 与 registry 里**省略 `rateLimit`（= true）**自洽。
+    ['qiniu-adapter.ts', ['qiniu']],
     // ⚠️ minimax **曾经**登记为空（不写标记）—— 2026-10-11 的 issue IKJW32 给它
     //    接上请求级换号 + 冷却后，它会写 `modelRateLimits`（额度 24h / 限流 1h）。
     //    下面那条「登记为不写标记的确实没有写点」用例就是靠这个变化**红**出来的。

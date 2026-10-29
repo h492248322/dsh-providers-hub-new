@@ -121,6 +121,8 @@ import { AUTOCLAW, AUTOCLAW_INTL } from './autoclaw-product.js'
 import { parseAutoclawCredential, isAutoclawRefreshable, autoclawDisplayNickname } from './autoclaw.js'
 // ⚠️ **本 fork 独有**（modelscope，2026-10-16）。
 import type { ModelscopeAuth } from './modelscope-auth.js'
+// ⚠️ **本 fork 独有**（qiniu，2026-10-29）。
+import type { QiniuAuth } from './qiniu-auth.js'
 import { normalizeAccioRegion, type StartedAccioLogin } from './accio-auth.js'
 import { ACCIO } from './accio-product.js'
 // AStudio（讯飞 AstronStudio）：直连上游 MAAS。**没有 OAuth 授权页** —— 凭据是客户端登录后
@@ -143,6 +145,9 @@ import {
 // ⚠️ **本 fork 独有**（modelscope，2026-10-16）。
 import { MODELSCOPE } from './modelscope-product.js'
 import { maskModelscopeKey } from './modelscope.js'
+// ⚠️ **本 fork 独有**（qiniu，2026-10-29）。
+import { QINIU } from './qiniu-product.js'
+import { maskQiniuKey } from './qiniu.js'
 import { CODELY_PROVIDER_ID, startCodelyDeviceLogin, decodeCodelyJwtExpMs } from './codely-auth.js'
 import type { CodelyAuth } from './codely-auth-service.js'
 import { CODERLY } from './codely-product.js'
@@ -277,6 +282,7 @@ import { handleGeminiRpc } from './gemini-rpc.js'
 import { handleQoderRpc } from './qoder-rpc.js'
 import { handleMinimaxIntlRpc } from './minimax-rpc.js'
 import { handleModelscopeRpc } from './modelscope-rpc.js'
+import { handleQiniuRpc } from './qiniu-rpc.js'
 import { clearDeadModels, deadModelIdsFor } from './dead-model-store.js'
 import { OPENCODE } from './opencode-product.js'
 import type {
@@ -1626,6 +1632,12 @@ export interface JetHubAuths {
    * ⚠️ 值是 `ModelscopeAuth` **Service 实例**（与 accio 同款），不是命名空间。
    */
   readonly modelscope: ModelscopeAuth
+  /**
+   * 七牛云 AI（Qiniu）—— **本 fork 独有**（上游 rc.11 仍无此 provider）。
+   *
+   * ⚠️ 值是 `QiniuAuth` **Service 实例**，与 modelscope 同款。
+   */
+  readonly qiniu: QiniuAuth
 }
 
 /**
@@ -2550,6 +2562,15 @@ function registerJetHubEndpoints(
     //    ⚠️ **「余额能读」与「凭据能续」是两件事** —— 正因为余额现在能读了，
     //    才更需要显式留下这条豁免，否则后人会当成「忘了登记」而补进去。
     //    显式豁免登记在 `credits-balance-self-heal.spec.ts` 的 `SELF_HEAL_EXEMPT`。
+    // ⚠️ **qiniu（七牛云，2026-10-29）同样刻意不在本表里**，理由是 modelscope 那条
+    //    的**加强版**：七牛云的凭据本身就是长期有效的静态 API Key（官方明示
+    //    `sk-` 开头、无过期语义、无 refresh 端点），且 `credits.balance: false`
+    //    （**没有余额端点** ⇒ 积分端点压根不会为它走自愈链）⇒ 两层独立理由都指向
+    //    「无事可做」。它的 `refreshAccountCredential` 只做本地有效期对账、不发
+    //    网络请求，调它等于白跑一趟。
+    //    ⚠️ 显式豁免登记在 `credits-balance-self-heal.spec.ts` 的 `SELF_HEAL_EXEMPT`
+    //    —— 那张表是**反向守卫**（JetHubAuths 每个键都必须在自愈表或豁免表里），
+    //    漏登记会红。
   ])
 
   /**
@@ -3945,6 +3966,29 @@ function registerJetHubEndpoints(
       }
       return out
     }
+    // ⚠️⚠️ **本 fork 独有**（qiniu，2026-10-29）：与 modelscope 同款 —— 卡片要显示
+    //    **打码**的 API Key 并提供「编辑」入口（`qiniu.setApiKey`）。
+    //    ⚠️ **只下发打码串，绝不下发明文**（凭据经 RPC 明文下发等于把它摊到客户端
+    //    的 devtools / 日志 / 崩溃上报里）。⚠️ 打码在**宿主**做完（`maskQiniuKey`）
+    //    而不是客户端：两端各写一份必然漂移，且客户端那份一旦漏判形状就会回显原文。
+    if (provider === QINIU.id) {
+      const out: ProviderAccountStatus[] = []
+      for (const account of accounts) {
+        try {
+          const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
+          if (!resolved) { out.push(account); continue }
+          const parsed = JSON.parse(resolved.value) as { access_token?: unknown }
+          const masked = typeof parsed.access_token === 'string'
+            ? maskQiniuKey(parsed.access_token)
+            : ''
+          out.push({ ...account, ...(masked === '' ? {} : { qiniuKeyMask: masked }) })
+        } catch {
+          // 凭据损坏/未配置：保留原条目（卡片自行报错说明）。
+          out.push(account)
+        }
+      }
+      return out
+    }
     return [...accounts]
   }
 
@@ -4035,6 +4079,16 @@ function registerJetHubEndpoints(
     //    返回 `undefined` 让主 switch 继续匹配。
     if (method.startsWith('modelscope.')) {
       const handled = await handleModelscopeRpc(ctx, pool as never, method, payload)
+      if (handled !== undefined) return handled
+    }
+    // ⚠️ **本 fork 独有**（qiniu，2026-10-29）：与 modelscope 同款 —— 「不跳浏览器、
+    //    手工粘贴 API Key」的 provider 必须有自己的前缀改道分支，且必须在 `switch`
+    //    之前、对不认识的方法返回 `undefined` 让主 switch 继续匹配。
+    //    ⚠️ 漏本分支的症状是「面板出现但永远加不了账号、零日志」：
+    //    `qiniu.addAccount` 落进 `default` 回 `unknown method`，而客户端
+    //    `account.create` 也没有 qiniu 分支 ⇒ 报 `unknown provider: qiniu`。
+    if (method.startsWith('qiniu.')) {
+      const handled = await handleQiniuRpc(ctx, pool as never, method, payload)
       if (handled !== undefined) return handled
     }
     switch (method) {

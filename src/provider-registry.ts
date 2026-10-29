@@ -867,6 +867,36 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
     channel: true,
   },
   {
+    id: 'qiniu',
+    label: 'Qiniu (七牛云)',
+    displayName: 'Qiniu (七牛云)',
+    logoClass: 'qiniu',
+    // ⚠️⚠️ **balance: false 是实测结论，不是「还没接线」**（2026-10-29）。
+    //
+    // 七牛云 AI（Token Plan MaaS）的用量与计费**只在控制台可见**：官方文档与
+    // 全站 REST 端点实测均**无余额/额度查询接口**，也没有签到端点（订阅额度按周
+    // 刷新、周期内清零不结转；免费活动额度才是按日）。
+    // ⇒ src/qiniu-credits.ts **刻意不存在**，provider-credits.ts 的 creditsTable
+    //   也不登记它。「查不到」与「没接线」的区别必须留在注释里，否则后人会把
+    //   本条当成漏登记，去补一个编造的余额读数。
+    //
+    // ⚠️ 连带影响（三处都已按此判据处理，别只改这里）：
+    //   - 不进 aggregate-expiry.ts 的 WIRED_EXPIRY_PROVIDERS（无余额 ⇒ 无临期档
+    //     可折算），并在 expiry-runtime-parity.spec.ts 的 NOT_EXPIRY_WIRED 登记；
+    //   - 不进 credits-balance-self-heal.spec.ts 的正向派生判据（那条按
+    //     credits.balance === true 过滤），但仍须在 SELF_HEAL_EXEMPT 显式豁免。
+    credits: { balance: false, dailyCheckin: false },
+    // ⚠️ **rateLimit 省略（= true）**：本适配器**确实会写** modelRateLimits
+    //   （src/qiniu-adapter.ts 的 qiniuRetryAfterMs：429 走指数退避、额度类对齐
+    //   UTC+8 次日零点），接线层也注入了 markLimited ⇒ 「重测 / 重置」两个按钮
+    //   都该保留。与 modelscope 的 rateLimit: false（用户取舍关闭入口）**不同源**，
+    //   不要照抄成 false。
+    // ⚠️ 不登记 accountTest / creditPackages / permanentLock / usesExpiryWindow
+    //    —— 全部省略 = false，与能力实情一致。
+    // ⚠️ 不登记 settingsNamespace：它不在老契约（≤0.1.6）的 namespace 清单里。
+    channel: true,
+  },
+  {
     id: 'codely',
     label: 'Codely (Unity)',
     displayName: 'Codely (Unity)',
