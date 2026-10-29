@@ -12,14 +12,15 @@
  */
 
 import { describe, expect, it } from 'vitest'
+import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import {
   handleQiniuRpc,
   isQiniuAccountRef,
   qiniuSlotNamesOf,
 } from '../../src/qiniu-rpc.js'
 
-const KEY_A = 'sk-AAAAAAAAAAAAAAAA1111'
-const KEY_B = 'sk-BBBBBBBBBBBBBBBB2222'
+const KEY_A = 'qiniu-AAAAAAAAAAAAAAA1111'
+const KEY_B = 'qiniu-BBBBBBBBBBBBBBBB2222'
 
 interface FakeAccount { id: string; enabled: boolean; credentialRef: string; nickname?: string }
 
@@ -50,6 +51,48 @@ describe('qiniuSlotNamesOf：id 与 ref 由 Key 尾 8 位派生', () => {
     const a = qiniuSlotNamesOf(KEY_A)
     expect(qiniuSlotNamesOf(KEY_A)).toEqual(a)
     expect(qiniuSlotNamesOf(KEY_B).id).not.toBe(a.id)
+  })
+
+  it('★★ 末 8 位含 `.`/`-` 的 Key ⇒ ref 仍是合法标识符（否则 credentialRef 直接抛）', () => {
+    // 形状闸 `KEY_PATTERN` 放行 `[A-Za-z0-9_.-]`（刻意不绑死前缀），而宿主
+    // `credentialRef()` 只认 `/^[A-Za-z_][A-Za-z0-9_]*$/`。旧实现直接拼尾段
+    // ⇒ `QINIU_ACCOUNT_BBB-CCDD` 一进 credentialRef 就抛
+    //   `credential ref "…" must match /^[A-Za-z_][A-Za-z0-9_]*$/`
+    // ⇒ 任何这样的 Key 都加不进账号，用户只看到一句英文正则。
+    // 判据必须打到**真 credentialRef()** 上：用 Map 替身会吞掉这个 TypeError
+    // （这正是本缺陷此前全绿的成因）。
+    for (const apiKey of [
+      'QQQQQQQQQQQQQQQ.bbb-ccdd',
+      'WWWWWWWWWWWWWWW.XYZ-9999',
+      'EEEEEEEEEEEEEEE_______', // 纯下划线尾段：合法标识符，不该被归一化
+    ]) {
+      const { id, refName } = qiniuSlotNamesOf(apiKey)
+      expect(refName, `「${apiKey}」派生出的 ref 不是合法标识符`)
+        .toMatch(/^[A-Za-z_][A-Za-z0-9_]*$/)
+      expect(() => credentialRef(refName), '真 credentialRef 抛错 ⇒ 账号永远加不进来').not.toThrow()
+      expect(credentialRef(refName)).toBe(refName)
+      // id 侧不受影响（id 不是标识符，允许带 `-`）
+      expect(id).toBe('qiniu-' + apiKey.slice(-8).toLowerCase())
+    }
+  })
+
+  it('★★ 归一化后同名但 Key 不同的两条不得撞成同一个 ref（撞了会互相覆盖凭据）', () => {
+    // `…bbb-ccdd`（要归一化）与 `…bbb_ccdd`（本来就合法）归一化后裸尾段相同；
+    // 若归一化那条只剥字符不加哈希，两条会得到同一个 ref ⇒ 后加的 Key 覆盖
+    // 前一条的凭据（账号还在，但连的已经是另一个 Key）。哈希腿就是为这一格加的。
+    const dashed = qiniuSlotNamesOf('QQQQQQQQQQQQQQQ.bbb-ccdd')
+    const underscored = qiniuSlotNamesOf('WWWWWWWWWWWWWWW.bbb_ccdd')
+    expect(dashed.refName).not.toBe(underscored.refName)
+    // ⚠️ 反过来：**尾 8 位完全相同的两条 Key 仍复用同一账号**（按尾段派生是本
+    //    设计的一部分，不是缺陷）—— 这一格刻意断言相等，防止把去重逻辑改坏。
+    expect(qiniuSlotNamesOf('AAAAAAA_bbb_ccdd').refName)
+      .toBe(qiniuSlotNamesOf('BBBBBBB_bbb_ccdd').refName)
+  })
+
+  it('★ 尾段本来就合法的 Key ⇒ ref 逐字节不变（保护存量凭据引用）', () => {
+    // 老账号的 credentialRef 是 `QINIU_ACCOUNT_<尾8大写>`；若把合法尾段也
+    // 加上哈希后缀，全部存量账号会被当成新账号另建一条（凭据不再被引用）。
+    expect(qiniuSlotNamesOf(KEY_A).refName).toBe('QINIU_ACCOUNT_' + KEY_A.slice(-8).toUpperCase())
   })
 
   it('★ ref 前缀必须是 QINIU（jet-hub-store 的 REF_PREFIX_TO_PROVIDER 靠它反推）', () => {
@@ -99,7 +142,7 @@ describe('qiniu.addAccount', () => {
 
   it('★ 形状闸门不绑死 sk- 前缀（上游换发前缀时不得把新 Key 全数拒收）', async () => {
     const h = makeHarness()
-    const oc = 'oc_sk_abcdefghijklmnop1234'
+    const oc = 'zz_newprefix_abcdefghijklmnop1234'
     const result = await handleQiniuRpc(h.ctx, h.pool, 'qiniu.addAccount', { apiKey: oc }) as any
     expect(result.ok, 'Issue IKPLRU：绑死 ^sk- 会让换发前缀的新 Key 一个都加不进来').toBe(true)
   })

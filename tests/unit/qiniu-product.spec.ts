@@ -154,10 +154,12 @@ describe('classifyQiniuError：顺序即优先级', () => {
 
 describe('qiniuHeaders：Accept 按用途区分', () => {
   it('对话默认 text/event-stream，列举模型传 application/json', () => {
-    expect(qiniuHeaders('sk-abcdefghijklmnop').accept).toBe('text/event-stream')
-    expect(qiniuHeaders('sk-abcdefghijklmnop', 'application/json').accept).toBe('application/json')
-    const headers = qiniuHeaders('sk-abcdefghijklmnop')
-    expect(headers.authorization).toBe('Bearer sk-abcdefghijklmnop')
+    // ⚠️ 字面量刻意不带 `sk-` 形态：仓库的 repo-pii-guard 会把 `sk-` + 16 位以上判成
+    //    泄漏密钥；qiniu 的 KEY_PATTERN 是 `[A-Za-z0-9_.-]{16,}`，本来就不要求前缀。
+    expect(qiniuHeaders('qiniu-fakekey-abcdefghij').accept).toBe('text/event-stream')
+    expect(qiniuHeaders('qiniu-fakekey-abcdefghij', 'application/json').accept).toBe('application/json')
+    const headers = qiniuHeaders('qiniu-fakekey-abcdefghij')
+    expect(headers.authorization).toBe('Bearer qiniu-fakekey-abcdefghij')
     expect(headers['content-type']).toBe('application/json')
   })
 })

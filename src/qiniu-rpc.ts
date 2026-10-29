@@ -38,6 +38,7 @@
  * @module src/qiniu-rpc.ts
  */
 
+import { createHash } from 'node:crypto'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import type { Context } from '@deepseek-ai/cordis'
 import type { ProviderAccountEntry } from './types.js'
@@ -96,16 +97,38 @@ export interface QiniuPoolLike {
  */
 const KEY_PATTERN = /^[A-Za-z0-9_.-]{16,}$/
 
-/** 账号 id / credentialRef 由 Key 尾段派生，使重复 Key 落到同一账号。 */
+/**
+ * 账号 id / credentialRef 由 Key 尾段派生，使重复 Key 落到同一账号。
+ *
+ * ⚠️⚠️ **ref 名必须是合法标识符**（2026-10-29 审计 P1）：宿主的
+ * `credentialRef()` 只认 `/^[A-Za-z_][A-Za-z0-9_]*$/`（见
+ * `node_modules/@deepseek-ai/dsh-credentials` 的 `REF_PATTERN`），而本家的
+ * Key 形状闸放行 `[A-Za-z0-9_.-]`（**刻意不绑死前缀**，见 `KEY_PATTERN`）⇒
+ * 末 8 位含 `.`/`-` 的 Key 会把 `QINIU_ACCOUNT_` 拼成 `QINIU_ACCOUNT_BBB-CCDD`，
+ * 这个串一进 `credentialRef()` 就 **抛 TypeError**：
+ *
+ * ```text
+ * credential ref "QINIU_ACCOUNT_BBB-CCDD" must match /^[A-Za-z_][A-Za-z0-9_]*$/
+ * ```
+ *
+ * 后果是「任何末 8 位带连字符/点的 Key 都加不进账号」，用户看到一句英文正则 ——
+ * 与 opencode 的 Issue IKPLRU 同型（形状闸放宽后派生侧没跟上），故修法照抄
+ * `src/opencode-rpc.ts:208-221`：
+ *
+ * - **尾段本来就合法** ⇒ 逐字节不变（保护存量凭据引用，否则老账号会被当成新账号）；
+ * - **尾段不合法** ⇒ 剥掉非标识符字符 + 追加 key 的 sha256 前 8 位，
+ *   使 `…bb-ccdd` 与 `…bb_ccdd` 不会撞成同一个 ref（撞了会后者覆盖前者凭据）。
+ */
 export function qiniuSlotNamesOf(apiKey: string): { id: string; refName: string } {
   const tail = apiKey.slice(-8)
-  return {
-    id: `${QINIU.id}-${tail.toLowerCase()}`,
-    // ⚠️ 前缀必须是 `QINIU` —— `jet-hub-store.ts` 的
-    // `REF_PREFIX_TO_PROVIDER` 按它反推 provider，漏登记会让
-    // `QINIU_ACCOUNT_*` 的账号在 `state.json` 缺失时**静默消失**。
-    refName: `QINIU_ACCOUNT_${tail.toUpperCase()}`,
-  }
+  const upper = tail.toUpperCase()
+  // ⚠️ 前缀必须是 `QINIU` —— `jet-hub-store.ts` 的
+  // `REF_PREFIX_TO_PROVIDER` 按它反推 provider，漏登记会让
+  // `QINIU_ACCOUNT_*` 的账号在 `state.json` 缺失时**静默消失**。
+  const refName = /^[A-Z0-9_]*$/.test(upper)
+    ? `QINIU_ACCOUNT_${upper}`
+    : `QINIU_ACCOUNT_${upper.replace(/[^A-Z0-9_]/g, '')}_${createHash('sha256').update(apiKey).digest('hex').slice(0, 8).toUpperCase()}`
+  return { id: `${QINIU.id}-${tail.toLowerCase()}`, refName }
 }
 
 /**

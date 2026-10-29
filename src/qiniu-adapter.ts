@@ -46,7 +46,12 @@
  * @module src/qiniu-adapter.ts
  */
 
-import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import {
+  CONTEXT_WINDOW_EXCEEDED_CODE,
+  LlmAdapter,
+  LlmError,
+  ReasoningEffortId,
+} from '@deepseek-ai/dsh-llm'
 import type {
   GenerateOptions,
   LlmModelInfo,
@@ -753,13 +758,24 @@ export class QiniuAdapter extends LlmAdapter {
           ? {}
           : { 'retry-after': response.headers.get('retry-after') as string }),
       })
+      // ⚠️⚠️ **上下文超限必须归 `CONTEXT_WINDOW_EXCEEDED`**（2026-10-29 审计 P2）。
+      //    此前这一格落进 `httpErrorCode(status)`，而七牛云超限时回 **HTTP 400**
+      //    ⇒ `httpErrorCode(400)` = `'INVALID_REQUEST'` ⇒ 宿主的
+      //    `context-overflow` 监听器（判据第一行是
+      //    `if (failure.code !== CONTEXT_WINDOW_EXCEEDED_CODE) return next()`）
+      //    **完全不触发** ⇒ 自动压缩不跑、用户只看到一句「请求无效」，
+      //    唯一有效动作（压缩上下文重试）被掩盖。与 `gemini-adapter.ts:888` 同修法。
+      //    ⚠️ 轮换层已单独处理 `context_window`（不换号、不写标记，见上），
+      //    两条口径一致：**请求太大换账号没用**。
       const code = info.kind === 'quota'
         ? 'QUOTA_EXCEEDED'
         : info.kind === 'rate_limit'
           ? 'RATE_LIMIT'
-          : info.kind === 'auth'
-            ? 'AUTH'
-            : httpErrorCode(response.status)
+          : info.kind === 'context_window'
+            ? CONTEXT_WINDOW_EXCEEDED_CODE
+            : info.kind === 'auth'
+              ? 'AUTH'
+              : httpErrorCode(response.status)
       throw new LlmError(
         `qiniu: HTTP ${response.status} — ${text.slice(0, 300)}`,
         code,

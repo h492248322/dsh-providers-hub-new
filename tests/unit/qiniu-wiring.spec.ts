@@ -61,7 +61,7 @@ describe('Qiniu 接线完整性', () => {
 
     const listIds = async (pool: never) => {
       const adapter = new QiniuAdapter({
-        slots: async () => [{ id: 'a1', apiKey: 'sk-0123456789abcdefghij' }],
+        slots: async () => [{ id: 'a1', apiKey: 'qiniu-testkey-0123456789abcdef' }],
         product: QINIU,
         accountPool: pool,
         fetchRemoteCatalog: fakeFetch,

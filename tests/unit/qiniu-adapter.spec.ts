@@ -13,10 +13,11 @@
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { CONTEXT_WINDOW_EXCEEDED_CODE } from '@deepseek-ai/dsh-llm'
 import { QiniuAdapter, classifyQiniuFailure, qiniuRetryAfterMs } from '../../src/qiniu-adapter.js'
 import { QINIU } from '../../src/qiniu-product.js'
 
-const KEY = 'sk-0123456789abcdefghij'
+const KEY = 'qiniu-testkey-0123456789abcdef'
 
 /** 把若干 SSE 文本行做成一个 ReadableStream（模拟上游响应体）。 */
 function sseStream(rows: string[]): ReadableStream<Uint8Array> {
@@ -106,12 +107,23 @@ describe('stream：错误分派与错误码', () => {
     }))
     const adapter = makeAdapter({ markLimited })
     let message = ''
+    let code: string | undefined
     try {
       await drain(adapter.stream({ model: 'deepseek-v3', messages: [{ role: 'user', content: 'hi' }] } as never))
-    } catch (error) { message = (error as Error).message }
+    } catch (error) {
+      message = (error as Error).message
+      code = (error as { code?: string }).code
+    }
     expect(markLimited, '超限写冷却标记 ⇒ 用户只是消息太长却被封账号一整天').not.toHaveBeenCalled()
     expect(calls, '超限换号无意义（请求本身太大），白发一次请求').toBe(1)
     expect(message.length).toBeGreaterThan(0)
+    // ⚠️⚠️ 错误码也必须是 CONTEXT_WINDOW_EXCEEDED（2026-10-29 审计 P2）：
+    //    七牛云超限回 **HTTP 400**，若落进 httpErrorCode(400) 就是 INVALID_REQUEST，
+    //    而宿主 context-overflow 监听器第一行就是「code !== CONTEXT_WINDOW_EXCEEDED_CODE
+    //    就 return next()」⇒ **自动压缩永不触发**，用户只看到「请求无效」。
+    //    判据只断言 message 时这里恒绿（这正是本缺陷原先全绿的形态）。
+    expect(code, '不是 CONTEXT_WINDOW_EXCEEDED ⇒ harness 压缩重试不跑，唯一有效动作被掩盖')
+      .toBe(CONTEXT_WINDOW_EXCEEDED_CODE)
   })
 
   it('★★ 额度错误必须用字面量 QUOTA_EXCEEDED（harness 的 QUOTA 会吞掉 message）', async () => {
@@ -133,7 +145,7 @@ describe('stream：错误分派与错误码', () => {
     }))
     const adapter = makeAdapter({
       markLimited,
-      slots: async () => [{ id: 'a1', apiKey: KEY }, { id: 'a2', apiKey: 'sk-OTHERKEY0000000000' }],
+      slots: async () => [{ id: 'a1', apiKey: KEY }, { id: 'a2', apiKey: 'qiniu-otherkey-0000000000' }],
     })
     let code: string | undefined
     let message = ''
@@ -161,7 +173,7 @@ describe('stream：错误分派与错误码', () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response('{"error":{"message":"Invalid API Key"}}', { status: 401 })))
     const adapter = makeAdapter({
       markLimited,
-      slots: async () => [{ id: 'a1', apiKey: KEY }, { id: 'a2', apiKey: 'sk-OTHERKEY0000000000' }],
+      slots: async () => [{ id: 'a1', apiKey: KEY }, { id: 'a2', apiKey: 'qiniu-otherkey-0000000000' }],
     })
     let code: string | undefined
     try {
@@ -179,7 +191,7 @@ describe('stream：错误分派与错误码', () => {
       return new Response('{"error":{"message":"invalid_parameter_error"}}', { status: 400 })
     }))
     const adapter = makeAdapter({
-      slots: async () => [{ id: 'a1', apiKey: KEY }, { id: 'a2', apiKey: 'sk-OTHERKEY0000000000' }],
+      slots: async () => [{ id: 'a1', apiKey: KEY }, { id: 'a2', apiKey: 'qiniu-otherkey-0000000000' }],
     })
     let code: string | undefined
     try {
@@ -230,7 +242,7 @@ describe('stream：错误分派与错误码', () => {
       throw Object.assign(new Error('The operation was aborted'), { name: 'AbortError' })
     }))
     const adapter = makeAdapter({
-      slots: async () => [{ id: 'a1', apiKey: KEY }, { id: 'a2', apiKey: 'sk-OTHERKEY0000000000' }],
+      slots: async () => [{ id: 'a1', apiKey: KEY }, { id: 'a2', apiKey: 'qiniu-otherkey-0000000000' }],
     })
     let code: string | undefined
     try {
