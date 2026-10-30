@@ -3,10 +3,10 @@
 
 ## OpenCode V2 协议更新
 
-- 推理/目录端点改为 `https://opencode.ai/inference/v1`；默认 UA 为 `opencode/latest/2.0.29/cli`。⚠️ UA **不是**门禁的一部分（见下方逐变量矩阵）：`opencode/1.18.22` 在其余两项正确时照样 200，改成 `latest/<v>/cli` 只为外形一致，别再写成「不换就 403」。
+- 推理/目录端点改为 `https://opencode.ai/inference/v1`；默认 UA 为 `opencode/latest/2.1.1/cli`（2026-10-27 与官方 v2 通道对齐；⚠️ 仍不是门禁项）。⚠️ UA **不是**门禁的一部分（见下方逐变量矩阵）：`opencode/1.18.22` 在其余两项正确时照样 200，改成 `latest/<v>/cli` 只为外形一致，别再写成「不换就 403」。
 - session 外形仍是 `ses_ + 12hex + 14base62`，但首段必须按 `~(timestamp * 0x1000 + 1)` 的低 48 位生成，不能使用裸时间戳或随机 hex。
 - V2 不发送旧 `x-opencode-request`（⚠️ **它在场即 403**，即使 affinity 头齐全）；四个 session 头复用同一 session，但其中**只有 `x-opencode-session-id` 是必需的**。
-- 门禁工具**只保留 `read`**（名字与 `path/offset/limit` 参数 schema 必须保持上游形态，改名或空 properties 会 403）；不再注入 `shell`。⚠️ 「不再发显式 `tool_choice:none`」**与门禁无关**（实测 V2 接受 `none`/`auto`/`required`/`function` 全部 200），只是因为它**没有约束力**：同一句「读取 /tmp/a.txt」在 `tool_choice:none` 下后端照样产出 `read` 调用 —— 只发一条描述也拦不住。故「未启用工具」的不变式**必须**由响应层逐调用强制。
+- 门禁工具**整套发送**（`edit` / `glob` / `grep` / `question` / `read` / `shell` / `skill` / `subagent` / `webfetch` / `websearch` / `write` / `execute`），名字与参数 schema 必须保持上游形态（改名或空 properties 会 403）；顶层描述统一替换成「禁止调用」（描述不参与判定）。⚠️ 早先「只保留 `read` 也能放行」是当时的实测边界；2026-10-27 起按官方客户端的完整工具集对齐，工具集本身也是形状的一部分。⚠️ 「不再发显式 `tool_choice:none`」**与门禁无关**（实测 V2 接受 `none`/`auto`/`required`/`function` 全部 200），只是因为它**没有约束力**：同一句「读取 /tmp/a.txt」在 `tool_choice:none` 下后端照样产出 `read` 调用 —— 只发一条描述也拦不住。故「未启用工具」的不变式**必须**由响应层逐调用强制。
 - **客户端工具别名统一使用 `dsh_` 前缀**。所有客户端工具（包括 edit/write）都映射；定义、历史调用、指定工具选择同步改名，调用 id、参数 schema、结果正文不变。响应名字跨帧拼接后还原，缺失 index 按调用身份归并；保留/未知/不完整名字**剔除该次调用**（见下），不交给宿主执行、也不整轮报错。
 - 归一只在 `src/opencode-stream.ts` 的 OpenCode 专用前置流中完成，**不修改共享 `src/openai-compat.ts`**；不新增 SSE 单事件大小上限。取消/提前结束须释放前置流及上游连接。
 - 保留账号池的指纹代次、代理同源 fetch、额度分类/换槽与思考档位。不擅自设置默认输出预算；DSH `system` 转成标准 chat system 消息，不注入 OpenCode 身份提示词。
@@ -40,9 +40,9 @@
 `mimo-v2.6-flash-free` / `nemotron-3.5-lightning-free` / `longcat-2.5-preview-free` /
 `space-bunny-free`。
 
-### ⚠️⚠️ 保留门禁工具会被模型真的调用：只能「剔除」，不能整轮报错
+### ⚠️⚠️ 保留的内置工具会被模型真的调用：只能「剔除」，不能整轮报错
 
-`toolsDisabled`（调用方没传工具）时线上仍必须广告门禁 `read`，而模型**会**去调它 ——
+`toolsDisabled`（调用方没传工具）时线上仍必须广告整套内置工具（含 `read`），而模型**会**去调它们 ——
 同一句「读取 /tmp/a.txt」，`big-pickle` **多次**产出 `read{path:"/tmp/a.txt"}`
 （3 次独立观测，含一次完整 SSE 实录，见 `tests/fixtures/opencode-gate-call.sse.txt`；
 ⚠️ **非必然**：另有一次它直接作答、未调工具，故用例把它写成「两种收尾都算过」）。
@@ -68,9 +68,9 @@
 
 | 用户看到 | 实际根因 | 证据 |
 |---|---|---|
-| 一条回复**几乎没有正文**，却提示「已达到输出 token 上限」/「回答被截断…发送"继续"」 | **模型唯一意图是调门禁 `read`**，该调用被剔除 ⇒ 消费器报 `max-tokens` | 真机 fixture 34 帧里 `content` 分片 **0 个**（只有 reasoning）⇒ 客户端那句「已有输出保留在对话中」是**假话**；客户端 bundle 里没有任何「工具调用被剔除」文案（grep 零命中），用户唯一可见信号就是这条 token 提示 |
+| 一条回复**几乎没有正文**，却提示「已达到输出 token 上限」/「回答被截断…发送"继续"」 | **模型唯一意图是调某个内置工具（最常见 `read`）**，该调用被剔除 ⇒ 消费器报 `max-tokens` | 真机 fixture 34 帧里 `content` 分片 **0 个**（只有 reasoning）⇒ 客户端那句「已有输出保留在对话中」是**假话**；客户端 bundle 里没有任何「工具调用被剔除」文案（grep 零命中），用户唯一可见信号就是这条 token 提示 |
 
-⇒ 遇到该症状**先查宿主日志**（`[codearts-auth] opencode: 上游调用了保留门禁工具 read…`），
+⇒ 遇到该症状**先查宿主日志**（`[codearts-auth] opencode: 上游调用了保留的内置工具 read…`），
 不要按「输出上限」调 `maxTokens`：调大没用，模型下一轮还会去调它。
 真正的用户可见修复需要共享消费器新增一种 finish 变体（超本 PR 范围，**未做**）。
 
