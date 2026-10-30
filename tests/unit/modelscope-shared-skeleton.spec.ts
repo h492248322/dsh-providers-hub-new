@@ -51,7 +51,7 @@ function makeAdapter(pool: AccountPool, slots: number = 1): ModelscopeAdapter {
 
 describe('★★ modelscope 迁移到共享骨架：用户可见后果不变', () => {
   it('★★ 关闭单个模型 ⇒ 它从 listModels 消失，其余仍在', async () => {
-    const adapter = makeAdapter(makePool({ disabled: ['deepseek-ai/DeepSeek-V4.1-Flash'] }))
+    const adapter = makeAdapter(makePool({ disabled: ['deepseek-ai/DeepSeek-V4.1-Flash-1017'] }))
     const listed = await adapter.listModels(MODELSCOPE.id)
     const ids = listed.map((m) => m.id)
 
@@ -60,7 +60,7 @@ describe('★★ modelscope 迁移到共享骨架：用户可见后果不变', (
     expect(
       ids,
       '★★ 用户关掉的模型仍出现在选择器里 ⇒ 黑名单对 modelscope 静默失效',
-    ).not.toContain('deepseek-ai/DeepSeek-V4.1-Flash')
+    ).not.toContain('deepseek-ai/DeepSeek-V4.1-Flash-1017')
     // 且其余模型**仍在**（防「一关就整份清空」的假绿）。
     expect(ids.length).toBe(MODELSCOPE_FALLBACK_MODELS.length - 1)
   })
@@ -96,11 +96,11 @@ describe('★★ modelscope 迁移到共享骨架：用户可见后果不变', (
   })
 
   it('★ 全量视图（listAllModels）不套黑名单（设置页要看得到已关闭模型的开关）', async () => {
-    const adapter = makeAdapter(makePool({ disabled: ['deepseek-ai/DeepSeek-V4.1-Flash'] }))
+    const adapter = makeAdapter(makePool({ disabled: ['deepseek-ai/DeepSeek-V4.1-Flash-1017'] }))
     const all = adapter.listAllModels().map((m) => m.id)
     expect(
       all,
       '★ 全量视图被黑名单过滤 ⇒ 用户再也打不开那个模型（设置页没有入口）',
-    ).toContain('deepseek-ai/DeepSeek-V4.1-Flash')
+    ).toContain('deepseek-ai/DeepSeek-V4.1-Flash-1017')
   })
 })
