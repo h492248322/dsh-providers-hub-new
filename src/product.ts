@@ -8,8 +8,20 @@
  *
  * | 产品              | endpoint                    | platform       | genieVersion |
  * |-------------------|-----------------------------|----------------|--------------|
- * | CodeBuddy（中国） | https://copilot.tencent.com | ide            | —            |
- * | WorkBuddy（国际） | https://www.workbuddy.ai    | workbuddy-ai   | 5.5.2        |
+ * | CodeBuddy（中国） | https://copilot.tencent.com | ide            | 4.12.2       |
+ * | WorkBuddy（国际） | https://www.workbuddy.ai    | workbuddy-ai   | 5.8.4        |
+ *
+ * ⚠️⚠️ **`genieVersion` 是本表最关键的一列**：客户端发出去的 `X-IDE-Version` 与
+ * `User-Agent` 里的版本**都取它**（反编译实证见 `CODEBUDDY.clientVersion` 的注释）。
+ * 它来自客户端 `product.json` 的 `genieVersion`，**不是**同文件的 `version`
+ * （后者是 VS Code 基底版本，只在 `genieVersion` 缺失时兜底）。
+ * 实测值来源（2026-10-30）：
+ * - CodeBuddy：`CodeBuddy CN/resources/app/product.json` → `version=1.106.1`、`genieVersion=4.12.2`
+ * - WorkBuddy：`WorkBuddyAI/resources/app.asar.unpacked/cli/product.json` → `genieVersion=5.8.4`
+ *
+ * ⚠️ **本仓仍缺一个客户端会发的头：`X-Product-Version`**（= 客户端的
+ * `productVersion`，与 `platformVersion` 是两个量）。官方拦截器会发它，我们没发。
+ * 当前不发也能 200（实测），故先登记为缺口、不擅自新增未验证的信号。
  *
  * 关于「模型列表为何不能共用」：两者的**路径与响应解析完全相同**
  * （`GET /v3/config` → `data.data.models` / `data.data.agents`），
@@ -336,12 +348,26 @@ export const CODEBUDDY: BuddyProduct = {
   // 中国版只有一条产品线，无需按模型分档：全部模型沿用 IDE UA。
   userAgentByModelFamily: [],
   attributionName: 'CodeBuddy',
-  // ⚠️ 2026-10-30：IDE 版本由 `1.106.1` 升到 **`4.12.2`**（用户提供的客户端
-  // 实际版本）。`X-IDE-Version` 直接取它 ⇒ 值与真实客户端一致。
-  // ⚠️ UA 里的版本**必须与它同值**（改前两者都是 `1.106.1`，这是既有不变式）；
-  //    只改一处会造出「UA 说 1.106.1、头说 4.12.2」的自相矛盾指纹。
-  // ⚠️ `cliVersion`（`2.137.1`）是**另一个量**（CLI 版本 ≠ IDE 版本，改前就不相等）
-  //    ⇒ 刻意不动。
+  // ⚠️⚠️ **本值 = 客户端 `product.json` 的 `genieVersion`**（2026-10-30 反编译实证，
+  // 不是猜的）：`extensions/genie` 的 `getPlatformVersion()` 实现是
+  // ```js
+  // const product = JSON.parse(readFileSync(join(env.appRoot, 'product.json')))
+  // if (product.genieVersion) return product.genieVersion   // ← 优先
+  // return version                                          // 兜底 = product.json.version
+  // ```
+  // 而 `CustomHeadersHttpProxyInterceptor` 里：
+  // ```js
+  // if (ci.platformVersion) {
+  //   headers['X-IDE-Version'] = ci.platformVersion
+  //   setCodeBuddyVersion(ci.platformVersion)   // ← UA 用同一个值
+  // }
+  // ```
+  // ⇒ `X-IDE-Version` 与 `User-Agent` **同源**（都取 `genieVersion`）。
+  // ⚠️ 本机 `CodeBuddy CN/resources/app/product.json` 实测：
+  // `version = 1.106.1`（VS Code 基底）而 **`genieVersion = 4.12.2`**（产品版本）
+  // ⇒ 发 `1.106.1` 是**发错了字段**（那是兜底值，只有在 `genieVersion` 缺失时才用）。
+  // ⚠️ 交叉验证：`WorkBuddyAI/.../cli/product.json` 的 `genieVersion = 5.8.4`，
+  // 与客户端「关于」里显示的 5.8.4 一致 ⇒ 该字段确实是**对外报的版本**。
   clientVersion: '4.12.2',
   cliVersion: '2.137.1',
   defaultCredentialRef: 'BUDDY_ACCESS_TOKEN',
