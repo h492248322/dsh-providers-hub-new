@@ -108,7 +108,8 @@
     "@deepseek-ai/cosmokit": "^1.8.5",
     "@deepseek-ai/schemastery": "^3.18.4",
     "jose": "^6.1.3",
-    "undici": "^8.11.2"
+    "undici": "^8.11.2",
+    "wreq-js": "^3.2.0"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "~4.0.5",

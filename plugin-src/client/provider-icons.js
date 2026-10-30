@@ -210,6 +210,18 @@ const ZCODE_ICON = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAA
 const MODELSCOPE_ICON = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHJlY3Qgd2lkdGg9IjI0IiBoZWlnaHQ9IjI0IiByeD0iNSIgZmlsbD0iIzYyNEFGRiIvPjxwYXRoIGQ9Ik02IDE3VjdoMi42bDMuNCA1LjJMMTUuNCA3SDE4djEwaC0yLjR2LTZsLTMgNC42aC0uMmwtMy00LjZ2Nkg2eiIgZmlsbD0iI2ZmZiIvPjwvc3ZnPg==';
 
 /**
+ * Qiniu (七牛云) 面板图标（内联 SVG data URL，手绘）。
+ *
+ * ⚠️ **本 fork 独有**的 provider（上游仍无 qiniu）。
+ * ⚠️ **占位图标**：暂无七牛云官方 SVG，先用通用「蓝色圆角方块 + 白色 Q」占位，
+ *    **待补充**：换成七牛云官方图标后再删掉此占位（与 modelscope 同款内联 SVG 做法）。
+ * 图形：蓝色（#0A6CFF）圆角方块 + 白色 Q 字形（Qiniu 首字母）。
+ */
+const QINI_ICON = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHJlY3Qgd2lkdGg9IjI0IiBoZWlnaHQ9IjI0IiByeD0iNSIgZmlsbD0iIzBBNkNGRiIvPjxwYXRoIGQ9Ik0xMiA1LjZjLTIuOSAwLTUuMSAyLjItNS4xIDUuMXYyLjZjMCAyLjkgMi4yIDUuMSA1LjEgNS4xIDEuMyAwIDIuNS0uNSAzLjQtMS4zbDEuOSAxLjkgMS4yLTEuMi0xLjktMS45Yy44LS45IDEuMy0yLjEgMS4zLTMuNHYtMS44YzAtMi45LTIuMi01LjEtNS4xLTUuMXptMy41IDUuMXYxLjhjMCAuNy0uMiAxLjMtLjUgMS45bC0yLjMtMi4zIDEuMi0xLjIgMi4zIDIuM2MtLjItLjEtLjQtLjItLjctLjJ2LTIuM2MwLTEuNy0xLjMtMy0zLTNzLTMgMS4zLTMgM3YyLjZjMCAxLjcgMS4zIDMgMyAzIC45IDAgMS43LS40IDIuMy0xbDEuMiAxLjJjLS45LjgtMi4xIDEuMy0zLjUgMS4zLTIuNCAwLTQuMy0xLjktNC4zLTQuM3YtMi42YzAtMi40IDEuOS00LjMgNC4zLTQuM3M0LjMgMS45IDQuMyA0LjN6IiBmaWxsPSIjZmZmIi8+PC9zdmc+';
+
+
+
+/**
  * OpenCode 面板图标（内联 SVG data URL，手绘）。
  *
  * ⚠️ 与 Qoder / LobsterAI / TRAE 同款做法：opencode 没有可取的小图标资源，
@@ -330,6 +342,8 @@ export const PROVIDER_ICONS = {
   modelscope: MODELSCOPE_ICON,
   // ⚠️ 与 registry 的声明序一致：magicrew 紧邻 aggregate 之前（倒数第二）。
   magicrew: MAGICREW_ICON,
+  // ⚠️ **本 fork 独有**（七牛云）：占位图标（见 QINI_ICON 注释，待替换官方 SVG）。
+  qiniu: QINI_ICON,
   aggregate: AGGREGATE_ICON,
   // ⚠️ Codely（Unity，本 fork 独有）：UI 先行阶段（registry 里 channel:false），
   //    但图标键集合守卫按**全量** registry 比对 —— 漏加这行会红（而非渲染空白图标）。

@@ -43,12 +43,14 @@ it('共 24 条（23 个真渠道 + aggregate；codely 2026-10-22 已翻 channel:
     // ⚠️ 2026-10-20 合并 remote master 时 astudio 随上游并入（21 → 22 条），而本条
     //    期望值当时仍是上游的 21 ⇒ 变红。按**注册表事实**更正为 22（这条断言是
     //    「注册表没被误删」的唯一防线，数字必须跟着注册表走，不能反向改注册表凑数）。
+    // ⚠️ 2026-10-29：并入 **qiniu（七牛云）** ⇒ 23 → 24（同批 channel 22 → 23）。
+    //    数字必须跟着注册表走，不能反向改注册表凑数。
     // ⚠️ 2026-10-29 加 magicrew（超级麦吉国内站，第 23 个真渠道）：位置有硬要求
     //    （**紧邻 aggregate 之前 = 倒数第二**），由下面「声明序在 aggregate 之前」那条守着。
-    expect(PROVIDER_REGISTRY).toHaveLength(24)
+    expect(PROVIDER_REGISTRY).toHaveLength(25)
     // ⚠️ 2026-10-22（A6）：codely **已翻 `channel: true`** —— 它的推理 / 目录 / 余额 / 签到 / 续期全部已接线，
     //    而 `channel` 在生产代码里**零个读取点** ⇒ 原来那个 `false` 只是为了让守卫不变红而选的，它同时把 codely 挡在聚合目录之外。现在真实接线已完成，翻正。
-    expect(PROVIDER_REGISTRY.filter((d) => d.channel).length).toBe(23)
+    expect(PROVIDER_REGISTRY.filter((d) => d.channel).length).toBe(24)
     expect(
       PROVIDER_REGISTRY.find((d) => d.id === 'codely')?.channel,
       'codely 已接线完成，必须是 channel: true（否则它的模型永不进聚合目录）',

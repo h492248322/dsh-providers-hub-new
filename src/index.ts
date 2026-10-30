@@ -196,6 +196,13 @@ import { ModelscopeAuth } from './modelscope-auth.js'
 import { ModelscopeAdapter, registerModelscopeLlm } from './modelscope-adapter.js'
 import { MODELSCOPE } from './modelscope-product.js'
 import { modelscopeModelsUrl, modelscopeHeaders, type ModelscopeCredential } from './modelscope.js'
+// ⚠️ **本 fork 独有**的 provider（上游 rc.11 仍无 qiniu）。七牛云 AI 与 modelscope
+// **同格**：OpenAI 兼容 + 长期有效的静态 API Key（无 refresh、无余额端点），
+// 故整套实现是 modelscope 范式的镜像。见 `src/qiniu-product.ts` 模块头的出处表。
+import { QiniuAuth } from './qiniu-auth.js'
+import { QiniuAdapter, registerQiniuLlm } from './qiniu-adapter.js'
+import { QINIU } from './qiniu-product.js'
+import { qiniuModelsUrl, qiniuHeaders, type QiniuCredential } from './qiniu.js'
 import type { ZcodeCredential } from './zcode.js'
 import { GEMINI_DEFAULT_PROJECT, GEMINI_SESSION_LANE_SMOKE } from './gemini.js'
 import { createProviderCredits, creditsOf } from './provider-credits.js'
@@ -715,6 +722,16 @@ export const probeById: Record<string, NonNullable<ProviderRuntime['probe']>> = 
       product: MODELSCOPE,
       // ⚠️ 不传 `warn`：`probeById` 是**模块级**常量（在 `apply()` 之前求值），
       //    此处**没有 `ctx`**。与 cline / lobsterai 的 probe 条目同款。
+    }),
+  },
+  // 七牛云 AI（**本 fork 独有**）—— 与 modelscope 同格：静态 API Key、OpenAI 兼容。
+  // 探测同样只喂**这一份凭据**（单槽），不需要池；`fetchRemoteCatalog` 留空
+  // （`/v1/models` 实测免鉴权也回 200 ⇒ 目录探测不构成「凭据有效」的证据）。
+  qiniu: {
+    createProbeAdapter: (ref, credential) => new QiniuAdapter({
+      credentialRef: credentialRef(ref),
+      slots: async () => [{ id: QINIU.id, apiKey: (credential as QiniuCredential).access_token }],
+      product: QINIU,
     }),
   },
   // ZCode（智谱）→ Anthropic Messages 体 + 阿里云 captcha 参数。
@@ -4188,6 +4205,73 @@ export function apply(ctx: Context): void {
     // 那会让「同一语义两套判据」重现（本仓库红线），且会掩盖池没接上的缺陷。
   })
 
+  // ===== 七牛云 AI（Qiniu）—— **本 fork 独有** =====
+  //
+  // 与 modelscope **同格**：OpenAI 兼容协议 + 长期有效的静态 API Key ⇒ 无 OAuth、
+  // 无 refresh 端点、无余额端点（`credits.balance: false`）。故整套实现是
+  // modelscope 范式的逐字镜像（`src/qiniu-*.ts` 七个文件）。
+  //
+  // ⚠️ 与 modelscope 的**唯一实质差异**：`slots()` 里模型级限流判据完全一致，但
+  //    `fetchRemoteCatalog` 打在 `/v1/models` 上 —— 该端点**实测免鉴权也回 200**
+  //    ⇒ 「目录能读到」**不构成**凭据有效的证据（本仓库对这条一贯的要求，
+  //    见 officeace / opencode 的登记）。凭据有效性只由推理请求的真实结果判定。
+  //
+  // 服务名由 QiniuAuth 依 product.id 派生，注册为 ctx.qiniuAuth。
+  const qiniu = new QiniuAuth(ctx)
+  const qiniuAdapter = registerQiniuLlm(ctx, {
+    // 单凭据回退 ref：池里没有 qiniu 账号时用它（与其余 provider 同约定）。
+    credentialRef: credentialRef(QINIU.defaultCredentialRef),
+    // 槽序列由**接线层**解析好传进来（适配器不直接读凭据）。
+    // `modelId` 透传：据此过滤「该模型正处于限流窗口」的账号。
+    slots: async (modelId?: string) => {
+      const entries = await pool.listAccounts(QINIU.id)
+      const usable = await Promise.all(entries.map(async (entry) => {
+        if (!entry.enabled) return undefined
+        // ⚠️ 模型级限流标记：`modelId` 缺省时**不查**（目录路径刻意不传 ——
+        //    传了会让被限流的账号把整个目录一起拖空）。
+        if (modelId !== undefined && modelId.length > 0) {
+          const resetAt = entry.modelRateLimits?.[modelId]
+          if (typeof resetAt === 'number' && resetAt > Date.now()) return undefined
+        }
+        const resolved = await ctx.credentials.resolve(credentialRef(entry.credentialRef))
+        if (!resolved) return undefined
+        try {
+          const parsed = JSON.parse(resolved.value) as QiniuCredential
+          if (typeof parsed.access_token !== 'string' || parsed.access_token.length === 0) return undefined
+          return { id: entry.id, apiKey: parsed.access_token }
+        } catch {
+          return undefined
+        }
+      }))
+      return usable.filter((s): s is { id: string; apiKey: string } => s !== undefined)
+    },
+    accountPool: pool,
+    product: QINIU,
+    // 限流标记的**写入端**。⚠️ 读端（上面 `slots()` 里的 `modelRateLimits` 判据）
+    // 与写端必须成对存在 —— 只读不写 ⇒ 那段判据恒不命中（死代码）；
+    // 只写不读 ⇒ 标记写进池却永远不影响选号。与 modelscope / opencode 同款。
+    markLimited: async (slotId, modelId, resetAtMs) => {
+      await pool.updateModelRateLimit(slotId, modelId, resetAtMs)
+    },
+    // 远端目录：`GET https://api.qnaigc.com/v1/models`。失败回退
+    // `QINIU_FALLBACK_MODELS`（适配器的 `loadQiniuCatalog` 内部兜底，不会抛）。
+    // ⚠️ **必须带超时**：桌面版到外部域名的 fetch 可能永不 settle（opencode 的
+    //    真机事故 2026-10-02：没有超时 ⇒ listModels 永不返回 ⇒ 模型列表与徽标
+    //    同时空白）。超时后回退兜底表，UI 立刻可用。
+    fetchRemoteCatalog: (apiKey: string, signal?: AbortSignal) => fetch(qiniuModelsUrl(QINIU), {
+      headers: qiniuHeaders(apiKey),
+      signal: signal ?? AbortSignal.timeout(10_000),
+    }),
+    // 图片走 `readImage` 单一路径，逐模型按目录下发的模态声明（七牛云 `/v1/models`
+    // **不下发 modalities** ⇒ 见 `parseQiniuCatalog` 的说明：一律按文本声明，
+    // 宁可不给图也不静默幻觉 —— 与 accio 的纪律同源）。
+    readImage: makeReadImage(ctx),
+    // ⚠️ **黑名单与「关闭供应商」一律由共享骨架从账号池读走**（与 modelscope
+    //    2026-10-23 迁移同款）：不要在这里加回 `disabledModels` /
+    //    `providerClosed` 两个回调 —— 那会让「同一语义两套判据」重现（本仓库红线），
+    //    且会掩盖池没接上的缺陷。
+  })
+
   // 一次性修复**老账号**的昵称与凭据字段（与上面 WorkBuddy 的启动清理同类）。
   //
   // 早期实现把服务端的 `name` 直接当昵称用，而实测它是**自动生成的默认名**
@@ -5408,6 +5492,12 @@ async function fetchBalanceReading(
     //    退化到 `llm.listModels`（已按黑名单过滤）⇒ 「关闭整个 provider」时
     //    漏写黑名单 ⇒ 出现「provider 显示已关闭、模型却仍可选用」的矛盾态。
     modelscope: pruned(MODELSCOPE.id, modelscopeAdapter),
+    // ⚠️ **本 fork 独有**（qiniu，2026-10-29）。必须进这张表，理由与 modelscope
+    //    逐条相同：`provider.status` 的「已关闭」判据是 `total > 0 &&
+    //    disabled === total`，读的是 `listAllModels()` 那份**不套黑名单**的全量
+    //    目录。表里缺它 ⇒ 退化到已过滤的 `llm.listModels` ⇒「关闭整个 provider」
+    //    时漏写黑名单 ⇒「provider 显示已关闭、模型却仍可选用」的矛盾态。
+    qiniu: pruned(QINIU.id, qiniuAdapter),
     magicrew: pruned(MAGICREW.id, magicrewAdapter),
     // OfficeAce（华为 MaaS 云端直连）：目录静态 + 平台侧可用性，同其余渠道。
     officeace: pruned(OFFICEACE.id, officeAceAdapter),
@@ -5787,6 +5877,11 @@ async function fetchBalanceReading(
       // ⚠️ **本 fork 独有**的 provider（上游 rc.11 仍无 modelscope）。
       //    漏加这一行 = 它不出现在注册表里 ⇒ 续期/积分/探测三条链路全部静默失效。
       ['modelscope', modelscope],
+      // ⚠️ **本 fork 独有**的 provider（qiniu，2026-10-29）。
+      //    漏加这一行 = 它不出现在注册表里 ⇒ 续期/积分/探测三条链路全部静默失效
+      //    （`provider-runtime.ts` 的注册表是按本数组逐个 `registerProviderRuntime`
+      //    建的；主循环本身不需要改）。
+      ['qiniu', qiniu],
       // ⚠️ 超级麦吉（Magicrew，2026-10-29）：值必须是 `registerJetHubRpc` 的
       //    `auths.magicrew` 是**同一个对象**，否则守卫用例布在该实例上的 spy
       //    收不到本循环的调用（本仓库复发过 6 次）。
@@ -5978,6 +6073,11 @@ async function fetchBalanceReading(
     //    「客户端已登记但宿主没有同名键」⇒ zcode-wiring 的守卫会红，
     //    且 Jet Hub 的 modelscope 面板所有 RPC 全部 `unknown provider`。
     modelscope,
+    // ⚠️ **本 fork 独有**（qiniu，2026-10-29）：同款陷阱第 **六** 次。漏加 ⇒
+    //    客户端的 qiniu 面板所有 RPC 报 `unknown provider`，且
+    //    `credits-balance-self-heal.spec.ts` 的反向守卫（JetHubAuths 每个键
+    //    必须在自愈表或豁免表里）会红。
+    qiniu,
     // ⚠️ 超级麦吉（Magicrew，2026-10-29）：值必须是 `registerProviderRuntime` 那个
     //    registry 数组里 `['magicrew', magicrewAuth]` 的**同一个实例**，否则
     //    `provider-runtime-wiring.spec.ts` 布在该实例上的 spy 收不到调用。

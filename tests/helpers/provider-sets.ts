@@ -280,6 +280,11 @@ export const WRITES_RATE_LIMIT_PROVIDERS: readonly string[] = Object.freeze([
   //    （见 `modelscope-adapter.ts` 的 `modelscopeRetryAfterMs`）。漏登记 =
   //    标记写进去却在 `probeById` 里查不到 ⇒ 「重测 / 重置」清不掉（该陷阱已复发过）。
   'modelscope',
+  // ⚠️ **本 fork 独有**（qiniu，2026-10-29）：它**会写** `modelRateLimits`
+  //    （见 `qiniu-adapter.ts` 的 `qiniuRetryAfterMs`：429 指数退避 / 额度类对齐
+  //    UTC+8 次日零点）。漏登记 = 标记写进去却在 `probeById` 里查不到 ⇒
+  //    「重测 / 重置」清不掉（该陷阱已复发过五次）。
+  'qiniu',
   // ⚠️ accio（Accio 阿里，2026-10-18 / issue IKM3ZV）：接上请求级换号 + 冷却后
   //    **会写** `modelRateLimits`（额度至 UTC+8 当日 24:00 / 限流 1h）。
   //    它**曾**登记为「不写标记」，而那正是本 issue 的成因之一：换号接上后若漏本行，

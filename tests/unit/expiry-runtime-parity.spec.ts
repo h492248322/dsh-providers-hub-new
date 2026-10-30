@@ -263,6 +263,13 @@ const NOT_EXPIRY_WIRED = new Map<string, string>([
   //    假临期档。⚠️ 上游一旦开始下发到期时间，从本表删掉它并补
   //    三处（清单 + `createProviderExpiry()` + 折算原语）。
   ['codely', '上游余额报文**不下发任何到期时间**（codely-credits.ts 的 expiredTime/cycleEndTime 写死空串）⇒ 无临期档可折算'],
+  // ⚠️ **本 fork 独有**（qiniu，2026-10-29）：七牛云 AI **没有余额/额度查询
+  //    端点**（用量与计费只在控制台可见）⇒ `credits.balance: false` ⇒ 折算层
+  //    连「剩多少」都读不到，更谈不上临期档。缺的是**数据源**，不是接线：
+  //    强行加进清单只能编一个假数字（本仓库红线「绝不编造数字」）。
+  //    ⚠️ 上游一旦开放额度端点，从本表删掉它并补三处（清单 +
+  //    `createProviderExpiry()` + 折算原语）—— 走法与 codely 那条相同。
+  ['qiniu', '无余额端点（七牛云用量只在控制台可见）⇒ credits.balance: false，折算层读不到任何额度 ⇒ 无临期档可折算'],
 ])
 
   it('每个进了 AGGREGATE_CHANNELS 的真渠道都在 WIRED_EXPIRY_PROVIDERS 里（或已显式豁免）', () => {

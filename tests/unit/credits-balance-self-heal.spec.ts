@@ -699,6 +699,14 @@ describe('SELF_HEAL_REFRESHABLE_PROVIDERS 与真实分派的一致性', () => {
     // ⚠️ 判据「有没有 refresh 端点」与「余额能不能读」是**两件事**：
     //    正因为余额现在能读了，才更需要显式说明「仍不进 Set」的理由。
     ['modelscope', '无 refresh 端点：凭据是长期有效的静态 API Key（expires_at 可选、实测默认不过期）⇒ 没有「快过期」，自愈链无事可做（余额能读不等于能续期，两件事）'],
+    // ⚠️ **本 fork 独有**（qiniu，2026-10-29）：理由比 modelscope 更**彻底** ——
+    //    ① 凭据是长期有效的静态 API Key（官方明示 `sk-` 开头、无过期语义、
+    //       无 refresh 端点）⇒ 没有「快过期」；
+    //    ② `credits.balance: false`（七牛云**没有余额端点**，用量只在控制台可见）
+    //       ⇒ 积分端点压根不会为它触发自愈链。
+    //    两层独立理由都指向「无事可做」。⚠️ 必须显式登记：本表是**反向守卫**
+    //    （`JetHubAuths` 每个键都必须在自愈表或本表里），漏登记即红。
+    ['qiniu', '无 refresh 端点 + 无余额端点：凭据是长期有效的静态 API Key（sk- 开头、默认不过期）⇒ 没有「快过期」；credits.balance: false ⇒ 积分端点也不会为它触发自愈链'],
   ])
 
   it('★ Set 里的字面量恰好是 codearts / buddy / workbuddy（多一个少一个都红）', () => {

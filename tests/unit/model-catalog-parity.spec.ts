@@ -70,6 +70,8 @@ import { AUTOCLAW_INTL } from '../../src/autoclaw-product.js'
 import { MagicrewAdapter } from '../../src/magicrew-adapter.js'
 import { MAGICREW_FALLBACK_CONTEXT_WINDOW } from '../../src/magicrew-product.js'
 import { ModelscopeAdapter } from '../../src/modelscope-adapter.js'
+// ⚠️ **本 fork 独有**（qiniu/七牛云，2026-10-29）。
+import { QiniuAdapter } from '../../src/qiniu-adapter.js'
 import { CodelyAdapter } from '../../src/codely-adapter.js'
 import { ClineAdapter } from '../../src/cline-adapter.js'
 import { CodeArtsAdapter, CODEARTS_FALLBACK_CONTEXT_WINDOW } from '../../src/llm-adapter.js'
@@ -650,6 +652,21 @@ id: 'autoclaw',
         slots: async () => [{ id: 'modelscope', apiKey: 'ms-wire-test-key' }],
       } as never),
     },
+    {
+      // ⚠️ **本 fork 独有**（qiniu/七牛云，2026-10-29）。
+      // ⚠️ 同样**不注入 `fetchRemoteCatalog`**（注入了就真发网络）：不注入时
+      //    `loadQiniuCatalog` 回退 `QINIU_FALLBACK_MODELS`（那张表是 2026-10-29
+      //    直连 `/v1/models` 的实测快照，77 条带真实 `context_length`），本段因此零网络。
+      // ⚠️ `slots` 必须返回至少一个条目：`listModels` 的门控是「无槽位 ⇒ `[]`」。
+      id: 'qiniu',
+      make: () => new QiniuAdapter({
+        ...NO_CRED,
+        // ⚠️ 这里**不得**用 `sk-` 开头的字面量：`tests/unit/repo-pii-guard.spec.ts`
+        //    会把入库文件里的 sk- 风格串判成泄漏密钥（实测命中本行即红）。
+        //    qiniu 的 KEY_PATTERN 是 `[A-Za-z0-9_.-]{16,}`（刻意不绑死前缀），故此串合法。
+        slots: async () => [{ id: 'qiniu', apiKey: 'qiniu-wire-test-key-0123456' }],
+      } as never),
+    },
     // ⚠️ 超级麦吉（Magicrew，2026-10-29）：`channel: true` ⇒ 必须进本表，
     //    否则它不过本段任何对拍（目录 / 模态 / 窗口 / 档位全部零覆盖）。
     //    ⚠️ `fetchRemoteModels` 不给 ⇒ 走静态兜底表（27 条），那是**可预期**的目录；
@@ -764,7 +781,8 @@ id: 'autoclaw',
     const channels = PROVIDER_REGISTRY.filter(d => d.channel).map(d => d.id).sort()
     expect(CASES.map(c => c.id).sort()).toEqual(channels)
     // ⚠️ 2026-10-22（A6）：codely 翻 `channel: true` ⇒ 进本表：21 → 22。
-    expect(CASES).toHaveLength(23)
+    // ⚠️ 2026-10-29 **本 fork** 并入 qiniu（七牛云）+ master 并入 magicrew：22 → 23 → 24。
+    expect(CASES).toHaveLength(24)
   })
 
   it('★★ `catalog` 具备 `refresh` 的家，适配器上必须**存在** `refresh` 成员（转发接线）', () => {

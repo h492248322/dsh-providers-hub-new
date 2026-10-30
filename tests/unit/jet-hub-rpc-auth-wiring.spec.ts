@@ -89,6 +89,8 @@ const AUTH_SERVICE: Readonly<Record<string, string>> = {
   // ⚠️ **本 fork 独有**（modelscope，2026-10-16）。服务名同理由派生 ⇒ `modelscopeAuth`。
   //    该名字由 `provider-runtime-wiring.spec.ts` 的真跑 `apply()` 探针独立验证过。
   modelscope: 'modelscopeAuth',
+  // ⚠️ **本 fork 独有**（qiniu，2026-10-29）。服务名同理由派生 ⇒ `qiniuAuth`。
+  qiniu: 'qiniuAuth',
   // ⚠️ Codely（Unity，2026-10-22 A6）：服务名 `codelyAuth`（全小写，与 provider id 同形）。
   //    ⚠️ `CodelyAuth` 已从裸类改为 `extends Service`（否则 ctx 上永远没有
   //    `codelyAuth`，本表取不到实例）—— 见 `codely-auth-service.ts` 的类注释。
@@ -321,7 +323,8 @@ describe('★ registerJetHubRpc 的命名对象接线（真跑 apply + account.r
     //    同日 **本 fork** 并入 modelscope（魔搭）：18 → 19。
     // ⚠️ 2026-10-20 加 autoclawintl（AutoClaw 国际版）：19 → 20。
     // ⚠️ 2026-10-22（A6）：codely 已接入 auth（`CodelyAuth` 改为 Service + 接进 auths）：20 → 21。
-    expect(EXPECTED_AUTH_PROVIDER_IDS).toHaveLength(22)
+    // ⚠️ 2026-10-29 加 qiniu（七牛云）+ magicrew：21 → 22 → 23 个 auth 键。
+    expect(EXPECTED_AUTH_PROVIDER_IDS).toHaveLength(23)
     // 另一方向（原断言的**全部**证明力都在这条上，单独留着免得它随上面那条一起消失）：
     // 表里的每个键都必须是 registry 里真实存在的 provider id（防拼写错误造成的僵尸项）。
     for (const id of Object.keys(AUTH_SERVICE)) {

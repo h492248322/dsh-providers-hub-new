@@ -223,6 +223,12 @@ const CREDENTIAL_CONSTRUCTOR_SAMPLES: ReadonlySet<string> = new Set([
   'ms-wire-test-key',
   'sk-opencode-test-key-0123456789',
   'sk-opencode-disabled-key-0123456789',
+  // ⚠️ 2026-10-31 对抗审计收编的探针假 key（qiniu 泄漏面 / 闸门有牙性，
+  //    两个 spec 的构造样例）：形状合法但纯属构造，见
+  //    tests/unit/qiniu-credentials-leak-surface.spec.ts 与
+  //    tests/unit/opencode-bun-tls-gate.spec.ts 的文件头。
+  'sk-qiniu-SECRETKEY-a1b2c3d4e5f6',
+  'oc_sk_probe_aaaaaaaaaaaaaaaaaaaaaaaa',
   // ⚠️ **厂商公开的客户端参数**（不是秘密，见各处注释）：
   // - Gemini 的「已安装应用」client_id / client_secret（Google OAuth 公开客户端）
   // - AutoClaw 的静态 appKey（随智谱桌面端分发）
