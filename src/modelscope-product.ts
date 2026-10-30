@@ -413,13 +413,15 @@ function readableDetail(body: string): string {
 /**
  * 把一次失败的 HTTP 响应归类为语义化错误。
  *
- * ## ⚠️ 顺序即优先级（三条都来自本项目真实缺陷）
+ * ## ⚠️ 顺序即优先级（每条都来自本项目真实缺陷）
  *
- * 1. **限流/额度必须排在 auth 之前**：魔搭与同源的 chatanywhere 在额度耗尽时
- *    可能回 401/403 而不是 429（旧 fork `src/proxy/upstream.ts` 的
- *    `NON_RETRYABLE_CODES` 与 key-pool 的 `isQuotaLikeError` 就是为这个形态写的）。
- *    若先判状态码，用户看到的会是「API key 失效」——而他的唯一有效动作
- *    （等窗口恢复 / 换一个 key）被完全掩盖。
+ * 1. **⚠️ 401/403 先判，恒归 `auth`**（2026-10-31 对抗审计同批修，与 qiniu
+ *    `classifyQiniuError` 同步）：状态码与额度文案并存时**以状态码为准** ——
+ *    认证类是**账号态**、不是模型冷却，落 quota 会被 `markLimited` 写成
+ *    UTC+8 次日零点冷却，把认证故障放大成封池（loomy 2026-10-06「全池被封」
+ *    事故同型；不变式见 `docs/agent-notes/providers-loomy-raccoon-minimax.md`）。
+ *    原「额度耗尽可能回 401/403 故额度先判」的方向反了：宁可漏判额度
+ *    （不换号）不可误判成封号。
  * 2. **400 单独归 `invalid_request`**：魔搭对请求体形状极严格（见模块头的
  *    工具包装事故），把它归成 server/可重试会让 harness 白重试 5 次、
  *    每次都拿到同一个 400。
@@ -477,6 +479,8 @@ export function classifyModelscopeError(
     // ⚠️ `retryAfterMs` **刻意不给**：超限不是配额问题，重试无意义、也无处可退。
     return { kind: 'context_window', detail }
   }
+  // ⚠️ 认证先于额度/限流（不变式 1）：401/403 带额度文案 ⇒ 恒归 auth。
+  if (status === 401 || status === 403) return { kind: 'auth', detail }
   if (
     status === 429
     || lower.includes('too many requests')
@@ -507,7 +511,6 @@ export function classifyModelscopeError(
     return { kind: 'transport', detail }
   }
   if (status === 400 || status === 422) return { kind: 'invalid_request', detail }
-  if (status === 401 || status === 403) return { kind: 'auth', detail }
   if (status >= 500) return { kind: 'server', detail }
   return { kind: 'server', detail }
 }
