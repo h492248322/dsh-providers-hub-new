@@ -43,8 +43,8 @@ describe('产品配置', () => {
   })
 
   it('WorkBuddy 携带 pluginVersion 且 appendSessionParams 为 true', () => {
-    // 逆向自 WorkBuddyAI 5.5.2 的 cli/product.json
-    expect(WORKBUDDY.pluginVersion).toBe('5.5.2')
+    // 逆向自 WorkBuddyAI 5.9.4 的 cli/product.json
+    expect(WORKBUDDY.pluginVersion).toBe('5.9.4')
     expect(WORKBUDDY.appendSessionParams).toBe(true)
   })
 

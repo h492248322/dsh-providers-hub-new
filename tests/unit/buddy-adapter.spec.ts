@@ -3551,12 +3551,12 @@ describe('产品参数化', () => {
     }
 
     // 国际版独有模型线 → 国际版形态（平台段为 `WorkBuddy AI`）。
-    expect(await uaFor('gpt-5.6-sol')).toBe('WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2')
-    expect(await uaFor('gemini-3.5-flash')).toBe('WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2')
+    expect(await uaFor('gpt-5.6-sol')).toBe('WorkBuddy/5.9.4 WorkBuddy AI/5.9.4 CLI/5.9.4')
+    expect(await uaFor('gemini-3.5-flash')).toBe('WorkBuddy/5.9.4 WorkBuddy AI/5.9.4 CLI/5.9.4')
     // 国内系模型 → 国内客户端形态（平台段为 `WorkBuddy`）。
-    expect(await uaFor('glm-5.2')).toBe('WorkBuddy/5.5.2 WorkBuddy/5.5.2 CLI/5.5.2')
-    expect(await uaFor('hy3')).toBe('WorkBuddy/5.5.2 WorkBuddy/5.5.2 CLI/5.5.2')
-    expect(await uaFor('kimi-k3')).toBe('WorkBuddy/5.5.2 WorkBuddy/5.5.2 CLI/5.5.2')
+    expect(await uaFor('glm-5.2')).toBe('WorkBuddy/5.9.4 WorkBuddy/5.9.4 CLI/5.9.4')
+    expect(await uaFor('hy3')).toBe('WorkBuddy/5.9.4 WorkBuddy/5.9.4 CLI/5.9.4')
+    expect(await uaFor('kimi-k3')).toBe('WorkBuddy/5.9.4 WorkBuddy/5.9.4 CLI/5.9.4')
     // 未命中任何模型族规则 → 回落到 product.userAgent（默认国际版形态）。
     expect(await uaFor('deepseek-v4.1-flash')).toBe(WORKBUDDY.userAgent)
   })
