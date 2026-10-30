@@ -781,8 +781,8 @@ id: 'autoclaw',
     const channels = PROVIDER_REGISTRY.filter(d => d.channel).map(d => d.id).sort()
     expect(CASES.map(c => c.id).sort()).toEqual(channels)
     // ⚠️ 2026-10-22（A6）：codely 翻 `channel: true` ⇒ 进本表：21 → 22。
-    // ⚠️ 2026-10-29 **本 fork** 并入 qiniu（七牛云）+ master 并入 magicrew：22 → 23。
-    expect(CASES).toHaveLength(23)
+    // ⚠️ 2026-10-29 **本 fork** 并入 qiniu（七牛云）+ master 并入 magicrew：22 → 23 → 24。
+    expect(CASES).toHaveLength(24)
   })
 
   it('★★ `catalog` 具备 `refresh` 的家，适配器上必须**存在** `refresh` 成员（转发接线）', () => {

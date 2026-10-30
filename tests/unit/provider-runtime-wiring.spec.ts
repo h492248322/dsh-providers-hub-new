@@ -429,8 +429,8 @@ describe('★ index.ts 的能力注册表接线（行为断言，替代源码文
     //    减去 AUTH_EXEMPT 两项（opencode / aggregate）⇒ 19 个 auth 键。
     // ⚠️ 2026-10-20 加 autoclawintl（AutoClaw 国际版）：19 → 20 个 auth 键。
     // ⚠️ 2026-10-22（A6）：codely 翻 `channel: true`：20 → 21。
-    // ⚠️ 2026-10-29 加 qiniu（七牛云）+ magicrew：21 → 22 个 auth 键。
-    expect(shouldRegister, 'channel 集合变了，请复核 opencode 豁免是否仍成立').toHaveLength(22)
+    // ⚠️ 2026-10-29 加 qiniu（七牛云）+ magicrew：21 → 22 → 23 个 auth 键。
+    expect(shouldRegister, 'channel 集合变了，请复核 opencode 豁免是否仍成立').toHaveLength(23)
     expect(
       registeredRuntimeIds().sort(),
       'registry 里有账号的 provider 必须都注册进能力注册表（左侧多出 = 清单里多了僵尸项，' +

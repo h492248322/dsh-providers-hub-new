@@ -192,6 +192,22 @@ export async function bunTlsFetch(
   init: RequestInit,
   proxy: NormalizedProxy | undefined,
 ): Promise<Response> {
+  // ⚠️ **单测闸门**（2026-10-30 合并审计补）：`DSH_UNIT_TEST_NO_WREQ=1` 时一律
+  // 抛 {@link BunTlsUnavailableError}，让适配器走 `proxyFetch` 回退。
+  //
+  // 为什么必须有它：本机**装得到** `wreq-js` 时（Windows x64 等主流平台），
+  // 适配器单测的传输层桩（`vi.stubGlobal('fetch')` / `vi.mock('undici')`）
+  // 全部被本函数**绕过** ⇒ 几十条用例对上游真发请求，实测拿到 401
+  // `Invalid credential` / 429 `free_usage_limit`（真实上游响应），假红一片。
+  // 作者环境装不到 wreq-js、走回退恰好全绿 ⇒ 该缺陷在他机器上**不可见**。
+  //
+  // 闸门放在 `bunTlsFetch` 入口而不是 `loadWreq()` 里：加载器测试
+  // （`ensureBunTlsLoaded` 的两分支）不碰网络、保持真覆盖；e2e 用独立
+  // vitest 配置（`vitest.e2e.config.ts`，不注入该 env），真机验收不受影响；
+  // 生产环境不设该 env，行为逐字节不变。
+  if (process.env.DSH_UNIT_TEST_NO_WREQ === '1') {
+    throw new BunTlsUnavailableError('单测闸门 DSH_UNIT_TEST_NO_WREQ=1：禁用 Bun 指纹真传输层（单测禁止真发网络）')
+  }
   const module = await loadWreq()
   if (module === undefined) throw new BunTlsUnavailableError(wreqLoadError)
   const wreqInit: WreqRequestInit = {

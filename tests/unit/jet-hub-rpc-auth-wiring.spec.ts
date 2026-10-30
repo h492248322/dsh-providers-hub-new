@@ -323,8 +323,8 @@ describe('★ registerJetHubRpc 的命名对象接线（真跑 apply + account.r
     //    同日 **本 fork** 并入 modelscope（魔搭）：18 → 19。
     // ⚠️ 2026-10-20 加 autoclawintl（AutoClaw 国际版）：19 → 20。
     // ⚠️ 2026-10-22（A6）：codely 已接入 auth（`CodelyAuth` 改为 Service + 接进 auths）：20 → 21。
-    // ⚠️ 2026-10-29 加 qiniu（七牛云）+ magicrew：21 → 22 个 auth 键。
-    expect(EXPECTED_AUTH_PROVIDER_IDS).toHaveLength(22)
+    // ⚠️ 2026-10-29 加 qiniu（七牛云）+ magicrew：21 → 22 → 23 个 auth 键。
+    expect(EXPECTED_AUTH_PROVIDER_IDS).toHaveLength(23)
     // 另一方向（原断言的**全部**证明力都在这条上，单独留着免得它随上面那条一起消失）：
     // 表里的每个键都必须是 registry 里真实存在的 provider id（防拼写错误造成的僵尸项）。
     for (const id of Object.keys(AUTH_SERVICE)) {
