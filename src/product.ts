@@ -212,7 +212,7 @@ export interface BuddyProduct {
  * `src/buddy.ts` / `src/buddy-auth.ts` 改为从本模块取值后即可删除）：
  * - `platform: 'ide'`          ↔ `src/buddy.ts`  `PLATFORM`
  * - `productCode: 'codebuddy'` ↔ `src/buddy.ts`  `BUDDY_PRODUCT_CODE`
- * - `userAgent: 'CodeBuddyIDE/1.106.1'` ↔ `src/buddy.ts`  `BUDDY_USER_AGENT`
+ * - `userAgent: 'CodeBuddyIDE/4.12.2'` ↔ `src/buddy.ts`  `BUDDY_USER_AGENT`
  * - `defaultCredentialRef: 'BUDDY_ACCESS_TOKEN'` ↔ `src/buddy-auth.ts`  `BUDDY_CREDENTIAL_REF`
  * - `endpoint`/`apiDomain`     ↔ `src/buddy.ts`  `API_ENDPOINT` / `API_DOMAIN`
  *
@@ -332,11 +332,17 @@ export const CODEBUDDY: BuddyProduct = {
   webBase: 'https://www.workbuddy.cn',
   displayName: 'CodeBuddy (腾讯)',
   productCode: 'codebuddy',
-  userAgent: 'CodeBuddyIDE/1.106.1',
+  userAgent: 'CodeBuddyIDE/4.12.2',
   // 中国版只有一条产品线，无需按模型分档：全部模型沿用 IDE UA。
   userAgentByModelFamily: [],
   attributionName: 'CodeBuddy',
-  clientVersion: '1.106.1',
+  // ⚠️ 2026-10-30：IDE 版本由 `1.106.1` 升到 **`4.12.2`**（用户提供的客户端
+  // 实际版本）。`X-IDE-Version` 直接取它 ⇒ 值与真实客户端一致。
+  // ⚠️ UA 里的版本**必须与它同值**（改前两者都是 `1.106.1`，这是既有不变式）；
+  //    只改一处会造出「UA 说 1.106.1、头说 4.12.2」的自相矛盾指纹。
+  // ⚠️ `cliVersion`（`2.137.1`）是**另一个量**（CLI 版本 ≠ IDE 版本，改前就不相等）
+  //    ⇒ 刻意不动。
+  clientVersion: '4.12.2',
   cliVersion: '2.137.1',
   defaultCredentialRef: 'BUDDY_ACCESS_TOKEN',
   appendSessionParams: false,

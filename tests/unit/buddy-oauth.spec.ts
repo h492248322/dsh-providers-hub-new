@@ -469,7 +469,7 @@ describe('buddy fetchModels', () => {
     const [, init] = (fetcher as unknown as { mock: { calls: Array<[string, RequestInit]> } }).mock.calls[0]
     const headers = init.headers as Record<string, string>
     expect(headers['X-Product-Code']).toBe('codebuddy')
-    expect(headers['User-Agent']).toBe('CodeBuddyIDE/1.106.1')
+    expect(headers['User-Agent']).toBe('CodeBuddyIDE/4.12.2')
     // X-Product 是部署类型，两个产品共用 SaaS。
     expect(headers['X-Product']).toBe('SaaS')
   })

@@ -1884,7 +1884,7 @@ describe('BuddyAdapter credential handling', () => {
     expect(seen!.get('Authorization')).toBe('Bearer AT')
     expect(seen!.get('X-Domain')).toBe('copilot.tencent.com')
     expect(seen!.get('X-Product-Code')).toBe('codebuddy')
-    expect(seen!.get('User-Agent')).toBe('CodeBuddyIDE/1.106.1')
+    expect(seen!.get('User-Agent')).toBe('CodeBuddyIDE/4.12.2')
   })
 
   /**
