@@ -521,7 +521,24 @@ export async function fetchAgentCenterWindows(
   for (const item of agents) {
     if (typeof item !== 'object' || item === null) continue
     const a = item as Record<string, unknown>
-    const id = typeof a['id'] === 'string' ? a['id'] : undefined
+    /**
+     * ⚠️⚠️ **字段名是 `agent_id`，不是 `id`**（2026-10-30 真机实测修正）。
+     *
+     * 首版读 `a['id']` —— 上游 17 个 agent **一个都没有 `id` 键**，于是 `id`
+     * 恒 `undefined` ⇒ 直接 `return out` ⇒ **整条 AgentCenter 窗口腿静默失效**
+     * （只留一句「动态窗口不可用，退回静态兜底表」的 warn）。
+     *
+     * 实测键全集：`agent_id, original_id, domain_id, avatar_id, provider_id,
+     *  provider_name, agent_name, agent_type, agent_version, is_public, alias,
+     *  is_primary_agent, agent_order, …, is_system, status`
+     *
+     * ⇒ 兼容读两个键（`agent_id` 优先、`id` 兜底）：写死单个键会在上游改名时
+     * **静默失效**，而兜底一腿至少留一线。守卫见
+     * `codearts-agentcenter-windows.spec.ts` 的「agent_id 字段名」用例
+     * （用**真实上游形状**的 fixture，不是自造的 `id`）。
+     */
+    const rawId = a['agent_id'] ?? a['id']
+    const id = typeof rawId === 'string' ? rawId : undefined
     if (id === undefined || id.length === 0) continue
     if (a['is_primary_agent'] === true) { agentId = id; break }
     if (agentId === undefined) agentId = id
@@ -541,14 +558,36 @@ export async function fetchAgentCenterWindows(
     for (const item of gptsModels) {
       if (typeof item !== 'object' || item === null) continue
       const m = item as Record<string, unknown>
-      const id = typeof m['model_id'] === 'string' ? m['model_id'] : ''
+      /**
+       * ⚠️⚠️ **`gpts.models[]` 的条目里没有 `model_id`**（2026-10-30 真机实测修正）。
+       *
+       * 条目键全集：`model_alias, model_name, model_type, model_mode,
+       * model_parameters, credit, notice, model_tag` —— **无 `model_id`**。
+       * 首版按 `model_id` 取值 ⇒ 恒空串 ⇒ `continue` ⇒ **8 条模型一条都收不到**
+       * ⇒ 修了 `agent_id` 之后仍然 `windows: 0`（同一功能的第二个独立缺陷）。
+       *
+       * ⇒ 取值顺序：`model_id`（若上游将来补上）→ `model_alias` → `model_name`。
+       * 三者都要**过 VL 过滤与目录 id 对齐**：`model_alias` 实测与 builtin 的
+       * `model_id` 逐字相同（`GLM-5.2` / `deepseek-v4.1-flash-1017` / `kimi-k3`），
+       * 故可直接当目录 id 用。
+       */
+      const rawId = m['model_id'] ?? m['model_alias'] ?? m['model_name']
+      const id = typeof rawId === 'string' ? rawId.trim() : ''
       if (id.length === 0) continue
       const w = readAgentCenterWindow(m)
       if (w.contextWindow === undefined) continue
-      const alias = m['model_alias']
+      /**
+       * 展示名：**优先 `model_name`**（人话），退回 `model_alias`。
+       *
+       * ⚠️ 取反了会怎样（2026-10-30 用例当场抓到）：`model_alias` 在实测数据里
+       * 常常**就是模型 id 本身**（`GLM-5.2` / `kimi-k3`），而 `model_name` 才是
+       * 展示形态（`Kimi K3` / `DeepSeek V4.1`）⇒ 用 alias 当 name 会让新进目录的
+       * 模型显示裸 id（与 `listModels` 的「name 要人话」口径相悖）。
+       */
+      const display = m['model_name'] ?? m['model_alias']
       out.set(id, {
         contextWindow: w.contextWindow,
-        ...(typeof alias === 'string' && alias.length > 0 ? { name: alias } : {}),
+        ...(typeof display === 'string' && display.length > 0 ? { name: display } : {}),
       })
     }
   } catch {

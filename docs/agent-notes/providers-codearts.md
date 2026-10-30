@@ -488,3 +488,85 @@ HTTP 层拒绝，200 **无本机证据**（bili 未装、文档不可得）；�
   （⚠️ 包装层若吞掉该成员，判据会**静默放弃**、PR159 那半个修复无声失效）。
   变异验证：去掉 `confirmedRemote === true` 门槛 / 丢掉 `remoteComplete` 腿 /
   让 Proxy 吞掉该成员 ⇒ 三条用例各自变红。
+
+---
+
+## ⚠️⚠️ 出站字段集：按 IDE 抓包对齐（2026-10-30）
+
+### 取证方式
+
+Reqable 抓包拿到 **4 条真实 IDE 聊天请求**（`agent-kernel.exe` →
+`POST /api/v2/chat/completions`，233~257 条消息、16 个工具、body 590~630 KB），
+**顶层键集 4/4 完全一致**（11 个）：
+
+```
+enable_thinking, max_tokens, messages, model, stream, stream_options,
+temperature, tool_choice, tool_stream, tools, user_prompt
+```
+
+### 插件此前的偏移（已全部修正）
+
+| 字段 | 旧插件 | IDE | 处置 |
+|---|---|---|---|
+| `include` | 发 `["reasoning.encrypted_content"]` | **不发** | 移除（本仓无消费者） |
+| `reasoning_summary` | 发 `"auto"` | **不发** | 移除（同上） |
+| `enable_thinking` | 不发 | `true` | **新增** |
+| `stream_options` | 不发 | `{include_usage:true}` | **新增** |
+| `temperature` | 不发 | `0` | **新增** |
+| `tool_choice` | 不发 | `'auto'` | **新增**（仅真带工具时） |
+| `user_prompt` | 不发 | 用户原话 | **新增** |
+| `prompt_cache_key` | 发会话 id | **不发** | **刻意保留**（见下） |
+| `max_tokens` | 64000 | **32000** | 默认值降级到 32000 |
+
+### ⚠️⚠️ `enable_thinking` 才是真正生效的思考开关（**旧结论被推翻**）
+
+旧笔记断言「本网关唯一生效的思考控制是顶层 `thinking.type`」，据此插件关思考时发
+`thinking:{type:'disabled'}`、开思考时**不发**。2026-10-30 用 `reasoning_tokens`
+做判据重测（题目「17×23 step by step」）：
+
+| 请求 | `reasoning_tokens` | reasoning 字符 |
+|---|---|---|
+| `enable_thinking: true` | **34** | 129 |
+| `enable_thinking: false` | **n/a（无该字段）** | **0** |
+| 不发该字段（服务端默认） | 45 | 175 |
+
+⇒ `true` / `false` **双向都生效**；旧结论「开启 = 不发字段」**不成立**（不发只是走默认）。
+`enable_thinking:false` 与 `thinking:{type:'disabled'}` 实测**等价**（都归零）
+⇒ 与 IDE 对齐后**只留前者**，`thinking` 字段**不再发**（同一语义不发两份）。
+
+### ⚠️ `prompt_cache_key` 是唯一有意偏离 IDE 的字段
+
+IDE 不发它也能吃到自动前缀缓存（实测 `cached_tokens 148480/148949`，99.7% 命中）。
+插件仍发会话 id，理由是会话级亲和让多轮/并发落同一后端实例。2026-10-30 真机 A/B：
+带它 200 且 `cached=256`、不带也 200 且同样 `cached=256` ⇒ **无害**。
+⚠️ 若将来要**完全**对齐 IDE，删它也不会有功能损失（但要同步改这条注释与用例）。
+
+### ⚠️ `max_tokens` 为什么拆成两个常量
+
+| 常量 | 语义 | 值 |
+|---|---|---|
+| `CODEARTS_MAX_OUTPUT_TOKENS` | 上游**最多接受多少**（钳制上界） | 65_536 |
+| `CODEARTS_DEFAULT_MAX_OUTPUT_TOKENS` | **没人指定时发多少**（默认预算） | 32_000 |
+
+IDE 的 32000 是**客户端默认预算**（AgentCenter 给该模型的上限是 65536，4/4 请求恒 32000）。
+⚠️ **不能**把上界直接改成 32000：那会静默削掉调用方明确要求的长输出，而长输出正是
+`tool_stream` 存在的理由（大文件 write 的参数 JSON 需数万 token，截断产出非法 JSON）。
+
+### ⚠️ `user_prompt` 的取值语义（一个易写错的陷阱）
+
+必须是**最后一条真正的用户发言**的纯文本，且**从原始 `options.messages` 取**，
+不能从 `serializeMessages` 之后的 wire 数组取 —— 后者把工具结果展平成 `role:'tool'`，
+而 harness 原始消息里工具结果**搭载在 user 消息中** ⇒ 从 wire 数组回找会命中
+工具结果（几百 KB 的文件内容），与 IDE「用户一句话」的语义完全相反。
+末尾是工具结果时**回退**到上一条真正的用户发言；取不到就**省略该键**（不发空串）。
+
+### 与 IDE 仍然不同的地方（**不算缺陷**）
+
+1. **签名头集**：IDE 只签 `host;x-sdk-date;x-security-token`（3 个）且不签 content-type，
+   还重复发两次 `x-auth-token`；插件签 6 个。两种都被服务端接受（A/B 实测 200）。
+2. **遥测头**：IDE 有 20+ 个 `x-ot-*` / `traceid` / `user-msg-id` 等；插件不伪造这些
+   （伪造别人的遥测 ID 只会污染上游统计）。
+3. **DSML 模型（`deepseek-v4-*`）不发 `tools`/`tool_choice`**：工具 schema 改注入
+   system 提示（为规避 APIG 60s 空闲断连）。IDE 对 `-1017` 用标准 tools 路径，
+   而插件对 `-1017` **也是**标准路径（正则不匹配它）⇒ 该模型与 IDE 一致。
+4. **`user_prompt` 之外的 `thought_signature` 一类字段**：IDE 未下发，不臆造。

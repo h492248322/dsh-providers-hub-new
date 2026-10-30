@@ -24,7 +24,7 @@ import { signRequestHuawei } from './sign.js'
 // 「同一语义两套实现」—— 而共享实现已经把 12 家的坑（工具结果内嵌图片提升为
 // 独立 user 消息、空 Map 不降级、`[image unavailable]` 占位符、递归深度与
 // `collectImages` 对齐）全部踩过了。**故直接复用，不另写。**
-import { collectImages, detailFieldText, serializeMessages } from './openai-compat.js'
+import { collectImages, contentToText, detailFieldText, serializeMessages } from './openai-compat.js'
 
 /**
  * 重新导出共享的 `serializeMessages`（**只为了让既有调用方与测试的导入路径不变**）。
@@ -507,6 +507,38 @@ export function codeartsRateSuffix(display: string): string | undefined {
  * （有兜底），输出上限这里是**恒定收敛**（无兜底分支）。
  */
 const CODEARTS_MAX_OUTPUT_TOKENS = 65_536
+
+/**
+ * `maxTokens` **缺省时**下发的输出上限 —— 与 IDE 逐字一致（2026-10-30 取证）。
+ *
+ * ## 为什么有两个常量（`CODEARTS_MAX_OUTPUT_TOKENS` vs 本值）
+ *
+ * 它们回答的是**两个不同问题**，混用会让其中一个静默失效：
+ *
+ * | 常量 | 回答的问题 | 值 |
+ * |---|---|---|
+ * | {@link CODEARTS_MAX_OUTPUT_TOKENS} | 「上游**最多**接受多少」的**安全边界** | 65_536 |
+ * | **本值** | 「**没人指定时我们该发多少**」的**默认预算** | 32_000 |
+ *
+ * ## 取证
+ *
+ * Reqable 抓包 4 条真实 IDE 聊天请求，`model=deepseek-v4.1-flash-1017` 的
+ * `max_tokens` **恒为 32000**（4/4，无一例外），而 AgentCenter 的
+ * `model_parameters.max_tokens` 给的**上限**是 65536。
+ * ⇒ IDE 的 32000 是**客户端默认预算**，不是模型能力上限。
+ *
+ * ## ⚠️⚠️ 为什么不能直接把 {@link CODEARTS_MAX_OUTPUT_TOKENS} 改成 32000
+ *
+ * 那个常量是**钳制上界**（`clampCodeArtsMaxTokens` 用它 `Math.min`）。改成
+ * 32000 会**静默削掉**调用方明确要求的长输出 —— 而长输出正是本家接
+ * `tool_stream` 的理由（大文件 write 的参数 JSON 需数万 token，截断会产出
+ * 非法 JSON，harness 报 `invalid arguments`）。⇒ 两者必须分开：
+ * **默认值降级对齐 IDE，上界保持 65536**。
+ *
+ * ⚠️ 与 `RemoteModel.maxOutputTokens` 的取舍一致：上游声明的上限**不**当默认
+ * 预算用（否则宿主的压缩预留会跟着变，见 `readAgentCenterWindow` 的注释）。
+ */
+const CODEARTS_DEFAULT_MAX_OUTPUT_TOKENS = 32_000
 
 /**
  * 收敛输出上限到安全区间；非法值返回 undefined（不编造，交由调用方取默认）。
@@ -1980,6 +2012,27 @@ export class CodeArtsAdapter extends LlmAdapter {
     }
 
     const messages = serializeMessages(options.messages, imageUrls)
+    /**
+     * IDE 的 `user_prompt`：**回看原始 `options.messages`（不是序列化后的 wire 数组）**
+     * 里最后一条**真正的用户发言**的纯文本。
+     *
+     * ⚠️⚠️ **必须从原始入参取，不能从 `messages` 取**：
+     * 1. 序列化后的数组里，工具结果被展平成 `role:'tool'`，而 harness 原始消息里
+     *    工具结果搭载在 **user 消息**中 ⇒ 从 wire 数组往回找会优先命中工具结果；
+     * 2. `messages` 已被 `unshift` 插入 system、且可能被 DSML 模式注入过提示。
+     * ⇒ 若从 `messages` 取，`user_prompt` 会变成工具输出（几百 KB 的文件内容），
+     * 与 IDE 的「用户一句话」语义完全相反。
+     */
+    const lastUserPromptText = (() => {
+      for (let i = options.messages.length - 1; i >= 0; i--) {
+        const message = options.messages[i]
+        if (message.role !== 'user') continue
+        // 该条是否**只**含工具结果（没有真正的用户文本）⇒ 跳过
+        const text = contentToText(message.content).trim()
+        if (text.length > 0) return text
+      }
+      return undefined
+    })()
     // harness 的 GenerateOptions.system 是独立的系统提示（如标题生成的
     // systemPrompt、agent 的 persona）。后端 chat/completions 只接受
     // messages 数组里的 system 角色，必须显式插入——否则模型看不到
@@ -2040,25 +2093,69 @@ export class CodeArtsAdapter extends LlmAdapter {
       model: options.model,
       messages,
       stream: true,
-      // prompt_cache_key 让服务端启用前缀缓存并在 usage 中返回 cached_tokens，
-      // 缺少该字段时缓存命中恒为 0（实测 2026-08-24）。
+      /**
+       * ⚠️⚠️ **以下字段集与 IDE 抓包逐项对齐**（2026-10-30 真机对照）。
+       *
+       * ## 取证（Reqable 抓包，4 条真实 IDE 聊天请求，键集 4/4 完全一致）
+       *
+       * IDE 的 11 个键：
+       * `enable_thinking, max_tokens, messages, model, stream, stream_options,
+       *  temperature, tool_choice, tool_stream, tools, user_prompt`
+       *
+       * 插件此前**多发 3 个**（IDE 一个都不发）、**少发 5 个**：
+       *
+       * | 字段 | 旧插件 | IDE | 本次处置 |
+       * |---|---|---|---|
+       * | `prompt_cache_key` | 发 | **不发** | **保留**（见下，有实测收益） |
+       * | `include` | 发 | **不发** | **移除**（IDE 不请求加密 reasoning） |
+       * | `reasoning_summary` | 发 | **不发** | **移除**（同上） |
+       * | `enable_thinking` | 不发 | `true` | **新增**（唯一真正生效的思考开关） |
+       * | `stream_options` | 不发 | `{include_usage:true}` | **新增**（要 usage 帧） |
+       * | `temperature` | 不发 | `0` | **新增** |
+       * | `tool_choice` | 不发 | `'auto'` | **新增** |
+       * | `user_prompt` | 不发 | 用户原话 | **新增** |
+       *
+       * ## ⚠️ `prompt_cache_key` 为什么**不**跟着删（与 IDE 一致的那条唯一例外）
+       *
+       * IDE 不发它也能吃到缓存（实测 `cached_tokens 148480/148949`，99.7% 命中，
+       * 靠服务端自动前缀缓存）。但插件显式发会话 id 有**独立收益**：
+       * 会话级亲和让同一会话的多轮/并发请求落同一后端实例 ⇒ 命中率稳定。
+       * 2026-10-30 真机 A/B：带它 200 且 `cached=256`，不带也 200 且同样 `cached=256`
+       * ⇒ **无害**，故保留（不是「与 IDE 不一致」的误配）。
+       *
+       * ## ⚠️⚠️ `enable_thinking` 是**唯一真正生效**的思考开关（实测判别）
+       *
+       * 用「17×23 step by step」+ `reasoning_tokens` 作判据，三轮真机：
+       *
+       * | 请求 | `reasoning_tokens` | reasoning 字符 |
+       * |---|---|---|
+       * | `enable_thinking: true`  | **34** | 129 |
+       * | `enable_thinking: false` | **n/a（无该字段）** | **0** |
+       * | 不发该字段              | 45 | 175 |
+       *
+       * ⇒ `true`/`false` **双向都生效**；不发 = 服务端默认（开）。
+       * ⚠️ 这推翻了本文件上方「顶层 `thinking.type` 是唯一生效控制」的旧结论
+       * —— 那是 2026-09-29 只测了 `thinking.type` 得出的，**两条腿并存**：
+       * `enable_thinking:false`（IDE 方言）与 `thinking:{type:'disabled'}`（旧方言）
+       * 实测**等价**（都让 `reasoning_tokens` 归零），故按 IDE 用前者。
+       */
+      // ⚠️ 删 `include` / `reasoning_summary` 的依据：IDE 从不下发它们，
+      // 而本仓也没有任何消费者读「加密 reasoning」⇒ 纯冗余出站字段。
+      // ⚠️ `prompt_cache_key` **保留**（唯一有意偏离 IDE 的字段，理由见上方长注释）。
       prompt_cache_key: this.sessionId,
-      // include/reasoning_summary 对齐 Rust 端 CodeArtsExtraFields，
-      // 让服务端返回加密 reasoning 内容与摘要。
-      include: ['reasoning.encrypted_content'],
-      reasoning_summary: 'auto',
-      // 思考开关（实测，2026-09-29）：档位「关闭」翻成本网关真正认的字段。
-      // ⚠️ 是**顶层** `thinking`，不是 raccoon 那种 `extra_body.thinking` 方言
-      // （两者是不同网关的方言，混用会静默无效）。
-      // 实测判据：`disabled` → reasoning_tokens 3/3 全为 0、正文仍正确；
-      // `enabled` 与不传等价（服务端默认就开着），故「开启」档**不发**该字段。
-      //
-      // ⚠️ 标题请求走 `titlePlan`（上方），它会把档位定成 `'off'`，
-      // 于是这里同样发 `disabled` —— 两条判据**合并写**在一个表达式里，
-      // 避免「标题请求绕开了关闭」这类静默失效。
-      ...titlePlan.thinkingOff || options.reasoningEffort === 'off'
-        ? { thinking: { type: 'disabled' } }
-        : {},
+      // 思考开关：按 IDE 的 `enable_thinking`（关档发 false，其余发 true）。
+      // ⚠️ **不发 `thinking:{type:'disabled'}`** —— 与 IDE 对齐后两者只留一份，
+      //    避免「同一语义两个字段」（旧方言仍被服务端接受，但不该再发）。
+      enable_thinking: !(titlePlan.thinkingOff || options.reasoningEffort === 'off'),
+      // IDE 每次请求都带 `stream_options.include_usage`（要 usage 帧）。
+      // ⚠️ 本仓的 usage 消费方（token-meter / 占用条）依赖 `assistant/message.usage`，
+      //    拿不到 usage 会让分子的唯一来源变空 ⇒ 这不是可选美化项。
+      stream_options: { include_usage: true },
+      // ⚠️ `temperature: 0` 与 IDE 逐字一致（IDE 4/4 请求全是 0）。
+      temperature: 0,
+      // ⚠️ `tool_choice: 'auto'`：只在真带工具时发（无工具时下发的 `tools` 已省略，
+      //    此时发 `tool_choice` 是无意义字段，IDE 也只在有工具时发它）。
+      ...wireTools !== undefined && wireTools.length > 0 ? { tool_choice: 'auto' as const } : {},
       // 对齐 CodeArts Agent IDE 请求体（deveco-code 内核日志实证）：
       // tool_stream=true 让后端将超大工具调用参数（如大文件 file_write）
       // 分段流式传输，避免单次 SSE 事件过大导致连接被掐断
@@ -2082,8 +2179,26 @@ export class CodeArtsAdapter extends LlmAdapter {
       // ⚠️ 抬预算（`titlePlan.maxTokens`，关不掉思考时才有值）必须走**同一个**
       // 钳制函数，否则会被钳回原值、兜底静默失效。标题请求的 512 远小于上限，
       // 故实际不会被钳；这里统一走一遍是为了「预算只有一个出口」。
-      max_tokens: clampCodeArtsMaxTokens(titlePlan.maxTokens) ?? CODEARTS_MAX_OUTPUT_TOKENS,
+      max_tokens: clampCodeArtsMaxTokens(titlePlan.maxTokens) ?? CODEARTS_DEFAULT_MAX_OUTPUT_TOKENS,
       ...wireTools !== undefined && wireTools.length > 0 ? { tools: wireTools } : {},
+      /**
+       * ⚠️ `user_prompt` = **最后一条 user 消息的纯文本**（IDE 的语义）。
+       *
+       * 实测（Reqable 4 条 IDE 请求）它的值恒为「用户这一轮的原话」，例如
+       * `"继续按照设计稿优化UI代码dart，然后每完成一个模块，就提交一个git"`。
+       *
+       * ## 它是什么 / 不是什么
+       *
+       * - **不是**发给模型的提示（模型看的是 `messages`），大概率是服务端用于
+       *   **会话计费/审计/标题**的旁路字段 ⇒ 缺失不影响出流（旧的插件请求
+       *   不带它也能稳定 200，两年实测如此）。
+       * - 但既然用户要求「尽量与 IDE 一致」，就按 IDE 下发：取值语义必须**对齐**
+       *   （用户原话，不是拼好的 system 或工具结果），否则不如不发。
+       *
+       * ⚠️ 取不到（无 user 消息 / 内容全是工具结果）时**省略该键** —— 发一个
+       * 空串会与 IDE 的真实形态（恒非空）不符，反而制造新的差异。
+       */
+      ...lastUserPromptText !== undefined ? { user_prompt: lastUserPromptText } : {},
     })
     const url = `${CHAT_API_BASE}/chat/completions`
 
