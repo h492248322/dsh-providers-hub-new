@@ -195,15 +195,19 @@ provider，漏登记会让 `QINIU_ACCOUNT_*` 的账号在 `state.json` 缺失时
   ⚠️ 客户端**不自己打码**，否则与宿主实现漂移（`plugin-src/client/jet-hub.js:970`）。
 - 面板**不渲染**「余额」「签到」「重测/重置」以外的积分类按钮；「重测 / 重置」保留
   （见 §7）。
-- 图标在 `plugin-src/client/provider-icons.js:326`（`qiniu: QINI_ICON`）。
+- 图标在 `plugin-src/client/provider-icons.js:346`（`qiniu: QINI_ICON`）。
+
+> ⚠️ 2026-10-31 合并审计注：上文/本节的 `src/index.ts`、`jet-hub-rpc.ts` 行号在
+> master 并入（magicrew 追加进同几张表）后整体后移过；合并冲突再动这些文件时
+> 行号会再漂，判据以「键名/条目内容」为准，别按行号盲改。
 
 ## 12. 接线清单（漏一处都是静默失效）
 
 | 位置 | 内容 |
 |---|---|
 | `src/provider-registry.ts:870` | 纯数据条目 `id: 'qiniu'`、`logoClass: 'qiniu'` |
-| `src/index.ts:5793` | `['qiniu', qiniu]` 注册进 `registerProviderRuntime` 派生表 |
-| `src/jet-hub-rpc.ts:124-150, 285, 1640, 3969` | 引入 `QiniuAuth` / `QINIU` / `maskQiniuKey` / `handleQiniuRpc` |
+| `src/index.ts:5880` | `['qiniu', qiniu]` 注册进 `registerProviderRuntime` 派生表 |
+| `src/jet-hub-rpc.ts:125, 157-158, 293, 1654` | 引入 `QiniuAuth` / `QINIU` / `maskQiniuKey` / `handleQiniuRpc` |
 | `src/jet-hub-store.ts:1286` | `REF_PREFIX_TO_PROVIDER` 加 `['QINIU','qiniu']` |
 | `src/aggregate-adapter.ts:1338` | 聚合渠道清单含 `'qiniu'` |
 | `tests/helpers/provider-sets.ts:283` | 进 `WRITES_RATE_LIMIT_PROVIDERS` 集合 |

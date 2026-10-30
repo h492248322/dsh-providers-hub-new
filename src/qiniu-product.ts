@@ -15,13 +15,16 @@
  * 无余额端点。因此本 provider 逐字镜像 modelscope 的接入结构（见
  * docs/adding-a-new-provider.md 的「路径 B 全新脉系」）。
  *
- * ## ⚠️ 模型 id 由平台动态下发，**刻意不写死**
+ * ## ⚠️ 模型 id 由平台动态下发，兜底表 = 远端快照（**非空**，2026-10-30 修订）
  *
  * 七牛云官方明令「模型 id 由 qiniu.com/ai/models 下发」，会随平台增删变化。
- * 因此本文件的兜底模型表（QINIU_FALLBACK_MODELS）**刻意置空**：
- * 远端 /models 可用时完全采信远端；远端不可用且无缓存时，模型列表为空
- * （provider 分组随「无账号/空目录」被隐藏），而不是凭空编造一批可能
- * 已下架或改名、还会打错模型的 id。
+ * 因此**初版**曾把兜底模型表（QINIU_FALLBACK_MODELS）刻意置空 —— 但实测证明
+ * 那条路线有毒：`listAllModels()` 冷缓存恒 `[]` ⇒ `models.total === 0` ⇒
+ * 面板把该渠道**误显示为「已关闭且无模型可关」**（与 modelscope 那条
+ * 「provider 显示已关闭、模型却仍可选用」相反方向的矛盾态）。
+ * 现行做法：兜底表 = 远端快照 `QINIU_REMOTE_SNAPSHOT` 映射出的**非空**表
+ * （2026-10-29 直连 `/v1/models` 的 77 条实测，见下方「实测目录形状」），
+ * 远端可用时仍**完全采信远端**；快照只承接「远端不可用且无缓存」的兜底。
  *
  * ## 实测目录形状（2026-10-29 直连 https://api.qnaigc.com/v1/models，HTTP 200）
  *
@@ -32,7 +35,7 @@
  *   两种都要原样透传：**不得**自己做 `/` 拆分或归一（FAQ Q6 明确要求 model
  *   字段与模型广场的「API model 参数」逐字一致，否则找不到模型）。
  * - 每条带 `context_length` 与 `max_tokens`（部分为 0）⇒ 上下文窗口有权威来源，
- *   这正是兜底表可以置空的底气（远端给窗口，不需要本地猜）。
+ *   这正是快照表只需记 `[id, context_length]` 两列的底气（远端给窗口，不需要本地猜）。
  * - **不下发模态**（无 `modalities` / `input_modalities` 字段）。
  *
  * @module src/qiniu-product.ts
