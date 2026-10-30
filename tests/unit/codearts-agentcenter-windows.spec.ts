@@ -33,23 +33,39 @@ function makeFetcher(routes: Record<string, { status?: number; body: string }>) 
   return { fetcher: fetcher as unknown as typeof fetch, calls }
 }
 
-/** 实测 2026-10-29 的 AgentCenter 响应形状（id 全部真实）。 */
+/**
+ * 实测 2026-10-30 的 AgentCenter `useragents` 响应形状 —— **字段名是 `agent_id`**。
+ *
+ * ⚠️⚠️ 这份 fixture 曾经写成 `{ id: … }`，而**上游根本没有 `id` 键**（17 个 agent
+ * 逐条核对）⇒ 生产代码读 `a['id']` 恒 `undefined` ⇒ AgentCenter 窗口腿**全量
+ * 静默失效**，而本文件当时的 9 条用例**全绿**（fixture 比生产代码错得一样）。
+ * ⇒ **fixture 必须逐字对齐上游真实键名**，自造一个「看起来合理」的键名等于
+ * 把 bug 一起冻进测试。这条教训已登进 providers-codearts.md。
+ */
 const USERAGENTS_BODY = JSON.stringify({
+  total: 17,
   agents: [
-    { id: 'agent-secondary', is_primary_agent: false },
-    { id: 'agent-primary', is_primary_agent: true },
+    { agent_id: 'agent-secondary', agent_name: 'CodeAgent2', is_primary_agent: false },
+    { agent_id: 'agent-primary', agent_name: 'CodeAgent', is_primary_agent: true },
   ],
 })
 
 const DETAIL_BODY = JSON.stringify({
   gpts: {
     models: [
-      { model_id: 'GLM-5.2', model_alias: 'GLM-5.2', model_parameters: { context_window: 202752, max_tokens: 65536, supports_images: false } },
-      { model_id: 'deepseek-v4.1-flash-1017', model_alias: 'DeepSeek V4.1', model_parameters: { context_window: 1048576, max_tokens: 65536 } },
-      { model_id: 'kimi-k3', model_alias: 'Kimi K3', model_parameters: { context_window: 1048576, max_tokens: 65536 } },
-      { model_id: 'Qwen3-VL-235B', model_alias: 'VL', model_parameters: { context_window: 1048576 } },
-      { model_id: 'no-window-model', model_alias: 'NoWindow', model_parameters: { max_tokens: 1024 } },
-      { model_id: 'bad-window', model_alias: 'Bad', model_parameters: { context_window: '1048576' } },
+      /**
+       * ⚠️⚠️ **条目里没有 `model_id`**（2026-10-30 真机实测）—— 键全集是
+       * `model_alias, model_name, model_type, model_mode, model_parameters,
+       * credit, notice, model_tag`。首版 fixture 自造了 `model_id` ⇒ 生产代码
+       * 读它恒空 ⇒ 8 条全被 `continue` 掉 ⇒ **窗口腿第二次静默失效而用例全绿**。
+       * ⇒ 这里的条目**只用上游真实存在的键**，且刻意**不带** `model_id`。
+       */
+      { model_alias: 'GLM-5.2', model_name: 'GLM-5.2', model_parameters: { context_window: 202752, max_tokens: 65536 } },
+      { model_alias: 'deepseek-v4.1-flash-1017', model_name: 'DeepSeek V4.1', model_parameters: { context_window: 1048576, max_tokens: 65536 } },
+      { model_alias: 'kimi-k3', model_name: 'Kimi K3', model_parameters: { context_window: 1048576, max_tokens: 65536 } },
+      { model_alias: 'Qwen3-VL-235B', model_name: 'Qwen3 VL', model_parameters: { context_window: 1048576 } },
+      { model_alias: 'no-window-model', model_name: 'NoWindow', model_parameters: { max_tokens: 1024 } },
+      { model_alias: 'bad-window', model_name: 'Bad', model_parameters: { context_window: '1048576' } },
     ],
   },
 })
@@ -147,6 +163,9 @@ describe('AgentCenter 动态窗口合并', () => {
     expect(glm?.maxOutputTokens).toBeUndefined()
     const kimi = models.find((m) => m.id === 'kimi-k3')
     expect(kimi?.contextWindow).toBe(1048576)
+    // ⚠️ 名称来自 `model_alias`（上游真实键，见 DETAIL_BODY 注释）——**不是**自造的
+    //    `model_id`。2026-10-30 实测 `gpts.models[]` 里**没有 `model_id`**，
+    //    首版按它取值 ⇒ 恒空 ⇒ 8 条全被丢弃（本文件曾因此全绿而生产静默失效）。
     expect(kimi?.name).toBe('Kimi K3')
     const ds = models.find((m) => m.id === 'deepseek-v4.1-flash-1017')
     expect(ds?.contextWindow).toBe(1048576)
@@ -310,12 +329,37 @@ describe('AgentCenter 动态窗口合并', () => {
 
   it('falls back to the first agent when no is_primary_agent flag exists', async () => {
     const { fetcher, calls } = makeFetcher({
-      [SNAP_AGENT_CENTER_USERAGENTS_URL]: { body: JSON.stringify({ agents: [{ id: 'first-agent' }] }) },
+      // ⚠️ 用上游真实键名 `agent_id`（见 USERAGENTS_BODY 的注释）
+      [SNAP_AGENT_CENTER_USERAGENTS_URL]: { body: JSON.stringify({ agents: [{ agent_id: 'first-agent' }] }) },
       [`${SNAP_AGENT_CENTER_DETAIL_URL}?agent_id=first-agent`]: { body: DETAIL_BODY },
       [SNAP_MODEL_BUILTIN_URL]: { body: BUILTIN_BODY },
     })
     await fetchCodeArtsRemoteModels(makeCredential(), fetcher)
     const detailCall = calls.find((c) => c.url.startsWith(SNAP_AGENT_CENTER_DETAIL_URL))
     expect(detailCall?.url).toBe(`${SNAP_AGENT_CENTER_DETAIL_URL}?agent_id=first-agent`)
+  })
+
+  /**
+   * ⚠️⚠️ 守卫：**`agent_id` 字段名**（2026-10-30 真实缺陷的回归）。
+   *
+   * 生产代码曾读 `a['id']`，而上游只有 `agent_id` ⇒ 恒 undefined ⇒ 整条窗口腿
+   * 静默失效，而当时的 9 条用例全绿（fixture 也写了错的 `id`）。
+   * 本用例刻意喂**只带 `agent_id`、不带 `id`** 的形状：
+   * 若生产代码再退回只读 `id` ⇒ 拿不到窗口 ⇒ 本用例红。
+   */
+  it('⚠️ 必须按上游真实字段名 agent_id 取 agent（只带 id 的实现会红）', async () => {
+    const { fetcher } = makeFetcher({
+      [SNAP_AGENT_CENTER_USERAGENTS_URL]: {
+        body: JSON.stringify({
+          agents: [{ agent_id: 'real-agent', agent_name: 'CodeAgent', is_primary_agent: true }],
+        }),
+      },
+      [`${SNAP_AGENT_CENTER_DETAIL_URL}?agent_id=real-agent`]: { body: DETAIL_BODY },
+      [SNAP_MODEL_BUILTIN_URL]: { body: BUILTIN_BODY },
+    })
+    const models = await fetchCodeArtsRemoteModels(makeCredential(), fetcher)
+    // 窗口成功挂上 ⇒ agent 被正确取到（取不到则会退化成无窗口的 builtin 目录）
+    expect(models.find((m) => m.id === 'GLM-5.2')?.contextWindow).toBe(202752)
+    expect(models.find((m) => m.id === 'kimi-k3')?.contextWindow).toBe(1048576)
   })
 })

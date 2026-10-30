@@ -408,10 +408,15 @@ describe('CodeArtsAdapter', () => {
       .not.toMatch(/declaredEfforts:\s*\[\s*['"](?:on|off)['"]/)
   })
 
-  it('maps the "off" effort onto top-level thinking.type=disabled, and sends nothing for "on"', async () => {
-    // ⚠️ 必须断言「开启档不发该字段」：`enabled` 与服务端默认等价，发了只是噪声；
-    // 更重要的是不能把它写成 raccoon 那种 `extra_body.thinking` 嵌套方言
-    // （两者是不同网关的方言，混用会静默无效）。
+  /**
+   * 思考开关：**按 IDE 的 `enable_thinking` 方言**（2026-10-30 与 IDE 抓包对齐后改）。
+   *
+   * ⚠️ 旧实现发顶层 `thinking:{type:'disabled'}`（2026-09-29 测出来的「唯一生效控制」）。
+   * 本次真机判别推翻了「唯一」：`enable_thinking` 的 `true`/`false` **双向都生效**
+   * （判据 `reasoning_tokens`：true=34、false=n/a 且 reasoning 字符 0、不发=45）。
+   * 既然 IDE 用的是 `enable_thinking`，就只留这一份方言，不再发 `thinking`。
+   */
+  it('maps the "off" effort onto enable_thinking=false, and sends enable_thinking=true for "on"', async () => {
     const seen: Array<Record<string, unknown>> = []
     const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
       seen.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>)
@@ -434,15 +439,18 @@ describe('CodeArtsAdapter', () => {
     }
 
     const off = await run('off')
-    expect(off.thinking).toEqual({ type: 'disabled' })
-    // 顶层字段，不是嵌套方言。
+    expect(off.enable_thinking).toBe(false)
+    // ⚠️ 旧方言**不得**再发（同一语义两个字段 = 迟早分叉）。
+    expect(off.thinking).toBeUndefined()
     expect(off.extra_body).toBeUndefined()
 
     const on = await run('on')
+    expect(on.enable_thinking).toBe(true)
     expect(on.thinking).toBeUndefined()
 
+    // 未指定档位 ⇒ 宿主注入默认档（本家 'on'）⇒ 同样是 true
     const unset = await run(undefined)
-    expect(unset.thinking).toBeUndefined()
+    expect(unset.enable_thinking).toBe(true)
   })
 
   /**
@@ -490,12 +498,18 @@ describe('CodeArtsAdapter', () => {
       expect((await sentBody(65_536)).max_tokens).toBe(65_536)
     })
 
-    it('未传 / 非法值回落到默认 65536（不编造别的数值）', async () => {
-      expect((await sentBody(undefined)).max_tokens).toBe(65_536)
-      expect((await sentBody(0)).max_tokens).toBe(65_536)
-      expect((await sentBody(-1)).max_tokens).toBe(65_536)
-      expect((await sentBody(Number.NaN)).max_tokens).toBe(65_536)
-      expect((await sentBody(Number.POSITIVE_INFINITY)).max_tokens).toBe(65_536)
+    /**
+     * ⚠️ 2026-10-30 与 IDE 对齐后：**缺省值 65536 → 32000**。
+     *
+     * 取证：Reqable 4 条真实 IDE 请求的 `max_tokens` **恒 32000**（4/4），
+     * 而 AgentCenter 给该模型的**上限**是 65536 ⇒ 32000 是 IDE 的**默认预算**，
+     * 不是能力边界。⇒ 缺省时对齐 IDE 的 32000；**钳制上界仍是 65536**
+     * （调用方明确要长输出时不许被静默削掉，见下方那条用例）。
+     */
+    it('未传 / 非法值回落到 IDE 默认预算 32000（不编造别的数值）', async () => {
+      for (const bad of [undefined, 0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+        expect((await sentBody(bad)).max_tokens, String(bad)).toBe(32_000)
+      }
     })
 
     it('对**每一个** CodeArts 模型都生效 —— 适配器层是统一边界，不逐模型开洞', async () => {
@@ -503,6 +517,132 @@ describe('CodeArtsAdapter', () => {
         expect((await sentBody(128_000, model)).max_tokens, model).toBe(65_536)
       }
     })
+  })
+
+  /**
+   * ⚠️⚠️ 守卫：**出站字段集必须与 IDE 抓包对齐**（2026-10-30）。
+   *
+   * 判据来自 Reqable 4 条真实 IDE 聊天请求（键集 4/4 完全一致）：
+   * `enable_thinking, max_tokens, messages, model, stream, stream_options,
+   *  temperature, tool_choice, tool_stream, tools, user_prompt`
+   *
+   * 本用例只钉**插件曾经缺的 5 个**与**必须删掉的 2 个**：
+   * - 缺过：`enable_thinking` / `stream_options` / `temperature` / `tool_choice` / `user_prompt`；
+   * - 多发：`include` / `reasoning_summary`（IDE 从不下发，本仓也无消费者）。
+   *
+   * ⚠️ `prompt_cache_key` **刻意保留**（唯一有意偏离 IDE 的字段，理由见
+   * llm-adapter.ts 的长注释）⇒ 本用例**不断言它缺席**，否则会把那处有意设计判红。
+   */
+  it('出站字段集与 IDE 抓包对齐：补齐 5 个、移除 IDE 不发的 2 个', async () => {
+    const seen: Array<Record<string, unknown>> = []
+    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      seen.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>)
+      return new Response(
+        'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n',
+        { status: 200, headers: { 'content-type': 'text/event-stream' } },
+      )
+    })
+    // ⚠️ 必须用**非 DSML** 模型（`deepseek-v4-flash` 走 DSML，会刻意不发 tools
+    // ⇒ `tool_choice` 随之省略，用它测这一条会假红）。`deepseek-v4.1-flash-1017`
+    // 实测 `needsDsmlToolMode === false`，正是 GUI 的真实路径。
+    const adapter = makeAdapter({ fetchImpl })
+    for await (const _ of adapter.stream({
+      provider: 'codearts',
+      model: 'deepseek-v4.1-flash-1017',
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: '第一句' }] },
+        { role: 'assistant', content: [{ type: 'text', text: '好的' }] },
+        { role: 'user', content: [{ type: 'text', text: '这一句应成为 user_prompt' }] },
+      ],
+      tools: [{
+        name: 'bash',
+        description: 'Run shell',
+        parameters: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] },
+      }],
+      reasoningEffort: 'on',
+      signal: new AbortController().signal,
+    } as never)) { /* drain */ }
+    const body = seen.at(-1)!
+
+    // ① IDE 有、插件曾缺的 5 个
+    expect(body.enable_thinking).toBe(true)
+    expect(body.stream_options).toEqual({ include_usage: true })
+    expect(body.temperature).toBe(0)
+    expect(body.tool_choice).toBe('auto')
+    expect(body.user_prompt).toBe('这一句应成为 user_prompt')
+
+    // ② IDE 从不发、插件曾多发的 2 个
+    expect(body.include).toBeUndefined()
+    expect(body.reasoning_summary).toBeUndefined()
+
+    // ③ 既有的共同字段仍在
+    expect(body.stream).toBe(true)
+    expect(body.tool_stream).toBe(true)
+    expect(body.model).toBe('deepseek-v4.1-flash-1017')
+  })
+
+  /**
+   * ⚠️ DSML 分支的**有意差异**：该分支刻意不发 `tools`（工具 schema 改注入 system 提示），
+   * ⇒ `tool_choice` 也随之省略（没有 `tools` 时它无意义）。本用例把这条差异
+   * **钉死**，防止有人为了「对齐 IDE」在 DSML 分支上强行补发 `tools`。
+   */
+  it('DSML 模型不发 tools、因而也不发 tool_choice（有意差异，勿强行对齐）', async () => {
+    const seen: Array<Record<string, unknown>> = []
+    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      seen.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>)
+      return new Response(
+        'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n',
+        { status: 200, headers: { 'content-type': 'text/event-stream' } },
+      )
+    })
+    const adapter = makeAdapter({ fetchImpl })
+    for await (const _ of adapter.stream({
+      provider: 'codearts',
+      model: 'deepseek-v4-flash',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      tools: [{
+        name: 'bash',
+        description: 'Run shell',
+        parameters: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] },
+      }],
+      signal: new AbortController().signal,
+    } as never)) { /* drain */ }
+    const body = seen.at(-1)!
+    expect(body.tools).toBeUndefined()
+    expect(body.tool_choice).toBeUndefined()
+  })
+
+  /**
+   * ⚠️ `user_prompt` 的取值语义：**最后一条真正的用户发言**，不是工具结果。
+   *
+   * ⚠️⚠️ 若从**序列化后**的 wire 数组取，工具结果被展平成 `role:'tool'`、
+   * 而 harness 原始消息里工具结果搭载在 **user** 消息中 ⇒ 会取到几百 KB 的
+   * 文件内容，与 IDE「用户一句话」的语义完全相反。本用例专钉这一点。
+   */
+  it('user_prompt 取「用户原话」而非工具结果（末尾是工具结果时回退）', async () => {
+    const seen: Array<Record<string, unknown>> = []
+    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      seen.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>)
+      return new Response(
+        'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n',
+        { status: 200, headers: { 'content-type': 'text/event-stream' } },
+      )
+    })
+    const adapter = makeAdapter({ fetchImpl })
+    for await (const _ of adapter.stream({
+      provider: 'codearts',
+      model: 'deepseek-v4-flash',
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: '请读文件' }] },
+        {
+          role: 'assistant',
+          content: [{ type: 'tool-call', id: 'c1', name: 'bash', arguments: '{"command":"cat a"}' }],
+        },
+        { role: 'user', content: [{ type: 'tool-result', toolCallId: 'c1', content: [{ type: 'text', text: 'AAA' }] }] },
+      ],
+      signal: new AbortController().signal,
+    } as never)) { /* drain */ }
+    expect(seen.at(-1)!.user_prompt).toBe('请读文件')
   })
 
   it('streams text deltas from an OpenAI-compatible SSE response', async () => {
