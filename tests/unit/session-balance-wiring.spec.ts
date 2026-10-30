@@ -41,6 +41,26 @@ describe('createCredentialResolver · session-balance 接线', () => {
     expect(pool.sessionCalls).toEqual([{ sessionId: 'session-xyz', exclude: [] }])
   })
 
+  it('⚠️ `picked` 出参腿必须真的写入（2026-10-31 对抗审计 M6 补牙）', async () => {
+    // ⚠️ 变异实测无牙后补：编排内部 `report()` 的 `selection.accountId` 腿被砍掉
+    // （只剩进程级 `reportAccount`）时，既有用例全绿 —— 但那条腿正是 PR164 的
+    // 承重动机：`deps.reportAccount` 是**进程级**回调（zcode 写
+    // `activeZcodeAccountId` Map），多会话并发会互相覆盖 ⇒ 适配器把失败记到
+    // 别的账号头上。本用例**不传** `reportAccount`（进程级腿缺席），
+    // 只断言出参腿：变异后 `picked.accountId` 恒 undefined ⇒ 红。
+    const pool = resolverPoolWithSession()
+    const resolve = createCredentialResolver({ pool }, {
+      product: PRODUCT,
+      readCredential: async () => undefined,
+      fallback: { kind: 'custom', resolve: async () => undefined },
+      accountSelection: 'session-balance',
+    })
+    const picked: { accountId?: string } = {}
+    await resolve('GLM-5.3-Flash', 'session-xyz', picked)
+    expect(picked.accountId, 'picked 出参未写入 ⇒ 多会话并发时失败记账归属错账号')
+      .toBe('zcode-a')
+  })
+
   it('池没有 session 方法时回落 getAvailableAccount（兼容旧测试桩）', async () => {
     const calls: string[] = []
     const pool: ResolverPool<{ token: string }> = {
