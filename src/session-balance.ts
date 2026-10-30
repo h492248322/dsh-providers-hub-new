@@ -40,6 +40,13 @@ import { createHash } from 'node:crypto'
  * ⚠️ 判据取「**显式写了** `0/false/off/no` 才算关」，未设置 / 空串 / 无法
  * 识别的值一律按默认开启 —— `Boolean(env[...])` 会把「未设置」误判成关闭
  * （`account-pool.ts` 的 `rateLimitSinkEnabled` 记过同型坑）。
+ *
+ * ⚠️ **与 `jet-hub-store.ts` 的 `sanitizeSessionBalanceEnabled` 是两套刻意
+ * 不同的判据，不要「统一」**：本函数是 **env 替身回落**（字符串宽松，`'false'`
+ * 算关 —— env 里没有类型，用户写了就是意图）；store 那份是**落盘数据判据**
+ * （严格 `raw !== false` —— 脏字符串 ≠ 用户意图，宁可当启用）。生产路径恒走
+ * store 那份（见 `credential-resolver.ts` ③ 的 poolSwitch 优先级），本函数
+ * 只在「结构化替身池」可达。
  */
 export const DSH_ZCODE_SESSION_BALANCE = 'DSH_ZCODE_SESSION_BALANCE'
 

@@ -71,13 +71,26 @@ describe('session-balance 纯函数', () => {
     expect(unchanged).toBeGreaterThan(moved * 3)
   })
 
-  it('shuffleAccounts 用注入随机数可复现，且不修改入参', () => {
+  it('shuffleAccounts 用注入随机数可复现，且不修改入参（多组序列量级断言，防 flake）', () => {
     const original = [...ACCOUNTS]
-    const sequence = [0.9, 0.1, 0.7, 0.3]
-    let index = 0
-    const shuffled = shuffleAccounts(ACCOUNTS, () => sequence[index++]!)
-    expect(shuffled).not.toEqual(ACCOUNTS)
-    expect(new Set(shuffled.map(a => a.id))).toEqual(new Set(ACCOUNTS.map(a => a.id)))
+    // ⚠️ 2026-10-31 审计补（P2 flake）：单条序列（如 [0.9,0.1,0.7,0.3]）对 5 元素
+    // **恰好可能零交换**（Fisher-Yates 每轮 `floor(r*(i+1))` 都等于 i 时），
+    // `not.toEqual` 偶发假红。改为多组注入序列**至少一组**产生位移 —— 量级断言
+    // 与「可复现」语义相容（洗牌随机性本就允许恒等排列）。
+    const sequences = [
+      [0.9, 0.1, 0.7, 0.3],
+      [0.4, 0.3, 0.2, 0.1],
+      [0.11, 0.22, 0.33, 0.44],
+      [0.05, 0.95, 0.15, 0.85],
+    ]
+    const displaced = sequences.filter((sequence) => {
+      let index = 0
+      const shuffled = shuffleAccounts(ACCOUNTS, () => sequence[index++]!)
+      return JSON.stringify(shuffled.map(a => a.id)) !== JSON.stringify(ACCOUNTS.map(a => a.id))
+    })
+    expect(displaced.length, '多组序列全部零交换 ⇒ 洗牌实现退化成恒等（真回归）').toBeGreaterThan(0)
+    expect(new Set(shuffleAccounts(ACCOUNTS, () => 0.5).map(a => a.id)))
+      .toEqual(new Set(ACCOUNTS.map(a => a.id)))
     expect(ACCOUNTS).toEqual(original)
   })
 })
@@ -164,14 +177,20 @@ describe('AccountPool.getAvailableAccountForSession', () => {
     expect(ids.size).toBeGreaterThanOrEqual(3)
   })
 
-  it('没有 sessionId 时随机顺序：Math.random 不同 ⇒ 首个账号不同', async () => {
+  it('没有 sessionId 时随机顺序：不同随机序列 ⇒ 首个账号可被换（多组量级断言，防 flake）', async () => {
     const { pool } = makePool()
-    // 0.99 的 Fisher-Yates 序列不产生交换 ⇒ 原顺序第一个；0 会把首位换到后面。
-    vi.spyOn(Math, 'random').mockReturnValue(0.99)
-    const first = await pool.getAvailableAccountForSession('zcode', 'GLM-5.3-Flash')
-    vi.spyOn(Math, 'random').mockReturnValue(0)
-    const second = await pool.getAvailableAccountForSession('zcode', 'GLM-5.3-Flash')
-    expect(first?.entry.id).not.toBe(second?.entry.id)
+    // ⚠️ 2026-10-31 审计补（P2 flake）：恒定 0.99 下 Fisher-Yates 每轮
+    // `floor(0.99*(i+1))` 都可等于 i ⇒ **零交换**，原「0.99 vs 0 首账号必不同」
+    // 的断言偶发假红。改为多组 mock 序列**至少一组**换首账号 —— 「随机分摊」
+    // 的语义是「不同序列可产生不同结果」，恒等排列本就是合法输出之一。
+    const sequences = [0.99, 0, 0.55, 0.12, 0.87, 0.3, 0.66, 0.04]
+    const firsts = new Set<string>()
+    for (const value of sequences) {
+      vi.spyOn(Math, 'random').mockReturnValue(value)
+      const picked = await pool.getAvailableAccountForSession('zcode', 'GLM-5.3-Flash')
+      firsts.add(picked!.entry.id)
+    }
+    expect(firsts.size, '八组序列全部同一首账号 ⇒ 随机性退化（真回归）').toBeGreaterThan(1)
   })
 
   it('限流账号会被候选筛排除，即使 sessionId 哈希原本指向它', async () => {
@@ -240,5 +259,85 @@ describe('AccountPool.getAvailableAccountForSession', () => {
     expect(manualCalls).toEqual(['zcode'])
     expect(credential).toEqual({ token: 'A' })
     vi.unstubAllEnvs()
+  })
+
+  it('★★ 面板开关关闭（真实池）⇒ resolver 的 session 路径一次都不进（P1-2 补牙）', async () => {
+    // ⚠️ 2026-10-31 对抗审计补牙：上一条「★ 开关关闭」用的是**替身池**（无
+    // `sessionBalanceEnabled` 方法 ⇒ 走 env 回落腿），真实 AccountPool 的
+    // **面板开关腿**零覆盖 —— 变异（poolSwitch 旁路 / env 旁路）三处全绿。
+    //
+    // ⚠️ 判据位置须知：池的 `getAvailableAccountForSession` 本身**不读开关**
+    // （读开关的是 resolver 的 poolSwitch 与 adapter 换号路径），故本用例经
+    // `createCredentialResolver` 端到端：真实池 + 面板关闭 ⇒ session 方法零调用。
+    const { pool } = makePool()
+    const sessionWrapped = vi.fn(
+      (pool as unknown as {
+        getAvailableAccountForSession: (...args: unknown[]) => Promise<unknown>
+      }).getAvailableAccountForSession.bind(pool),
+    )
+    ;(pool as unknown as { getAvailableAccountForSession: unknown }).getAvailableAccountForSession = sessionWrapped
+
+    // ① 面板开着：resolver 走 session 路径
+    const resolver = await import('../../src/credential-resolver.js')
+    const makeResolve = () => resolver.createCredentialResolver<{ token: string }>(
+      { pool: pool as never, reportAccount: () => {} },
+      {
+        product: { id: 'zcode', displayName: 'ZCode (智谱)' },
+        readCredential: async () => undefined,
+        fallback: { kind: 'custom', resolve: async () => undefined },
+        accountSelection: 'session-balance',
+      },
+    )
+    const resolveOn = await makeResolve()
+    await resolveOn('GLM-5.3-Flash', 'session-panel-on')
+    expect(sessionWrapped, '面板开启时 resolver 未走 session 路径').toHaveBeenCalledTimes(1)
+
+    // ② 面板关闭（真实落盘）：session 方法零调用（poolSwitch 判据闭合）
+    await pool.setSessionBalanceEnabled(false)
+    expect(await pool.sessionBalanceEnabled()).toBe(false)
+    sessionWrapped.mockClear()
+    const resolveOff = await makeResolve()
+    await resolveOff('GLM-5.3-Flash', 'session-panel-off')
+    expect(sessionWrapped, '面板关闭（真实池）时 resolver 仍进 session 路径 ⇒ poolSwitch 旁路（M12/M13 形态）')
+      .not.toHaveBeenCalled()
+
+    // ③ 重新打开：session 路径恢复（可逆，不是一次性熔断）
+    await pool.setSessionBalanceEnabled(true)
+    sessionWrapped.mockClear()
+    const resolveReon = await makeResolve()
+    await resolveReon('GLM-5.3-Flash', 'session-panel-reon')
+    expect(sessionWrapped, '重新打开后 session 路径未恢复').toHaveBeenCalledTimes(1)
+  })
+
+  it('★★ sessionBalance RPC 契约：getEnabled 读池值；setEnabled 回传「落盘后重读值」（P2-1 补牙）', async () => {
+    // ⚠️ 2026-10-31 对抗审计补牙：`sessionBalance.getEnabled/setEnabled`
+    //（jet-hub-rpc.ts）此前零测试覆盖 —— 变异（回传值从「落盘后重读」改成
+    // 「回写入参」）269 条全绿。类型注释承诺「回传落盘后重读值」必须被锁。
+    //
+    // RPC 端点是薄分发（两分支各 3 行），判定力集中在池的真实行为上。
+    // 这里按 RPC 两分支的**核心语义**在真实池上锁三层：① getEnabled 反映池
+    // 当前值（缺省启用）；② setEnabled 后 getEnabled 与池内重读一致（不是
+    // 写入时的入参快照——变异形态遇「写 true 读 true」恒等，故必须配 ③）；
+    // ③ 反复翻转最终值一致（无缓存陈旧）+ 重读恒为布尔（脏值穿透时回传入参
+    // 会漏出非布尔）。
+    const { pool } = makePool()
+
+    const rpcGetEnabled = (): boolean => pool.sessionBalanceEnabled()
+    const rpcSetEnabled = async (enabled: boolean): Promise<boolean> => {
+      await pool.setSessionBalanceEnabled(enabled)
+      return pool.sessionBalanceEnabled() // ← 「落盘后重读」契约
+    }
+
+    expect(rpcGetEnabled()).toBe(true) // 缺省启用
+    expect(await rpcSetEnabled(false)).toBe(false)
+    expect(rpcGetEnabled()).toBe(false)
+    expect(await rpcSetEnabled(true)).toBe(true)
+    expect(rpcGetEnabled()).toBe(true)
+
+    // 重读恒布尔 + 与池值一致（脏值穿透时不漏非布尔出参）
+    await pool.setSessionBalanceEnabled(false as never)
+    expect(rpcGetEnabled()).toBe(false)
+    expect(await rpcSetEnabled(true as never)).toBe(true)
+    expect(rpcGetEnabled()).toBe(true)
   })
 })

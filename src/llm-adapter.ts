@@ -2017,11 +2017,15 @@ export class CodeArtsAdapter extends LlmAdapter {
      * 里最后一条**真正的用户发言**的纯文本。
      *
      * ⚠️⚠️ **必须从原始入参取，不能从 `messages` 取**：
-     * 1. 序列化后的数组里，工具结果被展平成 `role:'tool'`，而 harness 原始消息里
-     *    工具结果搭载在 **user 消息**中 ⇒ 从 wire 数组往回找会优先命中工具结果；
-     * 2. `messages` 已被 `unshift` 插入 system、且可能被 DSML 模式注入过提示。
-     * ⇒ 若从 `messages` 取，`user_prompt` 会变成工具输出（几百 KB 的文件内容），
-     * 与 IDE 的「用户一句话」语义完全相反。
+     * 1. **语义正确性**：`user_prompt` 的值域是「用户原话」，从原始入参取让
+     *    取值判据独立于 `serializeMessages` 的投影方式。实测（对抗审计 M16
+     *    三场景探针）当前投影把工具结果发成独立 `role:'tool'`、永不命中
+     *    `role==='user'`，两取法**逐字同形** —— 但那是投影的**当前巧合**，
+     *    不是取值判据的依据；投影一改（如工具结果折回 user 消息），从 wire
+     *    取就会静默变成「几百 KB 的文件内容」，与 IDE 的「用户一句话」语义
+     *    完全相反。
+     * 2. `messages` 已被 `unshift` 插入 system、且可能被 DSML 模式注入过提示
+     *    ⇒ 扫 wire 数组要多绕开这些注入项。
      */
     const lastUserPromptText = (() => {
       for (let i = options.messages.length - 1; i >= 0; i--) {

@@ -3,6 +3,8 @@
  * 真的把 DSH 的 `sessionId` 传到池，而不是只停在纯函数里。
  */
 import { describe, expect, it, vi } from 'vitest'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import { createCredentialResolver, type ResolverPool } from '../../src/credential-resolver.js'
 import { ZcodeAdapter } from '../../src/zcode-adapter.js'
 import { ZCODE } from '../../src/zcode-product.js'
@@ -139,5 +141,89 @@ describe('ZcodeAdapter 把 sessionId 继续往下传', () => {
     }).switchAccountOnQuota({ model: 'GLM-5.3-Flash', sessionId: 'session-xyz' }, new Set(['zcode-a']), 'zcode-a')
     expect(next?.accountId).toBe('zcode-b')
     expect(sessionCalls).toEqual([{ sessionId: 'session-xyz', exclude: ['zcode-a'] }])
+  })
+
+  it('★ refresh 后二次 resolveCredential 也带 sessionId（P2-4 补牙）', async () => {
+    // ⚠️ 2026-10-31 对抗审计补牙：`resolveCredentialOrThrow` 的 refresh 分支
+    // （凭据 undefined ⇒ refresh ⇒ 二次 resolve）丢 `options.sessionId` 时既有
+    // 用例全绿 —— wiring 只测首次调用。会话亲和必须覆盖 refresh 后的重取，
+    // 否则「凭据过期 + refresh」之后的请求静默退回随机分摊。
+    const calls: Array<{ model?: string; sessionId?: string; pickedGiven: boolean }> = []
+    const adapter = new ZcodeAdapter({
+      credentialRef: 'ZCODE_CREDENTIAL' as never,
+      resolveCredential: vi.fn(async (
+        _modelId?: string,
+        sessionId?: string,
+        picked?: { accountId?: string },
+      ) => {
+        calls.push({ model: _modelId, sessionId, pickedGiven: picked !== undefined })
+        if (calls.length === 1) return undefined // 触发 refresh 分支
+        if (picked !== undefined) picked.accountId = 'zcode-r'
+        return { zcode_jwt: 'jwt', device_mid: 'mid' }
+      }),
+      refresh: async () => {},
+      product: ZCODE,
+    })
+    const result = await (adapter as unknown as {
+      resolveCredentialOrThrow: (options: { model: string; sessionId: string }) => Promise<{ credential: { zcode_jwt: string } }>
+    }).resolveCredentialOrThrow({ model: 'GLM-5.3-Flash', sessionId: 'session-refresh' })
+    expect(result.credential.zcode_jwt).toBe('jwt')
+    expect(calls).toHaveLength(2)
+    expect(calls[0], '首次调用').toMatchObject({ sessionId: 'session-refresh', pickedGiven: true })
+    expect(calls[1], 'refresh 后的二次调用必须同样带 sessionId 与出参（变异 M31 丢 sessionId 时此格 undefined ⇒ 红）')
+      .toMatchObject({ sessionId: 'session-refresh', pickedGiven: true })
+  })
+})
+
+/**
+ * ⚠️ **装配点唯一性自检**（2026-10-31 对抗审计 P1-1 补牙）。
+ *
+ * ## 为什么必须存在
+ *
+ * 对抗审计实测：把 `src/index.ts` 里 zcode 的 `accountSelection:'session-balance'`
+ * **删掉**、或**复制进 qoder 的 resolver 配置**，535+ 条测试全绿 —— PR 自述的
+ * 「其余 provider 手动序语义逐字节不变」没有任何牙齿。扩散的后果是静默的：
+ * qoder 等渠道的「手动顺序优先」被改成随机洗牌，无报错。
+ *
+ * 判据与 `credential-resolver.spec.ts` 的 `indexSource` 自检同款（装配事实只能
+ * 源码自检；行为由上面的替身用例守）。
+ */
+describe('index.ts 的 accountSelection 装配点唯一性', () => {
+  const indexSource = readFileSync(fileURLToPath(new URL('../../src/index.ts', import.meta.url)), 'utf8')
+  const code = indexSource
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .split('\n')
+    .filter((line) => !/^\s*\/\//.test(line))
+    .join('\n')
+
+  it('★ 装配点恰好 1 个，且锚定在 zcode 装配块内', () => {
+    const count = (code.match(/accountSelection:\s*'session-balance'/g) ?? []).length
+    expect(count, `装配点 ${count} 个（应为 1）——删掉 = zcode 静默退回手动序；>1 = 别的渠道被静默改成随机分摊`).toBe(1)
+    // 锚定在 zcode 装配块内：accountSelection 行必须出现在「ZCode 用户要求」注释
+    // 与 registerZcodeLlm 的 zcode resolver 段附近（±60 行内有 zcode 标识）。
+    const at = code.indexOf("accountSelection: 'session-balance'")
+    const context = code.slice(Math.max(0, at - 2000), at + 2000)
+    expect(
+      /zcode/i.test(context),
+      '唯一装配点不在 zcode 装配块附近 —— 被搬走/复制到别家了',
+    ).toBe(true)
+  })
+
+  it('★ 负向：主流手动序渠道的 resolver 块不含该键（扩散即红）', () => {
+    // 对抗审计 M11e/M26 的真实攻击面：复制进 qoder 的 createCredentialResolver 配置。
+    // 判据：每个「product: X,」 resolver 配置块（X ≠ ZCODE）内不得出现 accountSelection。
+    const blocks = [...code.matchAll(/createCredentialResolver<[^>]+>\(/g)].map(m => m.index!)
+    expect(blocks.length, 'index.ts 里找不到 createCredentialResolver 调用点（结构漂移，请人工复核判据）').toBeGreaterThan(0)
+    for (const start of blocks) {
+      const block = code.slice(start, start + 4000)
+      const productMatch = block.match(/product:\s*([A-Z_]+),/)
+      if (productMatch === undefined || productMatch[1] === 'ZCODE') continue
+      const end = block.indexOf('balance:', 0) > 0 ? block.indexOf('balance:') : Math.min(block.length, 3000)
+      const head = block.slice(0, end)
+      expect(
+        /accountSelection/.test(head),
+        `product=${productMatch[1]} 的 resolver 配置含 accountSelection ⇒ 该渠道被静默改成会话随机分摊`,
+      ).toBe(false)
+    }
   })
 })

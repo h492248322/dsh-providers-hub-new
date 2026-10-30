@@ -367,3 +367,41 @@ describe('登录开窗：宿主开过无痕窗时的用户裁决策略', () => {
     expect(open.filter(args => String(args[0] ?? '').includes('authui')).length).toBeGreaterThan(0)
   })
 })
+
+/**
+ * ★★ 「负载均衡」开关的 **zcode 门控**（2026-10-31 对抗审计 P2-2 补牙）。
+ *
+ * ## 为什么必须行为级
+ *
+ * `supportsSessionBalance = provider === 'zcode'`（jet-hub.js）被改成恒真时，
+ * 既有 panel-wiring 全绿 ⇒ **所有 provider 面板**都会渲染一个摆设开关
+ * （点击后 RPC 报 `unknown provider` 或对别家无效）。与「订阅额度只对 Cline
+ * 渲染」同一门控取向，判据打在**渲染产物**上：真渲染各 provider 的面板，
+ * 数「负载均衡」label 是否只在 zcode 出现。
+ */
+describe('负载均衡开关的 zcode 门控（仅 zcode 渲染）', () => {
+  const PROVIDERS = ['codearts', 'buddy', 'qoder', 'zcode', 'opencode', 'aggregate'] as const
+
+  it('真渲染：开关只在 zcode 面板出现（其余 provider 一个都不渲染）', async () => {
+    const perProvider = new Map<string, number>()
+    for (const provider of PROVIDERS) {
+      const r = await renderPanel(async (method: string) => {
+        if (method === 'sessionBalance.getEnabled') return { ok: true, value: { enabled: true } }
+        return { ok: true, order: [], statuses: {} }
+      }, provider)
+      expect(r.ok, `${provider} 渲染抛错：${r.ok ? '' : String((r as { error: unknown }).error)}`).toBe(true)
+      let count = 0
+      for (const element of elements) {
+        const props = element.props as { className?: unknown } | null | undefined
+        if (props?.className === 'dim-jh-nativeSearch') count += 1
+      }
+      perProvider.set(provider, count)
+    }
+    expect(perProvider.get('zcode'), 'zcode 面板必须有负载均衡开关').toBeGreaterThan(0)
+    const offenders = [...perProvider.entries()].filter(([p, n]) => p !== 'zcode' && n > 0)
+    expect(
+      offenders,
+      `非 zcode 面板渲染了摆设开关（去 zcode 门控的变异形态）：${JSON.stringify(offenders)}`,
+    ).toEqual([])
+  })
+})
