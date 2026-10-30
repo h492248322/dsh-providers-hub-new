@@ -176,18 +176,18 @@ describe('ModelScope 兜底表：日期快照后缀匹配（Issue #12）', () =>
     }
   })
 
-  it('★ 不误剥参数规模（72B / 32B 不是日期快照）', () => {
+  it('★ 不误剥参数规模（72B / 32B 不是日期快照）——无条件断言（M7b 补牙）', () => {
     // ⚠️ 若判据放宽成「任意位数字结尾」，`Qwen2.5-72B` 会被剥成 `Qwen2.5` ⇒
     //    可能并到完全不相干的条目上。这里点名几个**必须不命中**的形态。
+    // ⚠️ 2026-10-31 对抗审计 M7b 补牙：原版把「必须真同族」包在
+    //    `if (hit !== undefined)` 里 —— 剥错但未误命中任何条目时断言被
+    //    **整个跳过**（条件式断言假绿的变体），变异 `/-\d+$/` 实测 15 条全绿。
+    //    现改为：这些 id **必须未命中**（兜底表里没有它们的无后缀/同族条目，
+    //    任何命中都是剥错/误吞的直接证据），无条件、无跳过路径。
     for (const id of ['Qwen/Qwen2.5-72B-Instruct', 'Qwen/Qwen3-32B', 'some/LongCat-Flash-Lite']) {
       const hit = findModelscopeFallback(id)
-      if (hit !== undefined) {
-        // 若命中，必须是真同族（剥快照后相等，或以 `-` 为边界的前缀）
-        const bare = id.replace(/-(?:\d{4}|\d{8})$/, '')
-        const hitBare = hit.id.replace(/-(?:\d{4}|\d{8})$/, '')
-        expect(bare === hitBare || id.startsWith(`${hit.id}-`),
-          `${id} 命中了不相干的 ${hit.id}（跨族误吞）`).toBe(true)
-      }
+      expect(hit, `${id} 不得命中任何兜底条目（命中 = 剥错参数规模或跨族误吞：${hit?.id ?? ''}）`)
+        .toBeUndefined()
     }
   })
 

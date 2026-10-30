@@ -274,12 +274,20 @@ function readableDetail(body: string): string {
 /**
  * 把一次失败的 HTTP 响应归类为语义化错误。
  *
- * ## ⚠️ 顺序即优先级（与 modelscope 同款）
+ * ## ⚠️ 顺序即优先级
  *
  * 1. **上下文超限排在限流/额度之前**：归 quota 会让账号被封到次日零点；
- * 2. **限流/额度排在 auth 之前**：网关在额度耗尽时可能回 401/403 而不是 429；
- * 3. **400 单独归 `invalid_request`**：形状问题与账号无关，白重试 5 次无益；
- * 4. `retry-after` 由响应头给出（`retry-after.ts`，0 是合法值）。
+ * 2. **⚠️ 401/403 先判，恒归 `auth`**（2026-10-31 对抗审计 M1a 打穿后修）：
+ *    状态码与额度文案并存时（网关侧故障常在报文里捎带 `insufficient quota`
+ *    类提示）**以状态码为准** —— 认证类是**账号态**、不是模型冷却，落 quota
+ *    会被 `markLimited` 写成 UTC+8 次日零点冷却，把认证故障放大成封池
+ *    （loomy 2026-10-06「全池被封」事故同型，不变式见
+ *    `docs/agent-notes/providers-loomy-raccoon-minimax.md` §分类两条不变式 1）。
+ *    原「网关额度耗尽可能回 401/403，故额度先判」的注释方向反了：宁可漏判
+ *    额度（不换号）不可误判成封号。
+ * 3. **限流/额度之后**才是传输/形状/服务端；
+ * 4. **400 单独归 `invalid_request`**：形状问题与账号无关，白重试 5 次无益；
+ * 5. `retry-after` 由响应头给出（`retry-after.ts`，0 是合法值）。
  *
  * @param status  HTTP 状态码；传输层失败传 0。
  * @param body    响应体原文（调用方**必须先读一次体**再调本函数）。
@@ -294,7 +302,7 @@ export function classifyQiniuError(
   const detail = readableDetail(body)
   const lower = body.toLowerCase()
 
-  // 上下文超限：必须排在 rate_limit / quota 之前（见模块头）。
+  // 上下文超限：必须排在 rate_limit / quota / auth 之前（见模块头）。
   if (
     lower.includes('maximum context length')
     || lower.includes('context length')
@@ -307,6 +315,8 @@ export function classifyQiniuError(
   ) {
     return { kind: 'context_window', detail }
   }
+  // ⚠️ 认证先于额度/限流（不变式 1）：401/403 带额度文案 ⇒ 恒归 auth。
+  if (status === 401 || status === 403) return { kind: 'auth', detail }
   if (
     status === 429
     || lower.includes('too many requests')
@@ -336,7 +346,6 @@ export function classifyQiniuError(
     return { kind: 'transport', detail }
   }
   if (status === 400 || status === 422) return { kind: 'invalid_request', detail }
-  if (status === 401 || status === 403) return { kind: 'auth', detail }
   if (status >= 500) return { kind: 'server', detail }
   return { kind: 'server', detail }
 }

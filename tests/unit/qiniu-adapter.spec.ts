@@ -77,6 +77,25 @@ describe('resolveModel / listModels：能力声明的诚实性', () => {
     expect(resolved.id, '剥掉前缀 ⇒ 上游 404 model not found').toBe('moonshotai/kimi-k3')
   })
 
+  it('★ model id 原样透传（下划线/大写样本：对抗审计 M4 归一化变异的补牙）', async () => {
+    // ⚠️ 对抗审计实测：既有样本（moonshotai/kimi-k3、deepseek-v3）都不含 `_`
+    // 与大写，归一化变异（`replace(/_/g,'-')` + toLowerCase）后 69 条全绿。
+    // 上游 FAQ Q6 要求 model 与模型广场「API model 参数」**逐字**一致，
+    // 含 `_` 或大写的真实 id（如 `Qwen/Qwen2.5-72B-Instruct` 形态）一旦被
+    // 归一就 404 —— 故用含两类的样本断言上行请求里的 model 逐字节相等。
+    let sentModel: string | undefined
+    vi.stubGlobal('fetch', vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      sentModel = String(JSON.parse(String(init?.body)).model)
+      return new Response('data: {"choices":[{"delta":{"content":"ok"},"index":0}]}\n\ndata: [DONE]\n\n', {
+        status: 200, headers: { 'content-type': 'text/event-stream' },
+      })
+    }))
+    const adapter = new QiniuAdapter({ slots: async () => [{ id: 'a1', apiKey: KEY }], product: QINIU } as never)
+    await drain(adapter.stream({ model: 'Qwen/Qwen2.5_72B-Instruct', messages: [{ role: 'user', content: 'hi' }] } as never))
+    expect(sentModel, '归一化回流上行 ⇒ 上游 404（FAQ Q6 逐字一致要求）').toBe('Qwen/Qwen2.5_72B-Instruct')
+    vi.unstubAllGlobals()
+  })
+
   it('★ 没有可用账号时 listModels 返回空（provider 分组隐藏，不是报错）', async () => {
     const adapter = new QiniuAdapter({ slots: async () => [], product: QINIU } as never)
     await expect(adapter.listModels('qiniu')).resolves.toEqual([])

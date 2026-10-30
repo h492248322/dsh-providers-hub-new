@@ -28,7 +28,7 @@ function poolStub(disabled: readonly string[] = []): never {
 }
 
 describe('Qiniu 接线完整性', () => {
-  it('index.ts 的 qiniu 注册实参里必须带真 accountPool（剥注释后判定）', () => {
+  it('index.ts 的 qiniu 注册实参里必须带真 accountPool（剥注释后判定 + 死分支常量检测）', () => {
     const source = readFileSync(REPO + 'src/index.ts', 'utf8')
     const code = source
       .replace(/\/\*[\s\S]*?\*\//g, '')
@@ -47,6 +47,15 @@ describe('Qiniu 接线完整性', () => {
     expect(
       /accountPool:\s*(undefined|null)/.test(call),
       'accountPool 被写成 undefined / null ⇒ 骨架的 ?. 让它变成静默 no-op',
+    ).toBe(false)
+    // ⚠️ 2026-10-31 对抗审计 M10b 补牙：源文本判据可被 `if(false)` 死分支短路
+    //（client-ui.md 记录的旁路形态在 qiniu 上真实复现——变异
+    // `...(false ? { accountPool: pool } : {})` 后 2 条用例全绿）。
+    // 判据：registerQiniuLlm 调用块内**不得出现恒假条件**包住 accountPool
+    // （与 client-ui.md 的「常量假条件检测」同款判据）。
+    expect(
+      /(?:if\s*\(\s*false\s*\)|\?\s*\(\s*\{\s*accountPool|\.\.\.\(\s*false\s*\?)/.test(call),
+      'accountPool 被 if(false)/恒假三元包进死分支 ⇒ 源文本判据被短路（变异 M10b 形态）',
     ).toBe(false)
   })
 
