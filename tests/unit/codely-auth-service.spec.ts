@@ -217,7 +217,41 @@ describe('refreshCodelyCredential', () => {
       seenSignal = init?.signal
       return new Response(JSON.stringify({ access_token: 'X' }), { status: 200 })
     })
-    await refreshCodelyCredential('R', { fetcher: fetchImpl as never })
-    expect(seenSignal, '续期请求必须带 signal（上游挂住即续期链永久卡住）').toBeDefined()
+    // ⚠️ 只断言 `toBeDefined()` **没有锁住任何东西**：传一个**永不超时**的
+    //    `new AbortController().signal` 也照样变绿，而那恰恰是本用例要防的事
+    //    （上游挂住 ⇒ 续期链永久卡住）。⇒ 拦住 `AbortSignal.timeout` 看实参。
+    const timeoutSpy = vi.spyOn(AbortSignal, 'timeout')
+    try {
+      await refreshCodelyCredential('R', { fetcher: fetchImpl as never })
+
+      expect(seenSignal).toBeInstanceOf(AbortSignal)
+      expect((seenSignal as AbortSignal).aborted, '刚发出时不该是已中止状态').toBe(false)
+      expect(timeoutSpy, '必须真的调用 AbortSignal.timeout 挂上超时').toHaveBeenCalledTimes(1)
+      const ms = timeoutSpy.mock.calls[0]?.[0]
+      expect(typeof ms).toBe('number')
+      expect(ms, '超时期限必须是正数毫秒（0 / 负数等于立刻超时）').toBeGreaterThan(0)
+    } finally {
+      timeoutSpy.mockRestore()
+    }
+  })
+
+  it('★ 传入外部 signal 时仍要叠加超时（不能只听调用方的）', async () => {
+    let seenSignal: unknown
+    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      seenSignal = init?.signal
+      return new Response(JSON.stringify({ access_token: 'X' }), { status: 200 })
+    })
+    const timeoutSpy = vi.spyOn(AbortSignal, 'timeout')
+    try {
+      const outer = new AbortController()
+      await refreshCodelyCredential('R', { fetcher: fetchImpl as never, signal: outer.signal })
+
+      // 若实现是「有外部 signal 就原样透传」，超时就丢了 —— 而调用方的 signal
+      // 通常来自上层请求，它可能永远不中止。
+      expect(timeoutSpy, '叠加超时：调用方 signal 之外还要另挂一个 timeout').toHaveBeenCalledTimes(1)
+      expect(seenSignal, '应是组合后的 signal，不得原样透传调用方那个').not.toBe(outer.signal)
+    } finally {
+      timeoutSpy.mockRestore()
+    }
   })
 })

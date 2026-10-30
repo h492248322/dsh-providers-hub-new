@@ -45,6 +45,11 @@ import {
 } from '../../src/analyze-image.js'
 // ⚠️ 守卫 ⑪~⑬ 直接测共享序列化层（缺陷就在那一层，不在工具里）。
 import { serializeMessages } from '../../src/openai-compat.js'
+import {
+  codeartsAcceptsImage,
+  resetCodeartsImageModels,
+  setCodeartsImageModels,
+} from '../../src/codearts-vision.js'
 
 /** 造一条带图的 user 消息。 */
 function userWithImages(
@@ -143,6 +148,34 @@ describe('analyzeImage：路由判据', () => {
     expect(shouldOfferAnalyzeImage('codearts', 'glm-5.3')).toBe(true)
     expect(shouldOfferAnalyzeImage('codearts', 'kimi-k2.6-vl')).toBe(false)
     expect(shouldOfferAnalyzeImage('codearts', 'Qwen3-VL-235B')).toBe(false)
+  })
+
+  /**
+   * 守卫 ③c：**「能收图」与「不需要识图工具」是两回事**（2026-10-26 报障）。
+   *
+   * `kimi-k3` 这类新一代多模态主模型两头都沾：目录标了 `supports_images` ⇒ 能直接
+   * 收图；但它**不是**专用 VL 模型 ⇒ 仍然要挂 `analyzeImage`。
+   *
+   * 旧判据写作 `!accepts(model)`（「收不了图才挂」）—— 对老模型恰好等价，
+   * 一遇到 `kimi-k3` 就判成「不需要工具」，于是它只有直发、没有识图工具可用。
+   *
+   * ⚠️ 有牙：把 `shouldOfferAnalyzeImage` 改回 `!accepts(model)` ⇒ 第 2 条断言变红。
+   */
+  it('③c 能收图但非专用 VL 的模型仍要挂工具（kimi-k3）', () => {
+    try {
+      setCodeartsImageModels(['kimi-k3'])
+      expect(codeartsAcceptsImage('kimi-k3'), '前提：它确实能收图').toBe(true)
+      expect(
+        shouldOfferAnalyzeImage('codearts', 'kimi-k3'),
+        '能收图 ≠ 不需要工具：仍须挂 analyzeImage',
+      ).toBe(true)
+      // 专职 VL 模型仍然不挂（它们自己就是拿来识图的）
+      expect(shouldOfferAnalyzeImage('codearts', 'kimi-k2.6-vl')).toBe(false)
+      expect(shouldOfferAnalyzeImage('codearts', 'Qwen3-VL-235B')).toBe(false)
+    } finally {
+      // ⚠️ 能力集合是模块级单例，不清理会泄漏到别的测试文件
+      resetCodeartsImageModels()
+    }
   })
 })
 

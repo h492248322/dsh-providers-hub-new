@@ -1,6 +1,10 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { signRequestHuawei } from './sign.js'
 import type { CodeArtsCredential } from './types.js'
+// ⚠️ 单向依赖：`codearts-vision.ts` 是**无依赖叶子**（不 import 任何模块），
+//    故这里 import 它不会成环；反过来让它 import 本文件就会（它还被
+//    `llm-register-compat.ts` 消费，而那条链最终回到 `llm-adapter.ts`）。
+import { setCodeartsImageModels } from './codearts-vision.js'
 
 /**
  * opengw 网关配置端点 — 返回 benefit（免费额度）模型列表（glm-5.3-flash 等）。
@@ -407,12 +411,24 @@ export async function fetchCodeArtsRemoteModels(
     : extractJsonArray(snapText, ['builtinModels'])
   if (outcome !== undefined) outcome.builtinOk = snapArr !== undefined
   if (snapArr !== undefined) {
+    // ⚠️ `supports_images` 必须在本循环里**单独**读，不能指望 `RemoteModel`：
+    //    `parseModelInfo` 会把 `-VL-` / `-VL` 结尾的模型**整条丢掉**（它们不进
+    //    对话目录），而能收图的恰恰就是这批模型 ⇒ 走 `models` 数组根本看不到它们。
+    const imageIds: string[] = []
     for (const item of snapArr) {
       if (typeof item === 'object' && item !== null) {
-        const mi = parseModelInfo(item as Record<string, unknown>, seen, nowMs)
+        const entry = item as Record<string, unknown>
+        if (entry['supports_images'] === true) {
+          const rawId = entry['model_id']
+          if (typeof rawId === 'string' && rawId.length > 0) imageIds.push(rawId)
+        }
+        const mi = parseModelInfo(entry, seen, nowMs)
         if (mi) models.push(mi)
       }
     }
+    // ⚠️ 只在**本来源取到**时才灌入：请求失败（snapArr 为 undefined）时不动
+    //   已灌入的集合 —— 一次抖动就把「刚能收图」的模型变不能，比保持原样更糟。
+    setCodeartsImageModels(imageIds)
   }
 
   /**
