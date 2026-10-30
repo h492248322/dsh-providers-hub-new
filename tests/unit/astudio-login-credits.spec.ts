@@ -760,6 +760,7 @@ describe('AStudio Provider Credits & Jet Hub RPC 接线验证', () => {
       // ⚠️ **本 fork 独有**（七牛云，2026-10-29）：`JetHubAuths` 是全字段必填的
       //    结构化类型，漏一个即 TS2741 —— 本用例只验 astudio 那条链，故给空桩即可。
       qiniu: blank(),
+      magicrew: blank(),
       astudio: astudioAuth,
     }
 

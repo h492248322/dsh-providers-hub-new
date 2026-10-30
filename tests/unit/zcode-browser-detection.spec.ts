@@ -33,6 +33,11 @@ import { fileURLToPath } from 'node:url'
 import {
   browserCandidates,
   browserNotFoundMessage,
+  decodeRegistryOutput,
+  decodeRegistryOutputWithFallback,
+  encodingForOemCodePage,
+  registryCodePage,
+  windowsRegisteredBrowserPaths,
   findBrowserExecutable,
   isBrowserDeploymentError,
   scoopRootFromPath,
@@ -132,6 +137,214 @@ afterEach(() => {
     else process.env[k] = v
   }
   for (const k of Object.keys(saved)) delete saved[k]
+})
+
+describe('Windows App Paths 浏览器发现', () => {
+  // ⚠️⚠️ **夹具必须是「真实形态」**（2026-10-30 四路审计 P0 D-01 / P2 D-4 修）：
+  //
+  // 旧夹具写的是 `'    (默认)    REG_SZ    D:\\\\Tools\\\\Chrome\\\\App\\\\chrome.exe\r\n'`
+  // —— ① 中文标签是 **UTF-8**（真实输出是 **GBK 字节**）；② 路径是**双反斜杠**
+  // （真实输出是**单反斜杠**）；③ 路径**根本不存在**。
+  // ⇒ 它只验证了「`REG_SZ` 这个 ASCII token 能找到」，**完全绕开了编码问题**
+  // ⇒ P0 D-01 正是从这条缝漏过去的。
+  //
+  // ⇒ 下面的夹具改成：**真实存在的临时文件** + **真实 GBK 字节**。
+
+  /** 造一个真实的、存在的可执行文件（`existsSync` 过滤要过）。 */
+  function makeRealExe(dirName: string, rel: string): string {
+    const dir = join(dirName, ...rel.split('/').slice(0, -1))
+    mkdirSync(dir, { recursive: true })
+    const exe = join(dirName, ...rel.split('/'))
+    writeFileSync(exe, '')
+    return exe
+  }
+
+  it('★★ **GBK 字节**的中文路径必须被正确解码（2026-10-30 审计 P0 D-01 修）', () => {
+    // ⚠️⚠️ **判据必须直接打解码器**（旧夹具把「已解码的文本」喂给注入点 ⇒
+    //    **完全绕开了编码问题** ⇒ P0 D-01 正是从这条缝漏过去的）。
+    //
+    //    真实 `reg query` 输出是**系统 OEM 代码页字节**（中文 Windows = GBK）。
+    //    旧实现写死 `encoding: 'utf8'` ⇒ 中文被解成 **U+FFFD（不可逆）**。
+    const gbkBytesOf = (text: string): Buffer => {
+      // Node 无 GBK **编码器**（`TextEncoder` 只有 utf8）⇒ 用已知字节表。
+      // ⚠️⚠️ 字节表必须**逐项反查验证**（2026-10-30 第二轮审计 N-4 修）：
+      //    原表把 `认` 写成 `[0xd0,0xb6]` ⇒ 实测解出的是 **`卸`**（另一个字！）
+      //    ⇒ 而夹具里用的是 `默`/`认` 的**标签**、路径用「我的工具」⇒
+      //    那张错表**从未被真正测到**（潜伏）⇒ 必须给表项**加守卫**。
+      //    下表每一项都由 `TextDecoder('gb18030')` 反查得出（见本用例的自证）。
+      const table: Record<string, readonly number[]> = {
+        '我': [0xce, 0xd2], '的': [0xb5, 0xc4], '工': [0xb9, 0xa4], '具': [0xbe, 0xdf],
+        '默': [0xc4, 0xac], '认': [0xc8, 0xcf],
+      }
+      // ⚠️ **自证**：表里每一项都必须**解回原字**（否则这张表是错的）。
+      for (const [ch, bytes] of Object.entries(table)) {
+        expect(new TextDecoder('gb18030').decode(Buffer.from(bytes)), `字节表项 ${ch} 必须解回自身`).toBe(ch)
+      }
+      const out: number[] = []
+      for (const ch of text) {
+        const bytes = table[ch]
+        if (bytes === undefined) out.push(...Buffer.from(ch, 'utf8'))
+        else out.push(...bytes)
+      }
+      return Buffer.from(out)
+    }
+    const raw = gbkBytesOf('    (默认)    REG_SZ    D:\\我的工具\\Chrome\\App\\chrome.exe\r\n')
+    // ⚠️ **自证**：这段字节确实是 GBK（按 utf8 解必然乱码、按 gb18030 解正常）。
+    //    ⚠️ `Buffer.toString` **只认 utf8/latin1/ucs2/base64 等**（无 gbk）⇒
+    //    GBK 的「正确解」必须走 `TextDecoder`（Node 内置支持 gbk/gb18030，实测）。
+    expect(raw.toString('utf8')).not.toBe(new TextDecoder('gb18030').decode(raw))
+    expect(new TextDecoder('gb18030').decode(raw)).toContain('我的工具')
+
+    // ⚠️ 判据：解码后中文**完整**、**没有 U+FFFD**。
+    const decoded = decodeRegistryOutput(raw, 'gb18030')
+    expect(decoded).toContain('我的工具')
+    expect(decoded).not.toContain('\uFFFD')
+    expect(decoded).toContain('D:\\我的工具\\Chrome\\App\\chrome.exe')
+    // ⚠️ 反向对照：旧的 utf8 口径**确实**会坏（证明这条用例有判别力）。
+    expect(raw.toString('utf8')).toContain('\uFFFD')
+  })
+
+  it('★★ 英文代码页（windows-1252）**不得**被 `gb18030` 解坏（2026-10-30 第二轮审计修）', () => {
+    // ⚠️⚠️ **两个解码器都能解任何字节序列**（`fatal: false`）⇒ 「先试 gb18030」
+    //    在**英文 Windows**上会把 1252 的字节解成**别的字符**：
+    //    `C:\Users\José\Chrome` ⇒ gb18030 解成 `C:\Users\Jos閈\Chrome`。
+    const raw = Buffer.from('C:\\Users\\Jos\u00e9\\Chrome', 'latin1')
+    // ⚠️ 自证：这段字节是 1252 的（`é` = 0xE9，位于 `Jos` 之后）。
+    expect(raw.indexOf(0xe9)).toBeGreaterThan(0)
+    expect(raw[raw.indexOf(0xe9)]).toBe(0xe9)
+    // ⚠️ 1252 解码器必须给出正确的 `é`
+    expect(decodeRegistryOutput(raw, 'windows-1252')).toContain('Jos\u00e9')
+    // ⚠️ 反向对照：**gb18030 确实会解坏**（证明这条用例有判别力）
+    expect(decodeRegistryOutput(raw, 'gb18030')).not.toContain('Jos\u00e9')
+  })
+
+  it('★★ 代码页判据必须**读权威的 OEMCP**（2026-10-30 第二轮审计 P1-1 修）', () => {
+    // ⚠️⚠️ **不能**按 locale 猜：日文 OEMCP=932（Shift-JIS）、韩文=949、
+    //    **繁体中文=950（Big5）** ⇒ 把 ja/ko/zh-TW 映射到 gb18030 **全错**
+    //    （实测 Shift-JIS 的 `あ` 被 gb18030 解成 `偁`、Big5 的 `中` 解成 `い`）。
+    // ⚠️ 而且 `Intl` 的 locale 是**用户区域格式**、不一定等于 UI 语言。
+    // ⇒ 权威来源：`HKLM\SYSTEM\CurrentControlSet\Control\Nls\CodePage` 的 `OEMCP`。
+    expect(encodingForOemCodePage(936)).toBe('gb18030')
+    expect(encodingForOemCodePage(932)).toBe('shift_jis')
+    expect(encodingForOemCodePage(949)).toBe('euc-kr')
+    expect(encodingForOemCodePage(950)).toBe('big5')
+    expect(encodingForOemCodePage(1252)).toBe('windows-1252')
+    expect(encodingForOemCodePage(65001)).toBe('utf-8')
+    // ⚠️ 未知档 ⇒ 1252（**安全降级**：解错会被存在性过滤筛掉 ⇒「找不到」）
+    expect(encodingForOemCodePage(99999)).toBe('windows-1252')
+    // ⚠️ **OEMCP 优先于 locale**
+    expect(registryCodePage(936, 'en-US')).toBe('gb18030')
+    expect(registryCodePage(1252, 'zh-CN')).toBe('windows-1252')
+    // ⚠️ 读不到 OEMCP ⇒ locale 启发式（**只**把简体中文映射到 GBK）
+    expect(registryCodePage(undefined, 'zh-CN')).toBe('gb18030')
+    expect(registryCodePage(undefined, 'zh-TW')).toBe('windows-1252')
+    expect(registryCodePage(undefined, 'ja-JP')).toBe('windows-1252')
+    expect(registryCodePage(undefined, 'ko-KR')).toBe('windows-1252')
+    expect(registryCodePage(undefined, 'en-US')).toBe('windows-1252')
+  })
+
+  it('★★ 首选编码解出 U+FFFD ⇒ 自动重试候选编码（2026-10-30 第二轮审计修）', () => {
+    // ⚠️⚠️ `TextDecoder`（`fatal:false`）**不抛** ⇒ 首选编码猜错时只产出
+    //    U+FFFD ⇒ 路径被存在性过滤筛掉 ⇒ 整条注册表腿静默失效。
+    // ⇒ 必须有「重试」兜底。
+    const raw = Buffer.from('C:\\Users\\Jos\u00e9\\Chrome', 'latin1')
+    // ⚠️ 首选 gb18030（**错**的）⇒ 兜底必须救回来
+    const rescued = decodeRegistryOutputWithFallback(raw, 'gb18030')
+    expect(rescued).toContain('Jos\u00e9')
+    expect(rescued).not.toContain('\uFFFD')
+    // ⚠️ 反向对照：纯 ASCII 输出**首选即命中**（零额外开销）
+    const ascii = Buffer.from('C:\\Program Files\\Chrome\\chrome.exe', 'latin1')
+    expect(decodeRegistryOutputWithFallback(ascii, 'gb18030')).toBe('C:\\Program Files\\Chrome\\chrome.exe')
+  })
+
+  it('★★ 解码后的中文路径**能过存在性过滤**并成为候选（端到端）', () => {
+    if (process.platform !== 'win32') {
+      expect(windowsRegisteredBrowserPaths(() => ({ status: 0, stdout: 'x' }))).toEqual([])
+      return
+    }
+    const dir = mkdtempSync(join(tmpdir(), 'reg-gbk-'))
+    try {
+      // ⚠️ **真实的中文目录名** + **真实存在的文件**（存在性过滤要过）。
+      const exe = makeRealExe(dir, '我的工具/Chrome/App/chrome.exe')
+      const found = windowsRegisteredBrowserPaths((key) => (
+        key.startsWith('HKCU') && key.endsWith('\\chrome.exe')
+          // ⚠️ 注入点给的是**已解码**的文本（与真实解码器输出一致）。
+          ? { status: 0, stdout: `    (默认)    REG_SZ    ${exe}\r\n` }
+          : { status: 1, stdout: '' }
+      ))
+      expect(found).toEqual([exe])
+      expect(found[0]).not.toContain('\uFFFD')
+      expect(found[0]).toContain('我的工具')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('★ 注册名 ≠ 文件名时**不得**误杀（2026-10-30 审计 P3-3 修）', () => {
+    if (process.platform !== 'win32') return
+    const dir = mkdtempSync(join(tmpdir(), 'reg-edge-'))
+    try {
+      // ⚠️ 真实形态：`App Paths\msedge.exe` 的默认值是 `Microsoft Edge.exe`
+      //    （实测本机）⇒ 旧守卫 `=== 'msedge.exe'` 会**误杀**它。
+      const exe = makeRealExe(dir, 'Microsoft Edge/Application/Microsoft Edge.exe')
+      const found = windowsRegisteredBrowserPaths((key) => (
+        key.endsWith('\\msedge.exe')
+          ? { status: 0, stdout: `    (Default)    REG_SZ    ${exe}\r\n` }
+          : { status: 1, stdout: '' }
+      ))
+      expect(found).toEqual([exe])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('★ `REG_EXPAND_SZ` 也**要认**（2026-10-30 审计 U6 修）', () => {
+    if (process.platform !== 'win32') return
+    const dir = mkdtempSync(join(tmpdir(), 'reg-expand-'))
+    try {
+      const exe = makeRealExe(dir, 'Chrome/App/chrome.exe')
+      // ⚠️ 旧实现用 `/\bREG_SZ\b/i` ⇒ **不匹配** `REG_EXPAND_SZ`
+      //    （`\b` 在 `_` 前不成立）⇒ 整行被跳过。
+      const found = windowsRegisteredBrowserPaths((key) => (
+        key.endsWith('\\chrome.exe')
+          ? { status: 0, stdout: `    (Default)    REG_EXPAND_SZ    ${exe}\r\n` }
+          : { status: 1, stdout: '' }
+      ))
+      expect(found).toEqual([exe])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('★ **不存在的路径不产生候选**（存在性过滤，2026-10-30 审计 P2-1 修）', () => {
+    if (process.platform !== 'win32') return
+    // ⚠️ 标准安装会推出 `C:\Program Files\Google\Data` 这种**垃圾路径** ⇒
+    //    存在性过滤把它筛掉（否则污染目录列表 + 扫无关目录的 localStorage）。
+    const found = windowsRegisteredBrowserPaths((key) => (
+      key.endsWith('\\chrome.exe')
+        ? { status: 0, stdout: '    (Default)    REG_SZ    C:\\不存在的路径\\App\\chrome.exe\r\n' }
+        : { status: 1, stdout: '' }
+    ))
+    expect(found).toEqual([])
+  })
+
+  it('★ 查询失败或路径不完整时不产生候选', () => {
+    const found = windowsRegisteredBrowserPaths(() => ({ status: 0, stdout: '    (默认)    REG_SZ\r\n' }))
+    expect(found).toEqual([])
+  })
+
+  it('★ 非 Windows 平台**不执行**注册表查询（平台闸门）', () => {
+    if (process.platform === 'win32') {
+      // Windows 上闸门是「不短路」⇒ 断言查询器**被调用过**。
+      let called = 0
+      windowsRegisteredBrowserPaths(() => { called += 1; return { status: 1, stdout: '' } })
+      expect(called).toBeGreaterThan(0)
+      return
+    }
+    let called = 0
+    windowsRegisteredBrowserPaths(() => { called += 1; return { status: 0, stdout: 'x' } })
+    expect(called, '非 Windows 不得执行注册表查询').toBe(0)
+  })
 })
 
 describe('ZCode 浏览器探测', () => {

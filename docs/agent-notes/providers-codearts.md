@@ -48,7 +48,7 @@ request/context:  {"provider":"codearts","model":"glm-5.3"}                     
 复核脚本（解 zstd、抽 `request/context`）见会话 `session-fd3e2786` 的取证方式；
 **判据是 `request/context` 事件里有没有 `contextWindow` 键**，不是看 UI。
 
-### ⚠️⚠️ 上游两个目录端点**都不下发窗口**（2026-10-21 只读探测实测）
+### ⚠️⚠️ 两个目录端点不下发窗口，但**第三个端点下**（2026-10-29 修正）
 
 - `snap-access /v1/model/builtin` 的条目**键全集**：
   `channel_source, credit, display_enabled, enable, intervals, model_category,
@@ -60,7 +60,78 @@ request/context:  {"provider":"codearts","model":"glm-5.3"}                     
 - ⚠️ 探测脚本必须**遍历账号池**：本机第一份凭据（`CODEARTS_ACCESS_TOKEN`）已 401，
   只试它一个会得出「上游不可达」的**假结论**。
 
-⇒ 窗口的权威来源是 **IDE 自己下发的 provider 配置**，不是 HTTP 端点。
+⇒ **上面这两条仍然成立，但「窗口只能靠 IDE 配置」的结论已被 2026-10-29 推翻**：
+还有第三个端点 **AgentCenter** 下发窗口，而且是动态权威源（详见下节）。
+旧结论的原因很简单 —— 当时只探了 builtin 与 gateway/config 两个端点，
+AgentCenter 当时还没被当作目录源（codearts2api 那时也只用它取模型列表）。
+
+### ✅ AgentCenter：动态窗口权威源（2026-10-29 接入）
+
+⚠️⚠️ **2026-10-30 四路审计（2 正向 + 2 对抗，60+ 变异）后的修订** —— 本节
+记录了 3 个真缺陷与它们的修法（**代码已改、守卫已补**）：
+
+| # | 缺陷 | 修法 |
+|---|---|---|
+| **P1-1** | **`maxTokens` 出口污染宿主的上下文预留** —— `CatalogEntry.maxTokens` ⇒ `defaultMaxTokens` ⇒ 宿主 `dsh-compaction-basic` 的 `reservedCompletionTokens` 把它**从窗口里扣掉** ⇒ GLM-5.2 压缩触发点 162,201→109,772、压力预算 137,216→71,680；窗口 131,072 的模型 ⇒ **抛 `TargetPressureConfigError`** | **撤掉该落键**（照 `src/opencode-adapter.ts:392-413` 的先例：「上限 ≠ 合理默认预算」）+ 守卫⑦ |
+| **P1-2** | **AgentCenter 独有模型无倍率 ⇒ 聚合定价恒 `Infinity`** ⇒ codearts 在聚合里**永远排最后** | **`windowOnly`**：只作窗口源、**不进目录** + 守卫⑨⑩⑪⑫ |
+| **P2 D1** | **`canonicalQueryOf` 往返会改字节**（`+`/裸 `%`/`=`）⇒ 可能与服务端口径分叉 ⇒ 静默 401 | 加 `isSignedQueryValueSafe` 闸门（**安全集外不发请求**） |
+| **P2 D3** | **`detail` 一步的路由头零守卫** ⇒ 上游从严则 detail 恒 400 ⇒ 核心功能静默失效 | 守卫改**普查**（两次请求都要带） |
+| **P3 D6** | **动态腿在「手填 id」场景不可达**（`unknownModelContextWindow` 只在 `entry===undefined` 时被调，而旧实现查 `remoteModels` ⇒ 二者等价） | 动态窗口收进**独立的表**（`remoteContextWindows`）+ 守卫⑧ |
+
+⚠️⚠️ **2026-10-30 第二轮四路审计（2 正向 + 2 对抗，31 变异）后的修订** ——
+第一轮的修复**方向全部正确**，但「修法」本身暴露了 3 个新的承重处：
+
+| # | 缺陷 | 修法 |
+|---|---|---|
+| **P1 N-1** | **`windowOnly` 只在「远端拉取成功」时生效** —— 兜底路径 `DEFAULT_MODELS` **含 `kimi-k3`** ⇒ 冷缓存（首启 / 远端失败 / 上游抖动）下它**裸名**进目录 ⇒ 第一轮 P1-2 的症状**原样复发** | ① 把 `kimi-k3` **从 `DEFAULT_MODELS` 移除**（它的**窗口**仍可用：`CONTEXT_WINDOWS` + `remoteContextWindows`）② 判据改成**独立 id 集合**（`windowOnlyIds`）⇒ 两条路径口径一致 + 守卫⑪⑫ |
+| **P1 N-2** | **代码页判据把 ja/ko/zh-TW 误判成 GBK** —— 它们的 OEMCP 分别是 932(SJIS)/949/**950(Big5)**，**都不是 GB18030 的子集** ⇒ 那三类系统上路径被解坏 ⇒ 存在性过滤筛掉 ⇒ 整条注册表腿静默失效 | 改读**权威的 `OEMCP`**（`HKLM\SYSTEM\CurrentControlSet\Control\Nls\CodePage` 的 `OEMCP` 值）+ 解码**兜底重试**（首选解出 U+FFFD **或**与备选不同 ⇒ 换编码） |
+| **P1 N-3** | **安全集闸门只盖 4 条带 query 的签名 GET 里的 1 条** ⇒ 同一个 signer **两条腿两套防护口径** | 判据**下沉到 `signRequestHuawei`**（唯一入口、覆盖全部签名请求）；`models.ts` 那层保留只为**脱敏日志** |
+| **P2** | **`Agent-Type` 签名口径三条腿两套**（大小写 + 是否签名），分岔依据**零注释登记** | **已登记**（见 `src/models.ts` 的 `signedExtras` 注释里的矩阵）⇒ 修法需**真实上游**逐端点验证 |
+| **P3** | 安全集漏了 `encodeURIComponent` 的不编码字符（`! * ' ( )`）⇒ 用户手填带 `!` 的模型 id ⇒ `queue/status` 请求被**静默丢弃** | 安全集扩到 `encodeURIComponent` 的**完整**不编码集 + `%XX`（**且要求大写十六进制**：`%2b` 往返会变 `%2B`） |
+
+⚠️ **三条「结论」的更正**（审计发现原文过度归纳）：
+① 「10-21 那次不是上游永久上调而是**临时值/灰度**」—— 从 3 个数据点推出的
+**过度归纳**（按**账号**灰度同样解释得通，未验证）。⇒ 改为事实陈述 +
+登记「若上游按账号灰度 ⇒ 静态表对部分账号仍错」。
+② 「`kimi-k3` 进目录的唯一途径是 AgentCenter」—— **不成立**（它改前就在
+`DEFAULT_MODELS` 里）。
+
+两步 GET，签名与本仓 `signRequestHuawei` 兼容，**额外的两个头必须参与签名**：
+
+| 步骤 | 端点 | 关键返回 |
+|---|---|---|
+| ① | `/v1/agent-center/agents/useragents?offset=0&limit=100` | `agents[]`，取 `is_primary_agent` 那条（缺省第一条） |
+| ② | `/v1/agent-center/agents/detail?agent_id={id}` | `gpts.models[]` 含 `model_parameters.{context_window,max_tokens,supports_images}`（⚠️ 2026-10-30 起本仓**只取 `context_window`** —— `max_tokens` 刻意不取，见上表 P1-1 的后果说明） |
+
+必须带 `agent-type: AgentCenter` + `x-language: zh-cn`（**进签名**）：
+- 缺 `x-language` ⇒ `400 TM.00001001`（「未找到合法可路由 api」—— 看着像路由问题，其实是头不全）；
+- 缺 `agent-type` ⇒ 同上；带错（如 `PromptCenter`）⇒ 同样 400。
+
+⚠️⚠️ **query 必须按 key 排序参与签名**（2026-10-29 真机 2×2 定案）：
+`useragents` 的 wire 顺序是 `offset,limit`（**非**字典序），而服务端按自己收到的参数
+**排序后**重算 canonical ⇒ 直接照搬 wire 顺序签名会得 `401 verify ak sk signature fail`，
+改成签名内排序即 200（wire URL 顺序无关，四轮 4/4 确定性）。
+落在 `src/sign.ts` 的 `canonicalQueryOf()`，**只改签名侧、wire URL 原样**。
+
+真机数据（harness 自己的 STS 凭据，primary agent `9f0e5cb6…`）8 个模型全带窗口，
+与 IDE `/cag` 权威**逐值一致**：`GLM-5.2=202_752 / glm-5.2-sft-harmony=202_752 /
+openpangu-*=524_288 / glm-5.3=1_048_576 / ds-v4.1-flash=1_048_576 /
+kimi-k3=1_048_576 / ds-v4.1-flash-1017=1_048_576`。
+
+⇒ **现在的层次**：AgentCenter 动态值（`RemoteModel.contextWindow`）> 静态表 >
+具名兜底。静态表退化为**冷缓存兜底**，但每条数值仍被取证注释钉住
+（上游再漂移时不必手改表，下次目录刷新即自动跟上）。
+另：`kimi-k3` **只在 AgentCenter 出现**（builtin 漏发）⇒ 它**只能从 AgentCenter
+拿到窗口**。
+⚠️⚠️ **更正**（2026-10-30 四路审计 P3 D9 修）：原文写「这也是它**进目录**的
+唯一途径」——**不成立**：`kimi-k3` **改前就在 `DEFAULT_MODELS` 里**
+（`src/llm-adapter.ts` 的静态兜底目录，master 第 339 行）⇒ **冷缓存下它一直
+在目录里**，不是「可用性缺口」。
+⚠️⚠️ **且 2026-10-30 起它更不该进目录**（审计 P1-2 修）：AgentCenter
+**不下发倍率** ⇒ 它进目录就是**裸名** ⇒ `priceFactorFromName` 恒 `Infinity`
+⇒ 聚合候选**恒排最后、永不被挑中**（静默）。
+⇒ 现在它**只作窗口源**（`RemoteModel.windowOnly`）：**不进目录**，但**手填
+id 时的分母取 AgentCenter 的权威值**（动态窗口表与目录可见性解耦）。
 
 ### 权威取值：IDE 内核日志的 `limit.context`
 
@@ -69,7 +140,7 @@ request/context:  {"provider":"codearts","model":"glm-5.3"}                     
 
 ```json
 "provider":{"inferhub-provider":{"models":{
-  "GLM-5.2":{"id":"GLM-5.2","limit":{"input":1044480,"output":65536,"context":1048576}},
+  "GLM-5.2":{"id":"GLM-5.2","limit":{"input":1044480,"output":65536,"context":202752}},
   "glm-5.3":{"id":"glm-5.3","limit":{"input":1044480,"output":65536,"context":1048576}},
   "glm-5.2-sft-harmony":{"id":"...","limit":{"input":196608,"output":131072,"context":202752}},
   "openpangu-2.0-pro":{"id":"...","limit":{"input":512000,"output":131072,"context":524288}},
@@ -77,23 +148,45 @@ request/context:  {"provider":"codearts","model":"glm-5.3"}                     
 }}}
 ```
 
-⚠️ **这个值会变，而且变过**（本机 42 份日志，2026-09-11~10-21 按日期收敛）：
+⚠️⚠️ **上表的 `GLM-5.2` 已按 2026-10-29 双源复测改为 `202752`**（2026-10-30
+四路审计 P2-2 修）：原文此处写的是 `1048576`，而**同一文档**的漂移表
+（下一节）与代码（`src/llm-adapter.ts` 的 `CONTEXT_WINDOWS`）都是 `202752`
+⇒ 文档里**最像原始证据**的那一格停在改前的值 ⇒ 读者会拿到自相矛盾的两份
+「权威」。⚠️ 这段 JSON 是**历史内核日志的摘录**（按 2026-10-29 复测值校准），
+不是「某一天的原始日志」⇒ 已在上面标注校准来源。
+
+⚠️ **这个值会变，而且变过**（本机 42 份日志，2026-09-11~10-21 按日期收敛；
+2026-10-29 又用 IDE 0.2.6 抓包 + AgentCenter 双源复测）：
 
 | 模型 | 历史 |
 |---|---|
-| `GLM-5.2` | 09-11~10-20 = `202_752` ⇒ **10-21 起 = `1_048_576`** |
+| `GLM-5.2` | 09-11~10-20 = `202_752` ⇒ 10-21 一度 `1_048_576` ⇒ **10-29 复测回到 `202_752`** |
 | `glm-5.3` | 10-17 起出现，先 `202_752` ⇒ **10-21 起 = `1_048_576`** |
 | `glm-5.2-sft-harmony` | 全期 `202_752` |
 | `openpangu-2.0-flash` / `-pro` | 全期 `524_288` |
 | `deepseek-v4.1-flash` | 全期 `1_048_576`（本仓曾写 `1_000_000`，**是错的**） |
+| `kimi-k3` | `1_048_576`（**窗口只由 AgentCenter 下发**，builtin 目录里没有它；⚠️ 2026-10-30 起它**只作窗口源、不进目录** —— 见上节 `windowOnly`） |
 
-⚠️⚠️ **留旧值 `GLM-5.2 = 202_752` 有两个静默后果**（与 `officeace-product.ts`
-那次「估值偏小 5.3 倍」**逐字同因**）：① 占用比被封顶成 100%（分母小 5 倍）；
-② 自动压缩阈值 = `0.8 × 202752 ≈ 162K` ⇒ **1M 的能力永远吃不到**。
+⚠️⚠️ **`GLM-5.2` 的三次漂移是本条的活教材**：10-21 那次 `202_752 → 1M` 当时被当成
+「上游永久上调」（守卫文本还专门写了「不得退回 202_752」），而 10-29 双源复测证明
+那只是**临时值/灰度**。教训不是「该不该改表」，而是 **表本身不应该是唯一权威** ——
+所以本次把 AgentCenter 接成动态源；静态表只做冷缓存兜底，且改它的人必须带取证。
+
+⚠️ **两个方向的后果不对称，但都真实**（与 `officeace-product.ts`
+「估值偏小 5.3 倍」**逐字同因**）：
+- 表值**偏小**（如 202_752 而真实 1M）：占用比封顶 100%、压缩阈值降到 `0.8 × 202_752
+  ≈ 162K` ⇒ **1M 的能力永远吃不到**；
+- 表值**偏大**（如 1M 而真实 202_752）：压缩阈值 ≈ 838K 永不到达 ⇒ **先撞上游溢出**，
+  一轮对话报废。
 ⇒ 校准窗口时**两个出口一起想**（占用条的分母 + 压缩阈值），别只看 UI。
 
-### 修法（三条腿，缺一条就会复发）
+### 修法（四条腿，缺一条就会复发）
 
+0. **动态源**（2026-10-29 新增，最重要）：`fetchAgentCenterWindows()` 把
+   AgentCenter 的 `context_window` 挂到 `RemoteModel.contextWindow`，
+   `toCatalogEntry` 优先读它 ⇒ 上游一改，下次目录刷新自动跟上。
+   ⚠️ **它不进 `isRemoteCatalogComplete`** —— 窗口缺失只是退化（走静态表/兜底），
+   拿它当「目录不完整」的判据会让整个目录被拒，因果不成比例。
 1. **静态表** `src/llm-adapter.ts` 的 `CONTEXT_WINDOWS` 逐模型校准（写来源+日期）；
 2. **具名兜底** `CODEARTS_FALLBACK_CONTEXT_WINDOW = 524_288`（用户 2026-10-21 选定：
    取当前目录**最小真实窗口**；偏小 ⇒ 偏早压缩不报错，偏大 ⇒ 未知模型可能
@@ -124,6 +217,7 @@ request/context:  {"provider":"codearts","model":"glm-5.3"}                     
 | `unknownModelContextWindow` 改回无参常数 | ③ 红 + 跨家不变式 g 红 |
 | 骨架对未知 id 普遍给 `200_000` | **17 条红，逐家点名**（证明其余各家仍受约束） |
 | 回调改回 `() => CODEARTS_FALLBACK_CONTEXT_WINDOW` | ③c 红（精确复现上面那个缺陷） |
+| `toCatalogEntry` 忽略 `model.contextWindow`（只认静态表） | **⑥ 红**（动态源唯一有牙的守卫，2026-10-29 补） |
 
 跨家不变式 (g)「未知 id 不得编造 context」在 `model-catalog-parity.spec.ts`，
 现为「**默认禁止 + codearts 具名例外**」；例外**改判据**（必须等于具名常量），

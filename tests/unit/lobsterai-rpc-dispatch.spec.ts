@@ -116,7 +116,7 @@ describe('account.refresh 分派（T7 回归）', () => {
       EXPECTED_REFRESH_PROVIDER_IDS,
       'channel 集合变了，请复核 opencode 豁免是否仍成立（见 AUTH_EXEMPT）',
     // ⚠️ 2026-10-22（A6）：codely 翻 `channel: true`：20 → 21。
-    // 2026-10-29 fork: qiniu added -> 22.
+    // 2026-10-29 fork: qiniu + magicrew added -> 22.
     ).toHaveLength(22)
   })
 

@@ -103,6 +103,10 @@ export const REFRESH_PROVIDERS = [
   // still re-reads the credential and writes back pool expiresAt via the shared
   // contract, so it stays in this table (omitting it leaves that provider zero coverage).
   'qiniu',
+  // ⚠️ 超级麦吉（Magicrew，2026-10-29）：有真实 refresh 端点
+  //    （`PUT /api/v1/model-gateway/tokens`，`refreshMagicrewKey` 是 refresh_token 的唯一出口），
+  //    `refreshAccountCredential` 续期并回写池内 `expiresAt` ⇒ 不属 loomy / zcode 那类豁免。
+  'magicrew',
 ] as const
 
 /**

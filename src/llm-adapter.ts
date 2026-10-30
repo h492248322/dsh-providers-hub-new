@@ -12,7 +12,7 @@ import { RemoteCatalogGate } from './remote-catalog-gate.js'
 import { broadcastCatalogChanged } from './catalog-broadcast.js'
 import { claimCodeArtsBenefit } from './codearts-credits.js'
 import { nextUtc8DayStartMs } from './model-queue.js'
-import { isCodeArtsBenefitModelKnown } from './models.js'
+import { isCodeArtsBenefitModelKnown, type RemoteModel } from './models.js'
 import { normalizeHarnessMessages } from './message-shape.js'
 import { signRequestHuawei } from './sign.js'
 // ⚠️ `detailFieldText`（`detail` 那条腿）**只留一份实现** —— 本仓库 6 份同义的
@@ -331,12 +331,19 @@ const CODEARTS_QUOTA_EXHAUSTED_CODE = 'QUOTA_EXCEEDED'
 //
 // ⚠️ VL 模型（`kimi-k2.6-vl` / `Qwen3-VL-235B`）**刻意不入本表**：它们被
 // `catalogEntries` 的可见性过滤挡在主列表外，只经 `analyzeImage` 间接调用。
-const DEFAULT_MODELS: readonly string[] = [
+//
+// ⚠️⚠️ **`kimi-k3` 也不在本表**（2026-10-30 第二轮审计 P1 N-1 修）：
+// 它是**只在 AgentCenter 出现**的模型（builtin 漏发）⇒ AgentCenter
+// **不下发倍率** ⇒ 它进目录必然是**裸名** ⇒ `priceFactorFromName` 恒
+// `Infinity` ⇒ 聚合里 codearts 恒排最后、永远不被挑中（静默）。
+// ⇒ **窗口源条目一律不进对话目录**（两条路径：远端与冷缓存兜底）。
+// ⚠️ 它的**上下文窗口**仍可用：见 `CONTEXT_WINDOWS`（静态兜底）与
+// `remoteContextWindows`（动态权威）—— 用户手填 `kimi-k3` 时分母是对的。
+export const DEFAULT_MODELS: readonly string[] = [
   'GLM-5.2', 'GLM-5.1',
   'glm-5.3', 'glm-5.2-sft-harmony',
   'openpangu-2.0-flash', 'openpangu-2.0-pro',
   'deepseek-v4-flash', 'deepseek-v4.1-flash', 'deepseek-v4.1-flash-1017',
-  'kimi-k3',
 ]
 
 /**
@@ -358,23 +365,27 @@ const DEFAULT_MODELS: readonly string[] = [
  *
  * | 模型 | `limit.context` | 取值历史 |
  * |---|---|---|
- * | `GLM-5.2` | **1_048_576** | 09-11~10-20 是 `202_752`，**10-21 起上游改成 1M** |
+ * | `GLM-5.2` | **202_752** | 09-11~10-20 是 `202_752`；**10-21 改 1_048_576**；
+ * | | | **10-29 IDE 0.2.6 抓包 + AgentCenter 又改回 202_752**（三次漂移，见下） |
  * | `glm-5.3` | **1_048_576** | 同上（09 月表里没有它，10-17 起出现，先 202752 后 1M） |
- * | `glm-5.2-sft-harmony` | **202_752** | 全期稳定（09-11~10-21） |
- * | `openpangu-2.0-flash` / `-pro` | **524_288** | 全期稳定 |
+ * | `glm-5.2-sft-harmony` | **202_752** | 全期稳定（09-11~10-29，AgentCenter 一致） |
+ * | `openpangu-2.0-flash` / `-pro` | **524_288** | 全期稳定（AgentCenter 一致） |
  * | `deepseek-v4.1-flash` | **1_048_576** | 全期稳定（本表原先写 1_000_000，**已按 IDE 权威值改正**） |
+ * | `kimi-k3` | **1_048_576** | 2026-10-29 补（IDE 0.2.6 + AgentCenter 一致；此前缺行走 524_288 兜底） |
  * | `glm-5.3-flash` | **1_048_576** | 逆向自 IDE gateway/config（对齐 deveco-code-rust 90aeb17d） |
  * | `deepseek-v4-flash` / `-pro` | **1_048_576** | UI 标注「每日 1000 万免费 Tokens」同批（对齐 fb1b4a2） |
  *
- * ⚠️ **`GLM-5.2` 的 202_752 已过期**（那是 10-20 及以前的配置）。留着它有两个
- * 真实后果，且都是**静默**的：① 占用比被封顶成 100%（分母小 5 倍）；
- * ② 自动压缩阈值 = `0.8 × 202752 ≈ 162K` ⇒ **1M 的能力永远吃不到**
- * （与 `officeace-product.ts` 那次「估值偏小 5.3 倍」逐字同因）。
+ * ⚠️⚠️ **`GLM-5.2` 的窗口是本表唯一三次漂移的行**：202_752（09~10-20）→
+ * 1_048_576（10-21 校准）→ **202_752（10-29 复测，IDE 0.2.6 抓包 + AgentCenter
+ * 动态源双源一致）**。⇒ 结论：**10-21 那次不是「上游永久上调」而是临时值/灰度**。
+ * 本表现按 2026-10-29 权威写回 202_752 —— 但它是**兜底**（冷缓存/AgentCenter
+ * 失败时才用到）：运行时权威已由 AgentCenter 动态下发（`RemoteModel.contextWindow`，
+ * 优先于本表），下次上游再漂移不再依赖改这张表。
  *
  * ⚠️ **本表查不到时不再省略 `context`** —— 见 {@link CODEARTS_FALLBACK_CONTEXT_WINDOW}。
  */
 const CONTEXT_WINDOWS: ReadonlyMap<string, number> = new Map([
-  ['GLM-5.2', 1_048_576],
+  ['GLM-5.2', 202_752],
   ['glm-5.3', 1_048_576],
   ['glm-5.3-flash', 1_048_576],
   ['glm-5.2-sft-harmony', 202_752],
@@ -390,6 +401,10 @@ const CONTEXT_WINDOWS: ReadonlyMap<string, number> = new Map([
   //    不补这一行会让它走 524_288 的具名兜底 ⇒ 分母错 2 倍、压缩阈值偏早
   //    （正是 `CODEARTS_FALLBACK_CONTEXT_WINDOW` 注释里记录的那条报障形态）。
   ['deepseek-v4.1-flash-1017', 1_048_576],
+  // ⚠️ `kimi-k3` 在 IDE 0.2.6 与 AgentCenter 目录里都有（2026-10-29 取证），
+  //    但 2026-10-29 前的 `/v1/model/builtin` 快照**没有它** ⇒ 曾走 524_288
+  //    兜底（分母错 2 倍）。现由 AgentCenter 动态补目录 + 窗口，本行是兜底。
+  ['kimi-k3', 1_048_576],
 ])
 
 /**
@@ -515,7 +530,7 @@ export interface CodeArtsAdapterOptions {
   resolveCredential: () => Promise<CodeArtsCredential | undefined>
   refresh: () => Promise<void>
   /** 动态拉取远端模型列表；失败时调用方回退到静态列表。 */
-  fetchRemoteModels?: () => Promise<Array<{ id: string; name: string; rateLabel?: string }>>
+  fetchRemoteModels?: () => Promise<RemoteModel[]>
   /**
    * 最近一次目录拉取的**各来源成败**（issue IKJVTF，审计 I3）。
    *
@@ -1453,8 +1468,14 @@ export class CodeArtsAdapter extends LlmAdapter {
          * ⚠️ **不要推广到别家**：多数家的窗口来自远端该模型的配置，对未知 id
          *    编一个就是**假窗口**（分母错 ⇒ 占用比与压缩阈值一起错）。
          *    取值理由见 `CODEARTS_FALLBACK_CONTEXT_WINDOW` 的长注释。
+         *
+         * ⚠️ 2026-10-29 修订（AgentCenter 接入）：取值顺序改为「动态值优先、
+         *    静态表兜底」—— 此前「目录窗口全来自静态表」已过期；AgentCenter
+         *    与 IDE 内核权威逐值一致（GLM-5.2 现值 202752），静态表有三次漂移史
+         *    （见 `CONTEXT_WINDOWS` 的 GLM-5.2 行）；远端失败/无该 id 时仍回静态表。
          */
-        unknownModelContextWindow: (modelId) => codeartsContextWindow(modelId),
+        unknownModelContextWindow: (modelId) =>
+          this.remoteContextWindowOf(modelId) ?? codeartsContextWindow(modelId),
         /**
          * ★ **强制重拉**（供后台 20 分钟刷新器与「用户改设置」）。
          *
@@ -1487,7 +1508,53 @@ export class CodeArtsAdapter extends LlmAdapter {
   }
 
   /** 动态模型缓存（首次 listModels 成功后填充）。 */
-  private remoteModels: Array<{ id: string; name: string; rateLabel?: string }> | undefined
+  private remoteModels: RemoteModel[] | undefined
+
+  /**
+   * AgentCenter 动态窗口表（**独立于目录可见性**）。
+   *
+   * ⚠️⚠️ **为什么必须与目录解耦**（2026-10-30 四路审计 P3 D6 定案）：
+   * `src/model-catalog.ts` 的 `unknownModelContextWindow` 调用点**只在
+   * `entry === undefined`（模型不在目录里）时**才走；而旧实现查的是
+   * `this.remoteModels` —— 可 `catalogEntries()` 正是由 `this.remoteModels`
+   * 映射而来 ⇒ **「在 remoteModels 里」⟺「在目录里」** ⇒ 动态腿在
+   * 「手填模型 id」场景**基本不可达**（实测唯一例外是 VL 模型，而 VL 走
+   * `analyzeImage` 那条路**根本不需要窗口** ⇒ 实际收益 ≈ 0）。
+   *
+   * ⇒ 这张表只装「AgentCenter 下发的窗口」，**与目录可见性无关**：
+   * 任何 id 只要 AgentCenter 给过窗口，就能查到正确分母。
+   *
+   * ⚠️ 键用**原始 id**（不做 `normalizeModelId` 归一）—— 与
+   * `src/models.ts` 的 `seen` 键口径一致（归一会把 `deepseek-v4.1-flash` 与
+   * `deepseek-v4.1-flash-1017` 并成一条，那是**两个不同模型**）。
+   */
+  private remoteContextWindows = new Map<string, number>()
+
+  /**
+   * 「只作窗口源」的模型 id 集合（**独立于目录**）。
+   *
+   * ⚠️⚠️ **必须是独立集合，不能只看条目的 `windowOnly` 属性**
+   * （2026-10-30 第二轮审计 P1 N-1 修）：原先只看属性 ⇒ **只在「远端拉取
+   * 成功」时生效** ⇒ 冷缓存（首启 / 远端失败 / 上游抖动）走 `DEFAULT_MODELS`
+   * 兜底 ⇒ 那些条目**没有** `windowOnly` 属性 ⇒ `kimi-k3` 以**裸名**进目录
+   * ⇒ `priceFactorFromName('kimi-k3')` = `Infinity` ⇒ 聚合里 codearts 恒排
+   * 最后 ⇒ 第一轮 P1-2 的症状**原样复发**（实测）。
+   *
+   * ⇒ 这里在**远端拉到窗口源条目时**记下它们的 id ⇒ 之后**冷缓存也记得**
+   * ⇒ 两条路径口径一致。
+   */
+  private windowOnlyIds = new Set<string>()
+
+  /**
+   * AgentCenter 动态窗口优先查（2026-10-29 接入；2026-10-30 改为查独立表）。
+   *
+   * ⚠️ 查**表**（O(1)）而不是扫数组：旧实现是线性 `find`，且因与目录耦合
+   * 而基本走不到；改成表之后它才真的会被调用（手填 id 场景）。
+   */
+  private remoteContextWindowOf(modelId: string): number | undefined {
+    const w = this.remoteContextWindows.get(modelId)
+    return typeof w === 'number' && w > 0 && Number.isFinite(w) ? w : undefined
+  }
 
   /**
    * 已落缓存的目录是否**所有来源都取全**（issue IKJVTF，审计 I3）。
@@ -1558,6 +1625,32 @@ export class CodeArtsAdapter extends LlmAdapter {
       // 也不应立刻重试（否则每个模型都打一次空请求）。
       if (models.length === 0) return false
       this.remoteModels = models
+      // ⚠️⚠️ **同步重建窗口表**（2026-10-30 审计 P3 D6 修）：
+      //    动态窗口**必须与目录可见性解耦** —— `unknownModelContextWindow`
+      //    只在「模型不在目录里」时被调，而旧实现查的是 `remoteModels`
+      //    ⇒ 「在 remoteModels 里」⟺「在目录里」⇒ 动态腿在「手填模型 id」
+      //    场景**基本不可达**（实测唯一例外是 VL，而 VL 不需要窗口）。
+      //    ⇒ 这里把**全部**带窗口的条目（含 `windowOnly` 的窗口源条目）
+      //    收进表里，与目录可见性无关。
+      //
+      //    ⚠️ 键用**原始 id**（不做归一）—— 与 `src/models.ts` 的 `seen` 键
+      //    口径一致（归一会把 `deepseek-v4.1-flash` 与 `-1017` 并成一条，
+      //    那是**两个不同模型**）。
+      const windows = new Map<string, number>()
+      for (const model of models) {
+        const w = model.contextWindow
+        if (typeof w === 'number' && Number.isFinite(w) && w > 0) windows.set(model.id, w)
+      }
+      this.remoteContextWindows = windows
+      // ⚠️⚠️ **同时记下「窗口源 id」**（2026-10-30 第二轮审计 P1 N-1 修）：
+      //    这些 id **只在 AgentCenter 出现**（builtin 没有）⇒ 若它们进目录，
+      //    就是**裸名**（AgentCenter 不下发倍率）⇒ `priceFactorFromName` 恒
+      //    `Infinity` ⇒ 聚合里 codearts 恒排最后。
+      //    ⇒ 记进**独立集合**（`windowOnlyIds`）⇒ 之后**冷缓存也记得**
+      //    ⇒ 远端路径与兜底路径口径一致。
+      this.windowOnlyIds = new Set(
+        models.filter((m) => m.windowOnly === true).map((m) => m.id),
+      )
       // ⚠️ **只在成功赋值后**记时刻：失败/空结果不写，否则一次抖动会把上界
       //    刷新掉、下轮还要等满 20 分钟才发现上游没恢复。
       this.catalogAt = this.options.now?.() ?? Date.now()
@@ -1617,10 +1710,18 @@ export class CodeArtsAdapter extends LlmAdapter {
    *    `reasoning_tokens`，落在基线噪声内；`none` 也照常思考）。
    *    故**不**臆造 low/high/max 强度阶梯。
    */
-  private toCatalogEntry(model: { id: string; name: string; rateLabel?: string }): CatalogEntry {
-    // ⚠️ **恒有值**（表内优先、查不到走具名兜底）—— 缺它用户就没有上下文占用条，
-    //    见 `CODEARTS_FALLBACK_CONTEXT_WINDOW` 的长注释（真实报障 2026-10-21）。
-    const contextWindow = codeartsContextWindow(model.id)
+  private toCatalogEntry(model: RemoteModel): CatalogEntry {
+    // ⚠️ **恒有值**（远端动态值优先 → 静态表 → 具名兜底，恒返回正数）——
+    //    缺它用户就没有上下文占用条，见 `CODEARTS_FALLBACK_CONTEXT_WINDOW`
+    //    的长注释（真实报障 2026-10-21）。
+    //    2026-10-29 起动态源：AgentCenter 带回的窗口与 IDE 内核权威逐值一致，
+    //    静态表只是冷缓存/失败兜底（GLM-5.2 漂移史见 `CONTEXT_WINDOWS`）。
+    //    ⚠️ 这里**直接读条目自身的 `contextWindow`**（条目本就来自
+    //    `this.remoteModels`，再 `find` 一遍是 O(N²) 重建——IKL3YH 同型）；
+    //    `DEFAULT_MODELS` 的骨架条目没有该字段 ⇒ 走静态表。
+    const contextWindow = typeof model.contextWindow === 'number' && model.contextWindow > 0 && Number.isFinite(model.contextWindow)
+      ? model.contextWindow
+      : codeartsContextWindow(model.id)
     // ⚠️ 倍率拼进 `name`（与 officeace / buddy / loomy / raccoon 同款：
     //    `name` 带倍率、`resolveModel` 用裸名，骨架只认 `name`）。
     //
@@ -1666,6 +1767,32 @@ export class CodeArtsAdapter extends LlmAdapter {
       // ⚠️ **无条件落键**（`codeartsContextWindow` 恒返回正数）—— 写成
       //    `...contextWindow !== undefined ? {...} : {}` 就是本缺陷的成因。
       contextWindow,
+      // ⚠️⚠️ **刻意不声明 `maxTokens`**（2026-10-30 四路审计 P1-1 定案）：
+      //
+      //    上游 AgentCenter 的 `max_tokens`（单次输出上限）**看起来**该落这里，
+      //    但 DSH 的契约不是「上限」而是「**默认输出预算**」：
+      //    `dsh-llm` 把 `defaultMaxTokens` 注入 `config.maxTokens`
+      //    （`node_modules/@deepseek-ai/dsh-llm/lib/index.js:2183-2185`），
+      //    而 `dsh-compaction-basic` 的 `reservedCompletionTokens(agent,
+      //    defaultMaxTokens)`（`lib/index.js:757`）读的**正是同一个值** ——
+      //    它把该值当作「**输出侧预留**」**从上下文窗口里扣掉**。
+      //
+      //    ⇒ 落键的后果（实测，宿主默认 thresholdRatio=0.8 / headroom=65536）：
+      //      GLM-5.2 压缩触发点 **162,201 → 109,772**、压力预算 **137,216 → 71,680**；
+      //      窗口 131,072 的模型配上 65536 的预留 ⇒ pressure=0 ⇒ 宿主**抛**
+      //      `TargetPressureConfigError`（**不是降级**）。
+      //    ⇒ 而 `master` 的 `toCatalogEntry` **全文没有 `maxTokens` 键**
+      //      ⇒ `defaultMaxTokens` 恒 undefined ⇒ 预留恒 0 ⇒ 上述回归是
+      //      **本 PR 新引入的**。
+      //
+      //    ⚠️ 与本仓既有先例同口径：`src/opencode-adapter.ts:392-413`
+      //    **刻意不声明** `defaultMaxTokens`，理由逐字为「能力表里的
+      //    `limit.output` 是**模型单次输出上限**，不是『合理的默认输出预算』……
+      //    下发等于**我们替用户决定**每轮按上限请求」。本家照此办理。
+      //    ⚠️ 出站侧的钳制**不受影响**：`clampCodeArtsMaxTokens` 只 `Math.min`
+      //    向下、不抬预算，默认预算仍由 `CODEARTS_MAX_OUTPUT_TOKENS` 单点决定
+      //    （`src/llm-adapter.ts:1965`）⇒ 撤掉本键**不改变实际发出去的
+      //    `max_tokens`**（上游声明值 65535 与本地 65536 的 1 token 差异也一并消失）。
       reasoning: {
         // ⚠️ 顺序 = **强度序（弱 → 强）**，逐条理由见 `CODEARTS_REASONING_EFFORTS`
         // 的长注释（Issue IKLIDV）—— 简言之：DSH 把该数组当展示顺序、客户端不排序，
@@ -1688,11 +1815,43 @@ export class CodeArtsAdapter extends LlmAdapter {
   private async catalogEntries(): Promise<readonly CatalogEntry[]> {
     await this.ensureRemoteModels()
     const source = this.remoteModels ?? DEFAULT_MODELS.map((id) => ({ id, name: id }))
-    // ⚠️ 与 `listModels` 保持**同一套**「可见性」过滤（VL 多模态不参与），
-    // 唯一区别是不套用户黑名单 —— 那条区别现在由骨架的 `listAllModels` 承担。
     return source
-      .filter((m) => !/-VL-/i.test(m.id) && !/-VL$/i.test(m.id))
+      .filter((m) => this.isVisibleCatalogEntry(m))
       .map((m) => this.toCatalogEntry(m))
+  }
+
+  /**
+   * 一条远端条目**该不该进对话目录**（**两条路径共用**，2026-10-30 第二轮审计 P1 N-2 修）。
+   *
+   * ⚠️⚠️ **必须共用**（实测踩到）：`catalogEntries()`（异步，给 `listModels` /
+   * `resolveModel` 用）与 `syncCatalogEntries()`（同步，给 `listAllModels` 用）
+   * **原本各写一遍** ⇒ 守卫只覆盖了异步那条 ⇒ 变异「删掉同步那条的过滤」
+   * ⇒ **全量 11476 条用例全绿**（零保护）⇒ 而 `listAllModels()` 是
+   * **Jet Hub 模型开关清单**的数据源（`src/jet-hub-rpc.ts` 的 `fullCatalogIds()`）
+   * ⇒ 窗口源条目会**以裸名**出现在设置页（正是 P1-2 想消灭的形态）。
+   *
+   * ⇒ 现在**一份判据、两条路径共用** ⇒ 不可能再分叉。
+   *
+   * 判据两条：
+   * 1. ⚠️ **窗口源条目不进目录** —— AgentCenter 不下发倍率 ⇒ 进目录就是裸名
+   *    ⇒ `priceFactorFromName` 恒 `Infinity` ⇒ 聚合里 codearts 恒排最后、
+   *    永远不被挑中（静默）。它们的**窗口**仍可用 ——
+   *    见 {@link remoteContextWindows}。
+   *    ⚠️⚠️ **判据是「id 集合」而不是「条目属性」**（2026-10-30 第二轮审计
+   *    P1 N-1 修）：原先只看条目的 `windowOnly` 属性 ⇒ **只在「远端拉取成功」
+   *    时生效** ⇒ 冷缓存（首启 / 远端失败 / 上游抖动）走
+   *    `DEFAULT_MODELS` 兜底 ⇒ 那里的条目**没有** `windowOnly` 属性 ⇒
+   *    `kimi-k3` 以**裸名**进目录 ⇒ 第一轮 P1-2 的症状**原样复发**。
+   *    ⇒ 现在判据是 {@link windowOnlyIds} 这个**独立 id 集合**（远端来时填、
+   *    **冷缓存时也留着**）⇒ 两条路径口径一致。
+   * 2. ⚠️ **VL 多模态不进对话目录**（上下文小、不支持工具调用；当 agent 主模型
+   *    会踩别的坑）。⚠️ 与 `src/models.ts` 的 `parseModelInfo` **同口径**
+   *    （大小写**不敏感**）。
+   */
+  private isVisibleCatalogEntry(model: { id: string, windowOnly?: boolean }): boolean {
+    if (model.windowOnly === true) return false
+    if (this.windowOnlyIds.has(model.id)) return false
+    return !/-VL-/i.test(model.id) && !/-VL$/i.test(model.id)
   }
 
   /**
@@ -1703,8 +1862,11 @@ export class CodeArtsAdapter extends LlmAdapter {
    */
   private syncCatalogEntries(): readonly CatalogEntry[] {
     const source = this.remoteModels ?? DEFAULT_MODELS.map((id) => ({ id, name: id }))
+    // ⚠️⚠️ **判据与 `catalogEntries()` 共用**（`isVisibleCatalogEntry`）——
+    //    原先两条路径**各写一遍** ⇒ 守卫只覆盖异步那条 ⇒ 同步那条（**Jet Hub
+    //    模型开关清单**的数据源）零保护（2026-10-30 第二轮审计 P1 N-2 修）。
     return source
-      .filter((m) => !/-VL-/i.test(m.id) && !/-VL$/i.test(m.id))
+      .filter((m) => this.isVisibleCatalogEntry(m))
       .map((m) => this.toCatalogEntry(m))
   }
 

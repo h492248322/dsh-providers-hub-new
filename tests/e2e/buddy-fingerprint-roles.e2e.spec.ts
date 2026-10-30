@@ -135,7 +135,7 @@ const SITES = [
  * |---|---|---|
  * | `X-Product-Code` | `codebuddy` | `workbuddy` |
  * | `X-IDE-Name` / `X-IDE-Type` / `X-Product` | `CodeBuddy` | `WorkBuddy` |
- * | `X-IDE-Version` | `1.106.1` | 产品的 `clientVersion` |
+ * | `X-IDE-Version` | `4.12.2` | 产品的 `clientVersion` |
  *
  * ⚠️ 另外三枚 `X-Conversation-*` 与 `X-Agent-Purpose` 也照发：IKM7SG 实测
  * 「三头准入」是**按账号**的硬需求（本文件的 `11128` 子原因分类正是为它设的）。

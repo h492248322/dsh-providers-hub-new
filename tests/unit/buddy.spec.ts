@@ -165,7 +165,7 @@ describe('buddy request headers', () => {
   it('requestHeaders sends X-Domain and the IDE User-Agent', () => {
     const headers = credentialRequestHeaders({ access_token: 'AT', refresh_token: 'RT', domain: 'copilot.tencent.com' })
     expect(headers['X-Domain']).toBe('copilot.tencent.com')
-    expect(headers['User-Agent']).toBe('CodeBuddyIDE/1.106.1')
+    expect(headers['User-Agent']).toBe('CodeBuddyIDE/4.12.2')
   })
 
   it('requestHeaders falls back to the default domain', () => {

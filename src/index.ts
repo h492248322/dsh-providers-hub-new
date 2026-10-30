@@ -97,6 +97,11 @@ import { fetchQoderBalanceDetailed, fetchQoderCreditBalance } from './qoder-cred
 // ⚠️ astudio 的 `fetchAstudioCreditBalance` 是 2026-10-20 为「永久积分锁定」新增的
 //    薄封装（压平 `fetchAstudioBalanceDetailed` 的 `{balance, error?}` 成
 //    `CreditBalance | null`）。两个变体**都接**（见上方长注释），选号器优先用 Detailed。
+import { MagicrewAuth } from './magicrew-auth.js'
+import type { MagicrewCredential } from './magicrew-auth.js'
+import { MagicrewService } from './magicrew.js'
+import { MAGICREW } from './magicrew-product.js'
+import { registerAdapterIdempotent } from './llm-register-compat.js'
 import { fetchAstudioBalanceDetailed, fetchAstudioCreditBalance } from './astudio-credits.js'
 // ⚠️ MiniMax 两站的 `fetchMinimaxCreditBalance`（2026-10-20，同为「永久积分锁定」新增）：
 //    它是 `fetchMinimaxCreditBalanceDetailed` 的薄封装。两个变体**都接**。
@@ -3863,6 +3868,87 @@ export function apply(ctx: Context): void {
   // 故这里**不需要**再 ctx.provide('astudioAuth' / 'astudioLlm')。
   // 不注册斜杠命令：入口在 Jet Hub 的 AStudio 面板。
   const astudio = new AstudioAuth(ctx)
+  // 超级麦吉（Magicrew 国内站，2026-10-29）。MagicrewAuth 构造时自 provide（服务名 magicrewAuth）。
+  const magicrewAuth = new MagicrewAuth(ctx)
+  /**
+   * 适配器**必须**拿到 `resolveCredential` 与 `fetchRemoteModels`：
+   * 缺前者 ⇒ 每条请求抛 `AUTH`「账号未登录」（已登录用户也看到，且 AUTH 吞文案）；
+   * 缺后者 ⇒ 目录只剩静态兜底（静默退化，用户看到的是过期 ctx/档位）。
+   */
+  /**
+   * ⚠️⚠️ **必须走 `createCredentialResolver(pool)`**（2026-10-29 最终审查 K2）。
+   *
+   * 直接传 `() => magicrewAuth.currentCredential()` 会落到**固定默认 ref**
+   * （`MAGICREW_ACCESS_TOKEN`），而全仓**没有任何代码写那个 ref** ——
+   * 池里真正存的是 `MAGICREW_ACCOUNT_*`，适配器**永远读不到**：
+   *   ① 多账号不可用；② `mgw_` key 仅 **2 小时**，到期后 `refreshAll` 在池里
+   *   找不到账号 ⇒ **不自愈** ⇒ 此后每条请求 `AUTH`（token无效）直到手工换凭据。
+   *
+   * 走 resolver 还白拿**请求级换号**与**限流排除**（其余 23 家同款）。
+   */
+  const magicrewResolver = createCredentialResolver<MagicrewCredential>(
+    { pool: pool as never },
+    {
+      product: MAGICREW,
+      // 按 ref 读 ⇒ 池里的 `MAGICREW_ACCOUNT_*` 与手工塞的默认 ref 都能读。
+      readCredential: (refName) => magicrewAuth.currentCredential(refName),
+      // 兜底固定 ref（手工塞凭据 / 迁移场景，与其余 11 家同款）。
+      fallback: { kind: 'ref', refName: MAGICREW.defaultCredentialRef },
+      /**
+       * ⚠️ **必须传**（2026-10-29 最终审查 I5 连带）：不传时「全部账号被该模型限流」
+       *    会降级成**误导性的「未登录」**（`MISSING_CREDENTIAL`），用户会去重登一个
+       *    本来没问题的号（issue IKKHL5 的同型症状）。`ratelimit-locked-misreport`
+       *    的「走了工厂却没接限流判定」那条守卫会直接点名 magicrew。
+       */
+      throwIfAllRateLimited: throwIfAllAccountsRateLimited,
+    },
+  )
+  const magicrewService = new MagicrewService({
+    // ⚠️ 必填：`login()` 的实现在 auth 层（`account.create` 只拿得到 `JetHubAuths`）。
+    auth: magicrewAuth,
+    resolveCredential: magicrewResolver,
+    /**
+     * ⚠️ 桥接宿主读图入口。**必须用 `ctx.get()` 惰性取**，不能写 `ctx.attachments` ——
+     *    后者是 cordis 的 inject 服务，在同步代码里直接访问会抛
+     *    `cannot get property "…" without inject` 并**打断整个 `apply()`**
+     *    （实测：`ctx.provide('accountPool', …)` 在 5977 行，被打断后 minimax 的
+     *    巡检定时器读不到它 ⇒ `wiring-lifecycle-guards.spec.ts` 两条红）。
+     *    惰性取时缺服务返回 `undefined` ⇒ 适配器抛 `INVALID_REQUEST`（可见失败，
+     *    不是静默降级）。
+     */
+    readImage: async (attachment: unknown) => {
+      const attachments = ctx.get('attachments') as
+        | { readImage?: (a: unknown) => Promise<{ ref: { mediaType: string }, data: Uint8Array }> }
+        | undefined
+      if (attachments?.readImage === undefined) return undefined
+      const stored = await attachments.readImage(attachment)
+      if (stored === undefined) return undefined
+      // 形状转换：宿主给 `{ ref, data }`，适配器要 `{ data, mediaType }`（拼 data URL 用）。
+      return { data: stored.data, mediaType: stored.ref.mediaType }
+    },
+    fetchRemoteModels: async () => {
+      const credential = await magicrewAuth.currentCredential()
+      if (credential === undefined) return []
+      return await magicrewAuth.fetchCatalogModels(credential.jwt, credential.organizationCode)
+    },
+    /**
+     * ⚠️ 桥接宿主读图入口。缺了它，vision 模型发图会**抛 INVALID_REQUEST**
+     *（刻意的可见失败）—— 静默降级会让模型「看不到图却以为看到了」，那是幻觉源。
+     */
+    /**
+     * ⚠️⚠️ **必须传**（与 astudio 的 IKP8OF 同因）：不传时 `createModelCatalog` 的
+     *    deps 里 `accountPool` 缺席 ⇒「用户在 Jet Hub 关掉的模型照样出现在选择器里」
+     *    且关闭整个供应商无效（`disabledModelsFor` / `providerClosedFor` 全走 `?.`
+     *    静默跳过）。**更严重的是**：`MagicrewAdapter` 构造时若读 `ctx.accountPool`
+     *    会抛 `cannot get property "accountPool" without inject` ⇒ **打断整个 `apply()`**，
+     *    后续 provider 的定时器/接线全部不执行（实测：minimax 两站巡检因此没启动，
+     *    `wiring-lifecycle-guards.spec.ts` 两条红）。
+     */
+    accountPool: pool,
+  })
+  const magicrewAdapter = magicrewService.adapter
+  // 与 accio / aggregate 同款幂等注册（`llm-register-compat.ts` 负责记账与剔除包装）。
+  registerAdapterIdempotent(ctx.llm, [MAGICREW.id], magicrewAdapter)
   /**
    * 按凭据 ref 解析 AStudio 凭据（供**选号器查余额**与最终取凭据共用）。
    *
@@ -5408,6 +5494,7 @@ async function fetchBalanceReading(
     //    目录。表里缺它 ⇒ 退化到已过滤的 `llm.listModels` ⇒「关闭整个 provider」
     //    时漏写黑名单 ⇒「provider 显示已关闭、模型却仍可选用」的矛盾态。
     qiniu: pruned(QINIU.id, qiniuAdapter),
+    magicrew: pruned(MAGICREW.id, magicrewAdapter),
     // OfficeAce（华为 MaaS 云端直连）：目录静态 + 平台侧可用性，同其余渠道。
     officeace: pruned(OFFICEACE.id, officeAceAdapter),
     // AStudio（上游 MAAS 云端直连）：目录来自 model-manager 远端 + 兜底表，同其余渠道。
@@ -5791,6 +5878,11 @@ async function fetchBalanceReading(
       //    （`provider-runtime.ts` 的注册表是按本数组逐个 `registerProviderRuntime`
       //    建的；主循环本身不需要改）。
       ['qiniu', qiniu],
+      // ⚠️ 超级麦吉（Magicrew，2026-10-29）：值必须是 `registerJetHubRpc` 的
+      //    `auths.magicrew` 是**同一个对象**，否则守卫用例布在该实例上的 spy
+      //    收不到本循环的调用（本仓库复发过 6 次）。
+      //    漏加这一行 = 它不进注册表 ⇒ 续期/积分/探测三条链路全部静默失效。
+      ['magicrew', magicrewAuth],
     ]
     for (const [id, auth] of registry) {
       const descriptor = descriptorOf(id)
@@ -5982,6 +6074,10 @@ async function fetchBalanceReading(
     //    `credits-balance-self-heal.spec.ts` 的反向守卫（JetHubAuths 每个键
     //    必须在自愈表或豁免表里）会红。
     qiniu,
+    // ⚠️ 超级麦吉（Magicrew，2026-10-29）：值必须是 `registerProviderRuntime` 那个
+    //    registry 数组里 `['magicrew', magicrewAuth]` 的**同一个实例**，否则
+    //    `provider-runtime-wiring.spec.ts` 布在该实例上的 spy 收不到调用。
+    magicrew: magicrewAuth,
   }, modelAdapters)
 
   // 网关是旁路功能：这里传 `pool` 只为读设置页里的开关，其内部任何失败都已
