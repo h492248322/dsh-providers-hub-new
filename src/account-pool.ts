@@ -10,6 +10,7 @@ import { normalizeOpencodeGeneration } from './opencode-auth.js'
 import { maskProxyPassword } from './proxy-mask.js'
 // ⚠️ `model-queue.ts` **零 import**（纯函数模块，见其模块头）⇒ 不引入环。
 import { nextUtc8DayStartMs } from './model-queue.js'
+import { rankAccountsBySession, shuffleAccounts } from './session-balance.js'
 import type {
   CodeArtsCredential,
   ProviderAccountEntry,
@@ -393,6 +394,17 @@ export class AccountPool {
    */
   private nativeWebSearchCache = true
   /**
+   * 「ZCode 会话负载均衡」开关的进程内副本。
+   *
+   * 缺键语义是**启用**（与 {@link nativeWebSearchCache} 同一方向）：老文档没有
+   * 本键时保持会话亲和，不会因读取失败而静默改回「手动顺序压一个号」
+   *（那正是 2026-10-30 用户要求修掉的形态）。
+   *
+   * ⚠️ 与 {@link nativeWebSearchCache} 同级、**不需要**独立文档：丢失本键的
+   * 唯一后果是回到手动顺序，用户再开一次即可。
+   */
+  private sessionBalanceCache = true
+  /**
    * 「面板入口」的进程内副本：Jet Hub 的唯一入口位置（两个取值互斥）。
    *
    * 缺键语义是 `'sidebar'`「仅侧栏」（与 {@link nativeWebSearchCache} 同一方向）：
@@ -520,6 +532,8 @@ export class AccountPool {
       this.gatewayAllowLanCache = state.gatewayAllowLan === true
       // 原生搜索总开关同理：老文档没有该键 → 保持默认启用。
       this.nativeWebSearchCache = state.nativeWebSearchEnabled !== false
+      // 会话负载均衡开关同理：老文档没有该键 → 保持默认启用。
+      this.sessionBalanceCache = state.sessionBalanceEnabled !== false
       // 面板入口同理：老文档没有该键（或值是脏值）→ 回到默认「仅侧栏」。
       // 过一遍 sanitize：store 层的 load 已归一，这里再判一次是因为老契约
       // 后端可能绕过 schema 直接给出原始文档。
@@ -627,6 +641,10 @@ export class AccountPool {
         //    重启后静默回到只绑回环（用户会以为开关坏了）。
         gatewayAllowLan: this.gatewayAllowLanCache,
         nativeWebSearchEnabled: this.nativeWebSearchCache,
+        // ⚠️ **必须带上本键**（与 `nativeWebSearchEnabled` 同一个整体替换陷阱）：
+        //    漏键会让用户明确关闭的「会话负载均衡」在任何一次其它写入时被抹掉，
+        //    重启后静默回到开启。
+        sessionBalanceEnabled: this.sessionBalanceCache,
         // ⚠️ **必须带上本键**（与 `nativeWebSearchEnabled` 同一个整体替换陷阱）：
         //    漏键会让用户改过的面板入口在**任何**一次账号/黑名单/网关/顺序写入时
         //    被静默清掉，重启后入口又变回默认「仅侧栏」。
@@ -1137,6 +1155,37 @@ export class AccountPool {
     this.loaded = true
     if (this.store.kind === 'memory') {
       this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，原生搜索开关仅本次会话有效')
+      return
+    }
+    await this.queueStoreSave()
+  }
+
+  /**
+   * 「ZCode 会话负载均衡」开关当前是否启用。
+   *
+   * 缺键语义为**启用**（见 {@link sessionBalanceCache}）。
+   *
+   * ⚠️ 调用方（`credential-resolver.ts` 与 `zcode-adapter.ts` 的选号路径）
+   * **必须每次现读**，不能缓存返回值：用户随时可能在 Jet Hub 页头切换。
+   */
+  sessionBalanceEnabled(): boolean {
+    this.ensureLoaded()
+    return this.sessionBalanceCache
+  }
+
+  /**
+   * 打开/关闭「ZCode 会话负载均衡」并落盘。
+   *
+   * 关闭后 ZCode 回到「手动顺序首个可用账号」的既有语义 —— 与开关加入前
+   * 逐字节同路径（`getAvailableAccount`），不经过 session 排序。
+   */
+  async setSessionBalanceEnabled(enabled: boolean): Promise<void> {
+    this.ensureLoaded()
+    if (this.sessionBalanceCache === enabled) return
+    this.sessionBalanceCache = enabled
+    this.loaded = true
+    if (this.store.kind === 'memory') {
+      this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，会话负载均衡开关仅本次会话有效')
       return
     }
     await this.queueStoreSave()
@@ -2310,7 +2359,62 @@ export class AccountPool {
     modelId: string,
     excludeAccountIds?: ReadonlySet<string>,
   ): Promise<{ entry: ProviderAccountEntry; credential: TCredential } | null> {
-    const candidates = this.readAccounts()
+    const candidates = this.candidateAccounts(provider, modelId, excludeAccountIds)
+    if (candidates.length === 0) return null
+    // 候选顺序即**用户在 Jet Hub 拖拽设定的手动顺序**（`reorderAccounts` 写入）。
+    //
+    // 为什么不再按「限流重置时间最早到期」重排（早期实现如此）：
+    // 那个排序会让手动顺序形同虚设 —— 用户把某账号拖到首位，只要另一个
+    // 账号的限流重置时间更早，实际选中的仍是后者，拖拽变成纯 UI 装饰。
+    // 现在的语义是「手动顺序优先，限流豁免」：顺序完全由用户决定，
+    // 而当前正处于限流期的账号已被候选筛排除，不会选到。
+    //
+    // 注意 candidates 来自 readAccounts() 的 filter，而 filter 保持原数组
+    // 顺序，故这里天然就是手动顺序，无需任何排序。
+    return await this.resolveFirstCredential<TCredential>(provider, candidates)
+  }
+
+  /**
+   * 按 **sessionId** 选号（ZCode 专用，2026-10-30 用户要求）。
+   *
+   * - `sessionId` 非空：用 rendezvous 哈希把同一会话**稳定映射**到同一个候选
+   *   账号（会话亲和），不同会话自动分散到不同账号；账号集合变化时只迁移
+   *   原本落在该账号上的会话。
+   * - `sessionId` 为空/未传：随机洗牌后取第一个可用账号（本地 OpenAI 网关等
+   *   不带 DSH 会话标识的请求，随机均衡）。
+   *
+   * ⚠️ 本方法**刻意覆盖手动顺序** —— 这是 ZCode 用户明确要求的负载均衡语义。
+   * 其余 provider 继续走 {@link getAvailableAccount}（手动顺序优先），不受影响。
+   *
+   * `excludeAccountIds` 与 {@link getAvailableAccount} 同义：请求级换号时
+   * 排除刚失败的账号，避免拿回同一个。
+   */
+  async getAvailableAccountForSession<TCredential = CodeArtsCredential | BuddyCredential>(
+    provider: string,
+    modelId: string,
+    sessionId?: string,
+    excludeAccountIds?: ReadonlySet<string>,
+  ): Promise<{ entry: ProviderAccountEntry; credential: TCredential } | null> {
+    const candidates = this.candidateAccounts(provider, modelId, excludeAccountIds)
+    if (candidates.length === 0) return null
+    const ordered = sessionId !== undefined && sessionId.length > 0
+      ? rankAccountsBySession(candidates, sessionId, provider)
+      : shuffleAccounts(candidates)
+    return await this.resolveFirstCredential<TCredential>(provider, ordered)
+  }
+
+  /**
+   * 选号候选：`provider` + `enabled` + 不在 `excludeAccountIds` + 目标模型未限流。
+   *
+   * 与 {@link getAvailableAccount} / {@link getAvailableAccountForSession} 共用，
+   * 避免同一判据出现两份实现（两份必然漂移）。
+   */
+  private candidateAccounts(
+    provider: string,
+    modelId: string,
+    excludeAccountIds?: ReadonlySet<string>,
+  ): ProviderAccountEntry[] {
+    return this.readAccounts()
       .filter(a => a.provider === provider && a.enabled)
       .filter(a => excludeAccountIds === undefined || !excludeAccountIds.has(a.id))
       .filter(a => {
@@ -2320,19 +2424,18 @@ export class AccountPool {
         const resetAt = a.modelRateLimits[modelId]
         return resetAt === undefined || resetAt === 0 || Date.now() >= resetAt
       })
-    if (candidates.length === 0) return null
-    // 候选顺序即**用户在 Jet Hub 拖拽设定的手动顺序**（`reorderAccounts` 写入）。
-    //
-    // 为什么不再按「限流重置时间最早到期」重排（早期实现如此）：
-    // 那个排序会让手动顺序形同虚设 —— 用户把某账号拖到首位，只要另一个
-    // 账号的限流重置时间更早，实际选中的仍是后者，拖拽变成纯 UI 装饰。
-    // 现在的语义是「手动顺序优先，限流豁免」：顺序完全由用户决定，
-    // 而当前正处于限流期的账号已被上面的 filter 排除，不会选到。
-    //
-    // 注意 candidates 来自 readAccounts() 的 filter，而 filter 保持原数组
-    // 顺序，故这里天然就是手动顺序，无需任何排序。
-    //
-    // 逐个尝试解析凭据，跳过占位/损坏条目（并记录原因，避免静默失败）
+  }
+
+  /**
+   * 按给定顺序逐个解析凭据，返回第一个可用账号；坏的跳过并记录原因。
+   *
+   * 抽成私有方法是为了让「手动顺序」与「sessionId / 随机顺序」共用**同一份**
+   * 凭据解析与日志语义 —— 否则两条选号路径对「凭据损坏」的处理会分叉。
+   */
+  private async resolveFirstCredential<TCredential>(
+    provider: string,
+    candidates: readonly ProviderAccountEntry[],
+  ): Promise<{ entry: ProviderAccountEntry; credential: TCredential } | null> {
     const failures: string[] = []
     for (const entry of candidates) {
       let resolved

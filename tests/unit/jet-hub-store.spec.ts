@@ -213,6 +213,8 @@ describe('老契约后端（SettingsStore）', () => {
       gatewayAllowLan: false,
       // save 未携带原生搜索开关 → 写出启用（缺省），读回同值。
       nativeWebSearchEnabled: true,
+      // save 未携带会话负载均衡开关 → 写出启用（缺省），读回同值。
+      sessionBalanceEnabled: true,
       // save 未携带面板入口 → 写出「仅侧栏」（缺省），读回同值。
       panelEntry: 'sidebar',
       // save 未携带顺序 → 写出空数组（未自定义），读回同值。
@@ -379,6 +381,8 @@ describe('文件后端（FileStore）', () => {
       gatewayAllowLan: false,
       // 原生搜索开关缺省启用 —— 与升级前行为一致
       nativeWebSearchEnabled: true,
+      // 会话负载均衡开关缺省启用 —— 与 2026-10-30 要求的方向一致
+      sessionBalanceEnabled: true,
       // 面板入口缺省「仅侧栏」—— 与升级前行为一致
       panelEntry: 'sidebar',
       // 顺序缺省空数组（未自定义）—— 与升级前行为一致
@@ -467,6 +471,35 @@ describe('文件后端（FileStore）', () => {
       'utf-8',
     )
     expect(createJetHubStore(makeCtx(undefined)).load()?.nativeWebSearchEnabled).toBe(true)
+  })
+
+  // ── 「ZCode 会话负载均衡」开关（与原生搜索那组逐条同构）──
+  it('⚠️ 会话负载均衡开关 false 可跨实例读回（关了就是关了，含老契约后端）', async () => {
+    const writer = createJetHubStore(makeCtx(undefined))
+    await writer.save({ accounts: [], disabledModels: {}, sessionBalanceEnabled: false })
+
+    const reader = createJetHubStore(makeCtx(undefined))
+    expect(reader.load()?.sessionBalanceEnabled).toBe(false)
+  })
+
+  it('老文档没有会话负载均衡开关时缺省为启用（= 2026-10-30 要求的默认方向）', () => {
+    mkdirSync(join(dir, 'jet-hub'), { recursive: true })
+    writeFileSync(
+      join(dir, 'jet-hub', 'state.json'),
+      JSON.stringify({ accounts: [], disabledModels: {} }),
+      'utf-8',
+    )
+    expect(createJetHubStore(makeCtx(undefined)).load()?.sessionBalanceEnabled).toBe(true)
+  })
+
+  it('会话负载均衡开关落盘时脏值被归一化为启用', () => {
+    mkdirSync(join(dir, 'jet-hub'), { recursive: true })
+    writeFileSync(
+      join(dir, 'jet-hub', 'state.json'),
+      JSON.stringify({ accounts: [], disabledModels: {}, sessionBalanceEnabled: 'off' }),
+      'utf-8',
+    )
+    expect(createJetHubStore(makeCtx(undefined)).load()?.sessionBalanceEnabled).toBe(true)
   })
 
   /**
@@ -792,6 +825,8 @@ describe('文件后端（FileStore）', () => {
       gatewayAllowLan: false,
       // 原生搜索开关同理：写盘时缺省即启用，读回同值。
       nativeWebSearchEnabled: true,
+      // 会话负载均衡开关同理：写盘时缺省即启用，读回同值。
+      sessionBalanceEnabled: true,
       // 面板入口同理：写盘时缺省即「仅侧栏」，读回同值。
       panelEntry: 'sidebar',
       // 顺序缺省空数组（未自定义）：读回同值。

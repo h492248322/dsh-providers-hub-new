@@ -13,6 +13,7 @@
  *           载体页见 src/zcode-carrier-page.ts 与 src/captcha-carrier-server.ts）/
  *           backup.export / backup.import / backup.status /
  *           nativeSearch.getEnabled / nativeSearch.setEnabled /
+ *           sessionBalance.getEnabled / sessionBalance.setEnabled /
  *           panelEntry.get / panelEntry.set /
  * 另有一条 GET 路由 `/api/jet-hub/captcha-carrier`：渲染内部载体的载体页
  * （⚠ 手工诊断用；guest 加载不到它，见该路由注释里的主进程取证）。
@@ -373,6 +374,9 @@ import type {
   RpcNativeSearchGetEnabledResponse,
   RpcNativeSearchSetEnabledRequest,
   RpcNativeSearchSetEnabledResponse,
+  RpcSessionBalanceGetEnabledResponse,
+  RpcSessionBalanceSetEnabledRequest,
+  RpcSessionBalanceSetEnabledResponse,
   RpcPanelEntryGetResponse,
   RpcPanelEntrySetRequest,
   RpcPanelEntrySetResponse,
@@ -9112,6 +9116,35 @@ function registerJetHubEndpoints(
           + `${req.enabled ? '' : '（所有渠道改用 DeepSeek 官方搜索）'}`,
         )
         const value: RpcNativeSearchSetEnabledResponse = { enabled: pool.nativeWebSearchEnabled() }
+        return { ok: true, value }
+      }
+
+      // ── 「ZCode 会话负载均衡」总开关（Jet Hub 页头的开关）──
+      //
+      // 语义：**开** = ZCode 多账号按 DSH sessionId 做会话亲和（同一会话固定落
+      // 同一账号），没有 sessionId 的请求随机分摊；**关** = 回到「手动顺序首个
+      // 可用账号」的既有语义。消费方是 `credential-resolver.ts` 与
+      // `zcode-adapter.ts` 的选号路径（每次现读 `pool.sessionBalanceEnabled()`）。
+      case 'sessionBalance.getEnabled': {
+        const value: RpcSessionBalanceGetEnabledResponse = { enabled: pool.sessionBalanceEnabled() }
+        return { ok: true, value }
+      }
+
+      case 'sessionBalance.setEnabled': {
+        const req = payload as RpcSessionBalanceSetEnabledRequest
+        // ⚠️ 与 `nativeSearch.setEnabled` 同约定：**不做默认值猜测** ——
+        // 默认成 true 会静默打开用户特意关闭的开关。
+        if (typeof req.enabled !== 'boolean') {
+          return { ok: false, error: { code: 'bad-request', message: '非空布尔 enabled 必填' } }
+        }
+        await pool.setSessionBalanceEnabled(req.enabled)
+        // 不刷新任何缓存：选号路径**每次现读** `pool.sessionBalanceEnabled()`，
+        // 写完即生效（没有需要失效的派生状态）。
+        ctx.logger.info(
+          `[jet-hub] ${req.enabled ? '打开' : '关闭'}ZCode 会话负载均衡`
+          + `${req.enabled ? '' : '（ZCode 回到手动顺序优先选号）'}`,
+        )
+        const value: RpcSessionBalanceSetEnabledResponse = { enabled: pool.sessionBalanceEnabled() }
         return { ok: true, value }
       }
 

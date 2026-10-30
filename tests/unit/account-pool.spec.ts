@@ -2715,6 +2715,60 @@ describe('AccountPool · setAccountsEnabled（供应商级批量启停）', () =
   })
 
   /**
+   * 「ZCode 会话负载均衡」总开关（与上面「渠道原生搜索」那组逐条同构）。
+   *
+   * 同一组判据：默认启用 / 跨实例落盘 / 重开可读回 / 改开关不抹别的键 /
+   * 无关写入不抹本键。生产消费方是 `credential-resolver.ts` 与
+   * `zcode-adapter.ts` 的选号路径（每次现读）。
+   */
+  describe('ZCode 会话负载均衡总开关', () => {
+    it('默认启用（老用户升级后行为不变）', () => {
+      expect(new AccountPool(createMockContext() as never).sessionBalanceEnabled()).toBe(true)
+    })
+
+    it('⚠️ 关闭后可读回，且跨实例落盘（关了就是关了）', async () => {
+      const seeded = createMockContext([makeMockAccount()])
+      const writer = new AccountPool(seeded as never)
+      expect(writer.sessionBalanceEnabled()).toBe(true)
+      await writer.setSessionBalanceEnabled(false)
+      expect(writer.sessionBalanceEnabled()).toBe(false)
+
+      // 新实例从同一后端载入 —— 证明不是只改了内存副本。
+      expect(new AccountPool(seeded as never).sessionBalanceEnabled()).toBe(false)
+    })
+
+    it('重新打开后可读回 true', async () => {
+      const seeded = createMockContext()
+      const pool = new AccountPool(seeded as never)
+      await pool.setSessionBalanceEnabled(false)
+      await pool.setSessionBalanceEnabled(true)
+      expect(pool.sessionBalanceEnabled()).toBe(true)
+    })
+
+    it('⚠️ 改开关不得抹掉同一文档里的账号与黑名单', async () => {
+      const seeded = createMockContext([makeMockAccount()])
+      const pool = new AccountPool(seeded as never)
+      await pool.setSessionBalanceEnabled(false)
+
+      const raw = seeded.replacePayloads.at(-1) as
+        { accounts?: ProviderAccountEntry[]; disabledModels?: Record<string, unknown>; sessionBalanceEnabled?: boolean }
+      expect(raw.accounts).toHaveLength(1)
+      expect(raw.disabledModels).toBeDefined()
+      expect(raw.sessionBalanceEnabled).toBe(false)
+    })
+
+    it('⚠️ 另一次无关写入不得把已关闭的本开关抹回启用', async () => {
+      const seeded = createMockContext([makeMockAccount()])
+      const writer = new AccountPool(seeded as never)
+      await writer.setSessionBalanceEnabled(false)
+      const other = new AccountPool(seeded as never)
+      await other.setProviderOrder(['buddy'])
+
+      expect(new AccountPool(seeded as never).sessionBalanceEnabled()).toBe(false)
+    })
+  })
+
+  /**
    * 「面板入口」（与上面「渠道原生搜索」那组逐条同构）。
    *
    * ⚠️ 本组存在的理由与那组相同：这类偏好最常见的缺陷形态**不是**下拉点不动，

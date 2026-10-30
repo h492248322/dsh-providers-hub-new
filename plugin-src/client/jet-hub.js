@@ -3327,6 +3327,59 @@ function ProviderPanel({ provider, rpcCall }) {
   // 宿主侧那张手抄的平行清单已在 Task 4 删除，改由「是否提供 credits.afterClaim」判定），
   // 避免按钮渲染了却被服务端挡回 bad-request。
   const supportsGrowthTasks = GROWTH_TASK_PROVIDERS.has(provider);
+  // 「负载均衡」（会话亲和 + 随机分摊）开关：**只对 ZCode 渲染**（2026-10-31
+  // 用户要求）。会话亲和目前只有 zcode 一家接入（`accountSelection:
+  // 'session-balance'` 只装配在 zcode 上），其余渠道渲染了也是摆设 ——
+  // 与「订阅额度只对 Cline 渲染」同一门控取向。
+  const supportsSessionBalance = provider === 'zcode';
+
+  /**
+   * 「负载均衡」开关（仅 ZCode 面板渲染）。
+   *
+   * 开 = ZCode 多账号按 DSH sessionId 做会话亲和（同一会话固定落同一账号），
+   *      没有 sessionId 的请求随机分摊；
+   * 关 = 回到「手动顺序首个可用账号」的既有语义（会话不再固定账号）。
+   *
+   * ⚠️ 与页头那些开关同取向：**不做乐观更新**，以后端回传为准。
+   */
+  const [sessionBalanceOn, setSessionBalanceOn] = React.useState(true);
+  const [sessionBalanceBusy, setSessionBalanceBusy] = React.useState(false);
+  const [sessionBalanceFailed, setSessionBalanceFailed] = React.useState(false);
+
+  const loadSessionBalanceStatus = React.useCallback(async () => {
+    if (!supportsSessionBalance) return;
+    try {
+      const res = await rpcCall('sessionBalance.getEnabled', {});
+      if (!mounted.current) return;
+      setSessionBalanceOn(res?.enabled !== false);
+      setSessionBalanceFailed(false);
+    } catch (caught) {
+      console.error('[jet-hub] load session balance status failed:', caught);
+      if (!mounted.current) return;
+      // 降级为「默认开启」并标记读取失败：开关本身不可用，但不影响其余功能。
+      setSessionBalanceOn(true);
+      setSessionBalanceFailed(true);
+    }
+  }, [rpcCall, supportsSessionBalance]);
+
+  const toggleSessionBalance = React.useCallback(async (nextEnabled) => {
+    setSessionBalanceBusy(true);
+    try {
+      const res = await rpcCall('sessionBalance.setEnabled', { enabled: nextEnabled });
+      if (!mounted.current) return;
+      setSessionBalanceOn(res?.enabled !== false);
+      setSessionBalanceFailed(false);
+    } catch (caught) {
+      console.error('[jet-hub] toggle session balance failed:', caught);
+      if (!mounted.current) return;
+      // 保留原状态：重新拉一次以确保与服务端一致。
+      await loadSessionBalanceStatus();
+    } finally {
+      if (mounted.current) setSessionBalanceBusy(false);
+    }
+  }, [rpcCall, loadSessionBalanceStatus]);
+
+  React.useEffect(() => { void loadSessionBalanceStatus(); }, [loadSessionBalanceStatus]);
   /**
    * 「订阅额度」按钮的渲染条件（当前只有 Cline）。
    *
@@ -4955,6 +5008,27 @@ function ProviderPanel({ provider, rpcCall }) {
               ? React.createElement('path', { d: 'M7 11V7a5 5 0 0 1 10 0v4' })
               : React.createElement('path', { d: 'M7 11V7a5 5 0 0 1 9.9-1' })),
             lockBusy ? '处理中…' : '永久积分')
+          : null,
+        // 「负载均衡」开关：**只对 ZCode 面板渲染**（supportsSessionBalance）。
+        // 与页头开关同款 Switch 形态；挂在按钮行（面板页头最右），与
+        // 「一键领取积分 / 重测所有」同一排。
+        supportsSessionBalance
+          ? React.createElement('label', {
+              className: 'dim-jh-nativeSearch',
+              title: (sessionBalanceFailed
+                ? '⚠️ 开关状态读取失败，当前显示的是默认值（开启）。点击即可重新提交一次。'
+                : '负载均衡：多账号按会话分散（同一会话固定同一账号，无会话标识的请求随机分摊）。'
+                  + '关闭后回到「手动顺序优先」的选号方式。'),
+            },
+            React.createElement('input', {
+              type: 'checkbox',
+              className: 'dim-jh-switch',
+              checked: sessionBalanceOn,
+              // ⚠️ 与页头开关同取向：只因提交中禁用，读取失败不禁用（自救路径）。
+              disabled: sessionBalanceBusy,
+              onChange: (event) => void toggleSessionBalance(event.target.checked),
+            }),
+            React.createElement('span', null, '负载均衡'))
           : null,
         // ⚠️ **「模型列表」排在「+ 新建账号」左边，且已改成图标 + 文字**
         //    （用户 2026-10-26：「模型按钮移动到新建账号左边改为图标+模型」）。
