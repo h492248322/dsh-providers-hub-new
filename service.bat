@@ -65,6 +65,9 @@ set "PURGE=0"
 set "LOG_TAIL=50"
 set "ENV_FILE=%TEMP%\dsh-providers-hub-svc-env.txt"
 if exist "%ENV_FILE%" del /q "%ENV_FILE%" >nul 2>&1
+rem `-env` 暂存区（2026-10-31 复审 B-2）：解析期只暂存，NODE_EXE 绑定后由
+rem :flush_user_env 统一写入。
+set "USER_ENV_N=0"
 
 call :detect_version
 
@@ -115,13 +118,31 @@ shift
 goto parse
 
 rem ---- 值里可能带 '=' 的三个选项，单独处理 ----
+rem ⚠️ 2026-10-31 复审 B-2 修：`-env` 在**解析期**被消费，而 %NODE_EXE% 此时必然
+rem    还没绑定（-node / find_node / setup_standalone 全在解析之后）⇒ 直接调
+rem    :add_env 恒失败且回归为静默丢配置。改为**先暂存**（USER_ENV_n），等
+rem    NODE_EXE 绑定后由 :flush_user_env 统一写入（install_dsh / install_standalone
+rem    两条流在 add_env 固定值之前各调一次；无需 -env 的调用零开销）。
 :opt_env
 call :maybe_join_arg3 "%~2" "%~3"
 if "%JOINED%"=="1" shift
-call :add_env "%MV%"
+set /a USER_ENV_N+=1
+set "USER_ENV_%USER_ENV_N%=%MV%"
 shift
 shift
 goto parse
+
+rem 把解析期暂存的 -env 值逐条写入 ENV_FILE（须在 %NODE_EXE% 绑定之后调用）。
+rem 失败即 die —— 静默丢一个用户显式指定的环境变量，比安装失败更难排查。
+:flush_user_env
+if "%USER_ENV_N%"=="0" exit /b 0
+set /a USER_ENV_I=1
+:flush_user_env_loop
+if %USER_ENV_I% gtr %USER_ENV_N% exit /b 0
+call :add_env "%%USER_ENV_%USER_ENV_I%%%"
+if errorlevel 1 exit /b 1
+set /a USER_ENV_I+=1
+goto flush_user_env_loop
 
 :opt_apikey
 call :maybe_join_arg3 "%~2" "%~3"
@@ -612,6 +633,10 @@ if errorlevel 1 exit /b 1
 echo [3/5] 生成服务配置...
 set "WORK_DIR=%DSH_HOME%\profiles\%PROFILE%"
 if not exist "%WORK_DIR%" set "WORK_DIR=%INSTALL_DIR%"
+rem 用户的 -env 暂存此刻已可写入（NODE_EXE 已绑定）—— 须在固定值之前，让用户
+rem 显式指定的值排在后面（service.conf 读取顺序：后写覆盖前写）。
+call :flush_user_env
+if errorlevel 1 exit /b 1
 call :add_env "DSH_HOME=%DSH_HOME%"
 if errorlevel 1 exit /b 1
 call :add_env "DSH_OPENAI_GATEWAY_ENABLED=1"
@@ -661,10 +686,25 @@ rem    （在目标机上 scripts\build-bootstrap.mjs 不存在 → 直接 die�
 rem    新产物打到无关的 %INSTALL_DIR%\pkg\）。现在检测产物里核心文件是否已就位：
 rem    bootstrap 的核心是 plugin\lib\index.js，standalone 的核心是预置 profile 里
 rem    的插件 lib\index.js。二者都在时自动跳过打包（-Force 保留「强制重打包」语义）。
+rem
+rem ⚠️⚠️ 2026-10-31 复审 B-1 修：standalone 检测不能一条 for /d 同时在两个路径段
+rem    放 * —— cmd 的 FOR 通配**只展开最后一段**，中段通配静默零匹配（本机
+rem    cmd 10.0.26100 实测 30+ 组对照），首版因此恒不命中、standalone 仍走打包。
+rem    修法：双层循环，每层只对**末段**用通配；内层判据是「该目录下有插件自己的
+rem    lib\index.js」（对齐 build-standalone.mjs:509 的真实布局
+rem    home\profiles\<profile>\node_modules\<plugin>\lib），并要求该 profile 有
+rem    package.json（2 级上溯 = profile 级；首版写 4 级指向不存在的 home\package.json）。
+rem    插件目录名不写死：任何 node_modules 下带 lib\index.js 的包都算 —— 宿主
+rem    @deepseek-ai\dsh 也带 lib\index.js，但它与 profile 级 package.json 的组合
+rem    恰好等价于「宿主已就位」，同样是「产物完整」的合法证据，不引入误判。
 set "SA_BUNDLE_COMPLETE=0"
 if exist "%BUNDLE_DIR%\plugin\lib\index.js" set "SA_BUNDLE_COMPLETE=1"
-for /d %%d in ("%BUNDLE_DIR%\home\profiles\*\node_modules\*") do (
-  if exist "%%d\lib\index.js" if exist "%%~dpd..\..\..\..\package.json" set "SA_BUNDLE_COMPLETE=1"
+if "%SA_BUNDLE_COMPLETE%"=="0" if exist "%BUNDLE_DIR%\home\profiles" (
+  for /d %%p in ("%BUNDLE_DIR%\home\profiles\*") do (
+    if exist "%%p\package.json" for /d %%d in ("%%p\node_modules\*") do (
+      if exist "%%d\lib\index.js" set "SA_BUNDLE_COMPLETE=1"
+    )
+  )
 )
 if "%SA_BUNDLE_COMPLETE%"=="1" if "%FORCE%"=="0" (
   echo [1/4] 产物目录已含完整产物，自动跳过打包（等价 -NoPackage；加 -Force 可强制重打包）
@@ -684,6 +724,9 @@ set "WORK_DIR=%BUNDLE_DIR%"
 set "CONF_PROGRAM=%NODE_EXE%"
 set "CONF_ARGS="%BUNDLE_DIR%\home\profiles\node_modules\@deepseek-ai\dsh\lib\bin.js" --profile %PROFILE% --host %BIND_HOST% --port %PORT% --no-open"
 set "CONF_CWD=%BUNDLE_DIR%"
+rem 用户的 -env 暂存此刻已可写入（NODE_EXE 已绑定）——理由同 install_dsh 流。
+call :flush_user_env
+if errorlevel 1 exit /b 1
 call :add_env "DSH_HOME=%BUNDLE_DIR%\home"
 if errorlevel 1 exit /b 1
 call :add_env "DSH_OPENAI_GATEWAY_ENABLED=1"
@@ -736,6 +779,10 @@ if not defined WORK_DIR set "WORK_DIR=%PROGRAM_DIR%"
 set "CONF_PROGRAM=%SVC_PROGRAM%"
 set "CONF_ARGS=%PROGRAM_ARGS%"
 set "CONF_CWD=%WORK_DIR%"
+rem custom 模式同样 flush 用户的 -env（NODE_EXE 可能仍未绑定 —— write_conf
+rem 内部会做最后一次 PATH 兜底；flush 失败即中止，不静默丢）。
+call :flush_user_env
+if errorlevel 1 exit /b 1
 call :write_conf
 if errorlevel 1 exit /b 1
 
