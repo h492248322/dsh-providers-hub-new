@@ -29,6 +29,7 @@ deepseek-harness 插件：统一管理多个 AI 编程服务的账号，并把�
 ## 目录
 
 - [安装](#安装)
+- [Windows 服务器部署（引导式 / 离线式）](#windows-服务器部署引导式--离线式)
 - [用法](#用法)
 - [支持的渠道](#支持的渠道)
 - [聚合路由](#聚合路由aggregate)
@@ -170,6 +171,154 @@ dsh plugin --profile <name> install <path-to-this-repo>
 该包声明了 `dsh.bundle` 补丁（`cordis.patch.yml`），因此 profile 的 layer 栈会
 自动拾取 `codearts-auth` 行。插件注入由 dsh base 提供的 `credentials`、
 `commands` 和 `llm` 服务。
+
+---
+
+## Windows 服务器部署（引导式 / 离线式）
+
+`service.bat` 除了把程序注册成 Windows 服务外，还能打出两种部署产物：
+
+| 模式 | 命令 | 体积 | 目标机要求 |
+|---|---|---|---|
+| **引导式**（推荐） | `package -Mode bootstrap` | **约 20 MB** | 能访问网络；首次执行 `install.cmd` 自动备好 Node 并下载依赖（约 730 MB） |
+| 离线式 | `package -Mode standalone` | 约 800 MB | **无需 anything**：Node 与全部依赖都内置，可完全断网 |
+
+两者都**不包含** profile 的账号与设置数据 —— 那部分用 Jet Hub 的「账号备份导入」恢复。
+
+### 引导式产物（按需下载，约 20 MB）
+
+```bat
+service.bat package -Mode bootstrap
+```
+
+产物在 `dist\bootstrap\dsh-providers-hub-<版本>-win-x64\`，部署只需两条命令：
+
+```bat
+install.cmd     :: 下载 DSH 宿主依赖 + 组装 profile（首次 1-3 分钟）
+start.cmd       :: 启动
+```
+
+产物结构：
+
+```
+dsh-providers-hub-<版本>-win-x64\
+├─ MANIFEST.json          版本 / 依赖版本 / 关键文件 sha256
+├─ README.txt             部署说明
+├─ install.cmd / install.ps1   目标机安装（下载依赖 + 组装 profile）
+├─ start.cmd / stop.cmd / stop.ps1
+├─ runtime\
+│  ├─ service-runner.mjs  服务包装器
+│  └─ node.exe            ← 仅 --with-node 打包时存在（含 npm，+130 MB）
+├─ plugin\                插件本体（lib / locale / cordis.patch.yml / package.json）
+│  └─ node_modules\       插件生产依赖（4 个包；--thin 时改为目标机下载）
+└─ host\
+   ├─ package.json        宿主依赖声明
+   └─ package-lock.json   精确锁定 548 个包的版本与 integrity（install 用 npm ci）
+```
+
+`install.cmd` 做 8 件事：**备好 Node（缺则自动下载）** → 校验 npm → 从 lock 安装宿主依赖 →
+**核验 peer 闭包**（`dsh` / `dsh-base` / `dsh-web-app` / `dsh-llm` / `cordis-plugin-loader`）→
+建 profile 骨架 → 把插件拷进 profile → 核验 `.node` 是否当前平台 → 打印后续命令。
+
+**Node 是怎么解决的**（三级回退，无需人工干预）：
+
+1. 产物内 `runtime\node.exe`（用 `--with-node` 打包时才有）；
+2. 系统 `PATH` 上的 `node.exe`；
+3. **都没有 → 自动下载**官方 Node win-x64 zip（版本取打包机自身版本，约 35 MB，自带 npm），
+   解压到产物 `runtime\`。之后 `start.cmd` 与 `service.bat` 都会自动用这份 Node，
+   不再依赖系统 PATH。
+
+> 下载源顺序：`-NodeMirror <基址>`（若给）→ `npmmirror.com` → `nodejs.org`。
+> 内网无外网时用 `-SkipNodeDownload` 让它老实报错，或事先把 Node 装好。
+
+可选参数：`install.cmd -Profile prod -Registry https://registry.npmmirror.com -Force -SkipVerify`、
+`-NodeMirror https://npmmirror.com/mirrors/node -SkipNodeDownload -NodeVersion v24.13.0`。
+
+需要产物自带 Node（目标机没装 Node）时：
+
+```bat
+node scripts\build-bootstrap.mjs --with-node
+```
+
+> ⚠️ **不能给 `npm install` 加 `--omit=peer`**：DSH 宿主的 peerDependencies 是它运行的一部分，
+> 漏一个就 `ERR_MODULE_NOT_FOUND` 起不来。`install.ps1` 会在装完后显式核验这 5 个包。
+
+### 离线式产物（完全自包含，约 800 MB）
+
+目标机**不需要安装 Node / npm / pnpm，也无法联网**，解压即跑。
+
+```bat
+service.bat package -Mode standalone
+```
+
+产物落在 `dist\standalone\dsh-providers-hub-<版本>-win-x64\`，把它整个目录拷到服务器即可。
+下面的目录结构说明针对离线式产物；引导式产物在 `install.cmd` 跑完后，`home\` 下的布局与它一致。
+
+### 目录结构
+
+```
+dsh-providers-hub-<版本>-win-x64\
+├─ MANIFEST.json          版本 / 依赖清单 / 原生二进制清单（可审计）
+├─ README.txt             部署说明（目录结构、启动方式、限制）
+├─ start.cmd              启动（前台，用内置 Node）
+├─ stop.cmd / stop.ps1    停止
+├─ runtime\
+│  ├─ node.exe            内置 Node 运行时（目标机无需装 Node）
+│  └─ service-runner.mjs  服务包装器
+└─ home\                  == DSH_HOME
+   ├─ cordis.patch.yml    home 级 patch 层
+   └─ profiles\
+      ├─ node_modules\
+      │  └─ @deepseek-ai\dsh\           DSH 宿主
+      │     ├─ lib\  package.json
+      │     └─ node_modules\            宿主依赖闭包（548 个包，真实目录）
+      └─ prod\                          预置 profile（免 npm install）
+         ├─ package.json                dsh.profile.bundles
+         ├─ cordis.patch.yml
+         └─ node_modules\
+            └─ dsh-providers-hub\       本插件
+               ├─ lib\  locale\  cordis.patch.yml
+               └─ node_modules\          插件生产依赖（真实目录）
+```
+
+要点：
+
+- **全部依赖以真实目录分发**（不是 junction），所以产物可以随意移动/复制，zip 也不会损坏。
+  宿主启动时若发现链接失效会**自动重建**。
+- **原生模块按 Windows 平台收录**（如 `@img/sharp-win32-x64`、
+  `node-addon-require-builtin-win32-x64-msvc`），打包时逐个核验，缺失即中止。
+- **预置 profile 里插件已就位**，目标机**不需要执行任何 `npm install` / `pnpm install`**，
+  也不需要联网。
+- 插件与宿主共用的依赖会做**去重**（按 semver 判定），避免同一模块出现两个实例。
+
+### 启动
+
+```bat
+start.cmd
+```
+
+| 环境变量 | 默认 | 说明 |
+|---|---|---|
+| `DSH_PROFILE` | `prod` | profile 名 |
+| `DSH_HOST` | `127.0.0.1` | Web UI 监听地址 |
+| `DSH_PORT` | `8123` | Web UI 端口 |
+| `DSH_OPENAI_GATEWAY_PORT` | `8326` | 本机 OpenAI 网关端口 |
+| `DSH_OPENAI_GATEWAY_HOST` | `127.0.0.1` | 网关监听地址 |
+
+Web UI：`http://<DSH_HOST>:<DSH_PORT>`；网关：`http://<网关地址>:<端口>/v1`。
+
+⚠️ 不要把监听地址改成 `0.0.0.0` / `::` —— 宿主与网关都会在启动前**显式拒绝**并报错退出；
+要给内网访问请填**具体网卡 IP**，并务必设置 `DSH_OPENAI_GATEWAY_API_KEY`。
+
+注册成 Windows 服务（需管理员 + NSSM）：
+
+```bat
+service.bat install -Mode standalone -BundleDir <产物目录> -Profile prod   :: 离线式
+service.bat install -Mode bootstrap  -BundleDir <产物目录> -Profile prod   :: 引导式（先跑过 install.cmd）
+```
+
+> ⚠️ 账号登录仍需在浏览器里完成（Jet Hub 设置页）；无浏览器环境请用「账号备份与迁移」里的
+> 导出/导入把账号搬过去。
 
 ---
 
