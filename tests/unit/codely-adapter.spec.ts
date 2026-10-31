@@ -627,47 +627,91 @@ describe('Codely 推理与换发必须带超时', () => {
   it('★★ 推理 POST 与换发 GET 都必须有 signal（用户不取消时也要有上限）', async () => {
     const signals: Array<{ url: string; signal: unknown }> = []
     const timeoutSpy = vi.spyOn(AbortSignal, 'timeout')
-    const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = String(input)
-      signals.push({ url, signal: init?.signal })
-      if (url.includes('/api/api-token/cli-api-key')) {
-        return new Response(JSON.stringify({ cli_api_key: 'sk-x' }), { status: 200 })
-      }
-      return new Response(
-        `data: ${JSON.stringify({ choices: [{ delta: { content: 'ok' }, finish_reason: 'stop' }] })}\n\n`
-        + 'data: [DONE]\n\n',
-        { status: 200 },
-      )
-    }) as never
-    const adapter = new CodelyAdapter({
-      credentialProvider: async () => ({ access_token: 't', refresh_token: 'r' } as never),
-      fetchImpl,
-    } as CodelyAdapterOptions)
-    for await (const _chunk of adapter.stream({
-      model: 'codely-flash',
-      messages: [{ role: 'user', content: 'hi' }],
-    } as never)) { /* 消费完 */ }
+    // ⚠️ try/finally（2026-10-31 审计 P3）：中途断言失败时 mockRestore 不执行，
+    //    spy 会泄漏到整个文件（vitest 未开 restoreMocks）。与 auth-service 侧同款。
+    try {
+      const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input)
+        signals.push({ url, signal: init?.signal })
+        if (url.includes('/api/api-token/cli-api-key')) {
+          return new Response(JSON.stringify({ cli_api_key: 'sk-x' }), { status: 200 })
+        }
+        return new Response(
+          `data: ${JSON.stringify({ choices: [{ delta: { content: 'ok' }, finish_reason: 'stop' }] })}\n\n`
+          + 'data: [DONE]\n\n',
+          { status: 200 },
+        )
+      }) as never
+      const adapter = new CodelyAdapter({
+        credentialProvider: async () => ({ access_token: 't', refresh_token: 'r' } as never),
+        fetchImpl,
+      } as CodelyAdapterOptions)
+      for await (const _chunk of adapter.stream({
+        model: 'codely-flash',
+        messages: [{ role: 'user', content: 'hi' }],
+      } as never)) { /* 消费完 */ }
 
-    const exchange = signals.find((s) => s.url.includes('/api/api-token/cli-api-key'))
-    const chat = signals.find((s) => s.url.includes('/chat/completions'))
-    expect(exchange, '必须真发过换发请求').toBeDefined()
-    expect(chat, '必须真发过推理请求').toBeDefined()
-    // ⚠️ 决定性断言：两处都必须有 signal（A3 原缺陷：两处都是 ABSENT）
-    //
-    // ⚠️ 只断言 `toBeDefined()` **锁不住任何东西**（与 `codely-auth-service.spec.ts`
-    //    同型）：实现若改成传一个**永不超时**的 `new AbortController().signal`，
-    //    这里照样全绿，而那正是本用例要防的 —— 上游挂住即永久转圈。
-    //    ⇒ 拦住 `AbortSignal.timeout`，断言两处都真的挂了正数毫秒的超时。
-    const timeoutCalls = timeoutSpy.mock.calls.map((args) => args[0])
-    expect(timeoutCalls.length, '换发与推理各挂一次超时（不能只挂一处）').toBeGreaterThanOrEqual(2)
-    for (const ms of timeoutCalls) {
-      expect(ms, '超时期限必须是正数毫秒（0 / 负数等于立刻超时）').toBeGreaterThan(0)
+      const exchange = signals.find((s) => s.url.includes('/api/api-token/cli-api-key'))
+      const chat = signals.find((s) => s.url.includes('/chat/completions'))
+      expect(exchange, '必须真发过换发请求').toBeDefined()
+      expect(chat, '必须真发过推理请求').toBeDefined()
+      // ⚠️ 决定性断言：两处都必须有 signal（A3 原缺陷：两处都是 ABSENT）
+      //
+      // ⚠️ 只断言 `toBeDefined()` **锁不住任何东西**（与 `codely-auth-service.spec.ts`
+      //    同型）：实现若改成传一个**永不超时**的 `new AbortController().signal`，
+      //    这里照样全绿，而那正是本用例要防的 —— 上游挂住即永久转圈。
+      //    ⇒ 拦住 `AbortSignal.timeout`，断言两处都真的挂了正数毫秒的超时。
+      const timeoutCalls = timeoutSpy.mock.calls.map((args) => args[0])
+      expect(timeoutCalls.length, '换发与推理各挂一次超时（不能只挂一处）').toBeGreaterThanOrEqual(2)
+      for (const ms of timeoutCalls) {
+        expect(ms, '超时期限必须是正数毫秒（0 / 负数等于立刻超时）').toBeGreaterThan(0)
+      }
+      for (const [name, entry] of [['换发', exchange], ['推理', chat]] as const) {
+        expect(entry!.signal, `${name}请求必须带 signal`).toBeInstanceOf(AbortSignal)
+        expect((entry!.signal as AbortSignal).aborted, `${name} signal 刚发出时不该是已中止`).toBe(false)
+      }
+    } finally {
+      timeoutSpy.mockRestore()
     }
-    for (const [name, entry] of [['换发', exchange], ['推理', chat]] as const) {
-      expect(entry!.signal, `${name}请求必须带 signal`).toBeInstanceOf(AbortSignal)
-      expect((entry!.signal as AbortSignal).aborted, `${name} signal 刚发出时不该是已中止`).toBe(false)
+  })
+
+  it('★ 传入外部 signal 时仍要叠加超时（与 auth-service 侧同纪律；2026-10-31 对抗审计补）', async () => {
+    const signals: Array<{ url: string; signal: unknown }> = []
+    const timeoutSpy = vi.spyOn(AbortSignal, 'timeout')
+    try {
+      const outer = new AbortController()
+      const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input)
+        signals.push({ url, signal: init?.signal })
+        if (url.includes('/api/api-token/cli-api-key')) {
+          return new Response(JSON.stringify({ cli_api_key: 'sk-x' }), { status: 200 })
+        }
+        return new Response(
+          `data: ${JSON.stringify({ choices: [{ delta: { content: 'ok' }, finish_reason: 'stop' }] })}\n\n`
+          + 'data: [DONE]\n\n',
+          { status: 200 },
+        )
+      }) as never
+      const adapter = new CodelyAdapter({
+        credentialProvider: async () => ({ access_token: 't', refresh_token: 'r' } as never),
+        fetchImpl,
+      } as CodelyAdapterOptions)
+      for await (const _chunk of adapter.stream({
+        model: 'codely-flash',
+        messages: [{ role: 'user', content: 'hi' }],
+        signal: outer.signal,
+      } as never)) { /* 消费完 */ }
+
+      const chat = signals.find((s) => s.url.includes('/chat/completions'))
+      expect(chat, '必须真发过推理请求').toBeDefined()
+      // 实现是 AbortSignal.any([outer.signal, AbortSignal.timeout(ms)]) ⇒
+      // 组合 signal ≠ 调用方 signal；换发与推理各挂一次 ⇒ spy 至少 2 次。
+      expect(timeoutSpy.mock.calls.length, '外部 signal 之外仍要另挂 timeout（只透传 = 无上限）')
+        .toBeGreaterThanOrEqual(2)
+      expect(chat!.signal, '应是组合后的 signal，不得原样透传调用方那个').not.toBe(outer.signal)
+    } finally {
+      timeoutSpy.mockRestore()
     }
-    timeoutSpy.mockRestore()
   })
 
   it('★ 推理超时必须长于目录/登录那档（30s 撑不住正常长回答）', async () => {

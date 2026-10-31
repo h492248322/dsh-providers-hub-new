@@ -196,6 +196,76 @@ function isCodelyBudgetExceeded(body: string): boolean {
 }
 
 /**
+ * 预算报文的**归一化形态**（2026-10-31 对抗审计 1D 修）：供团队级判定的两号比对用。
+ *
+ * ## 为什么不逐字比
+ *
+ * 上游报文里的 `request_id` / `instance` 这类**每次请求都变**的字段会让两个号
+ * 的报文必然逐字不等 ⇒ 判定静默永不触发（换发端点实测同形，见 `codely-auth.ts`）。
+ * 归一化抹掉它们，保留真正的骨架特征。
+ *
+ * ## 归一化规则（故意保守：只抹确定易变的）
+ *
+ * 1. **JSON 感知**：能解析成对象时，删除 `request_id` / `instance` 两个键
+ *    （LiteLLM problem/json 报文的逐次易变字段）；再在序列化产物上把**所有含
+ *    小数点的数字**按 **6 位有效数字**重写（`message` **字符串内**的
+ *    `Current cost: 54.708759999999994` 一并覆盖 —— 抹
+ *    `54.708759999999994` vs `54.70876` 这类**同一数值**的序列化尾差；
+ *    1.5 / 2.5 重写后仍是自身，「cost 递增 ⇒ 判账号级」的既有语义不变，
+ *    见 spec「整池耗尽」用例）。
+ * 2. **解析失败回退**：非 JSON（HTML 网关页等）按文本处理：剥 `request_id`/
+ *    `instance` 的 `"key":"value"` 片段 + 压空白后比对 —— 宽松方向是有意的：
+ *    这类报文本就缺乏骨架，宁可偶尔把两个撞同一堵网关墙的号判成团队级
+ *    （换号本来就无用），也不能把带易变字段的真团队墙漏成整池连坐。
+ *
+ * ⚠️ 已知残余风险（登记于 streamViaHttp 判据注释）：`Current cost` 若是团队
+ * 累计消费（逐号递增），归一化也救不了 —— 那要等真实团队级报障取证后再改。
+ */
+function normalizeBudgetDetail(detail: string): string {
+  try {
+    const parsed: unknown = JSON.parse(detail)
+    if (typeof parsed === 'object' && parsed !== null) {
+      const scrubbed = structuredClone(parsed as Record<string, unknown>)
+      delete scrubbed['request_id']
+      delete scrubbed['instance']
+      scrubNested(scrubbed)
+      // ⚠️ LiteLLM 的 cost 不在 JSON 数字里，而嵌在 `error.message` **字符串**内
+      //    （`Current cost: 54.708759999999994`）⇒ 上面的数字 scrub 摸不到它。
+      //    在序列化**产物**上再做一次文本级浮点归一：**所有含小数点的数字**统一
+      //    按 6 位有效数字重写（覆盖任意嵌套深度的字符串字段）。
+      //    ⚠️ 不能只挑「≥6 位小数」的：`54.70876`（5 位）与
+      //    `54.708759999999994`（15 位）是**同一数值**的两种序列化，前者会漏网。
+      //    统一 toPrecision(6) 后两者都是 54.7088；而 1.5 / 2.5 重写后仍是自身
+      //    ⇒ 「cost 递增 ⇒ 判账号级」的既有语义不变（spec「整池耗尽」仍绿）。
+      return JSON.stringify(scrubbed).replace(/\d+\.\d+/g, (m) => String(Number(Number(m).toPrecision(6))))
+    }
+  } catch { /* 非 JSON：走文本回退 */ }
+  return detail
+    .replace(/"(?:request_id|instance)"\s*:\s*"[^"]*"/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+/** 递归把对象/数组里的浮点数按 6 位有效数字重写（抹同一数值的序列化尾差）。 */
+function scrubNested(node: unknown): void {
+  if (Array.isArray(node)) {
+    for (let i = 0; i < node.length; i += 1) {
+      const v = node[i]
+      if (typeof v === 'number' && !Number.isInteger(v)) node[i] = Number(v.toPrecision(6))
+      else if (typeof v === 'object' && v !== null) scrubNested(v)
+    }
+    return
+  }
+  if (typeof node !== 'object' || node === null) return
+  for (const key of Object.keys(node as Record<string, unknown>)) {
+    const obj = node as Record<string, unknown>
+    const v = obj[key]
+    if (typeof v === 'number' && !Number.isInteger(v)) obj[key] = Number(v.toPrecision(6))
+    else if (typeof v === 'object' && v !== null) scrubNested(v)
+  }
+}
+
+/**
  * 收窄账号池回传的凭据：池的 `getAvailableAccount` 是**裸 `JSON.parse`**
  * （不做形状校验，`account-pool.ts` 头注记过）⇒ 手工编辑过的备份可能是 `{}`
  * 之类的坏形状，直接读 `access_token.length` 会抛 `TypeError`（accio 同款教训）。
@@ -736,9 +806,20 @@ export class CodelyAdapter extends LlmAdapter {
      *
      * ## 判据
      *
-     * **连续两个不同账号返回逐字相同的预算报文** ⇒ 判定为团队级。
-     * 用报文逐字比对而不是只看 status，是因为 402 也可能是单号额度耗尽
+     * **连续两个不同账号返回「归一化后相同」的预算报文** ⇒ 判定为团队级。
+     * 用报文比对而不是只看 status，是因为 402 也可能是单号额度耗尽
      * （那种情况换号是有用的，不该 break）。
+     *
+     * ⚠️⚠️ **「归一化」而不是「逐字相等」**（2026-10-31 对抗审计 1D 修）：
+     * 同一上游的报文**并不保证逐字稳定** —— 换发端点实测就带 `request_id` /
+     * `instance`（见 `codely-auth.ts` 的 RFC 7807 取证），推理侧若同形，两个号
+     * 的报文必然逐字不等 ⇒ 逐字比对会让团队级判定**静默永不触发**，退化回
+     * 修复前的「整池封到次日 0 点」，且零日志零告警。归一化把易变字段抹掉后再比
+     * （见 {@link normalizeBudgetDetail}），其余骨架必须一致。
+     * ⚠️ **仍未实测「两个账号真撞同一份报文」**（报障截图只有单账号）——
+     *    若 `Current cost` 是**团队累计消费**（逐号递增），最坏仍判成账号级。
+     *    这条假设要等真实团队级报障再取证；在此之前，判不中只是**退回旧行为**
+     *    （多烧几次注定失败的换号），不会比修复前更糟。
      */
     let lastBudgetDetail: string | null = null
     let teamBudgetExhausted = false
@@ -873,6 +954,14 @@ export class CodelyAdapter extends LlmAdapter {
           ? AbortSignal.timeout(CODELY_INFERENCE_TIMEOUT_MS)
           : AbortSignal.any([options.signal, AbortSignal.timeout(CODELY_INFERENCE_TIMEOUT_MS)]),
       })
+      // ⚠️⚠️ **已登记的失明区**（2026-10-31 对抗审计 1C，未修）：HTTP 200 但
+      //    SSE 流内发 error 帧（如流内 `budget_exceeded`）会**绕过下面整个换号
+      //    循环** —— `res.ok` 在读 detail 之前 break，SSE 消费器又不识别 error 帧
+      //    ⇒ 不换号、不分类、不判团队级，最终落 `EMPTY_RESPONSE`（spec 的
+      //    (200, budget) 用例走的是**非流式**那条腿，此路径在流式不可达）。
+      //    accio 有同型实测（200 + 流内 402），codely 未实测是否有此形态。
+      //    修法（要动 SSE 消费器，属独立任务）：消费器识别 error 帧后按
+      //    `isCodelyRotatableFailure` 同口径抛可换号错误。
       if (res.ok) break
       detail = await res.text().catch(() => '')
       const body = detail.length === 0 ? '' : `（${detail.slice(0, 240)}）`
@@ -920,8 +1009,12 @@ export class CodelyAdapter extends LlmAdapter {
       //    此时「两个账号撞同一份报文」这个前提不成立，按账号级处理（换号可能有用）。
       //    否则所有只返回裸 402、不带 body 的上游都会被误判成团队级，提前停止换号。
       if ((res.status === 402 || isCodelyBudgetExceeded(detail)) && detail.length > 0) {
-        if (lastBudgetDetail !== null && detail === lastBudgetDetail) {
-          // 两个不同账号撞逐字相同的预算报文 ⇒ 团队级。
+        // ⚠️ 比对用归一化形态（2026-10-31 对抗审计 1D 修，理由见上方判据注释）：
+        //    上游报文可能带 request_id / instance / 浮点尾差，逐字比对会让
+        //    团队级判定静默永不触发。归一化只抹易变字段，骨架仍必须一致。
+        const normalized = normalizeBudgetDetail(detail)
+        if (lastBudgetDetail !== null && normalized === lastBudgetDetail) {
+          // 两个不同账号撞归一化后相同的预算报文 ⇒ 团队级。
           // 直接 break 且**不记账本号**（上面 ②那步还没执行到）。
           teamBudgetExhausted = true
           // ⚠️ 回滚本轮已记的预算账：这些号撞的是**同一堵团队墙**，本身都是好的。
@@ -941,8 +1034,9 @@ export class CodelyAdapter extends LlmAdapter {
           }
           break
         }
-        // 第一个号：还无法区分「它自己的额度」与「团队预算」，先记报文继续换号。
-        lastBudgetDetail = detail
+        // 第一个号：还无法区分「它自己的额度」与「团队预算」，先记归一化报文继续换号
+        // （存归一化形态：下一轮与 normalized 直接比，两侧行为对称）。
+        lastBudgetDetail = normalized
       } else {
         // ⚠️ 非预算轮次（429 / 其它 4xx / 5xx…）**必须清空**，否则「连续」二字落空：
         //    A 号 402(X) → B 号 429 → C 号 402(X) 时，C 会拿 A 那份报文比对并判成

@@ -255,3 +255,74 @@ describe('refreshCodelyCredential', () => {
     }
   })
 })
+
+describe('CodelyAuth 续期早退必须留痕（2026-10-31 审计补牙：warn 零断言缺口）', () => {
+  /**
+   * 造一个可观测 logger 的 cordis Context 桩。
+   *
+   * ⚠️ 真实 `Context` 的 `logger` 形状由宿主注入，测试桩里可能整个缺失 ——
+   *    本主题修复的正是「早退静默、日志零字」，所以守卫必须能观测 warn 调用。
+   *    直接在 Context 实例上挂 `logger.warn`（cordis 的属性访问是动态的）。
+   */
+  function makeContextWithLogger(): { ctx: Context; warns: string[] } {
+    const warns: string[] = []
+    const ctx = new Context()
+    Object.assign(ctx, { logger: { warn: (message: string) => { warns.push(message) } } })
+    return { ctx, warns }
+  }
+
+  it('★ credentials 未注入 ⇒ warn 且跳过（接线错误必须显眼，不得日志零字）', async () => {
+    const { ctx, warns } = makeContextWithLogger()
+    const auth = new CodelyAuth(ctx, {})
+    await auth.refreshAccountCredential('REF_X', undefined, 'acc-1')
+    expect(warns.length, '必须恰好一条 warn').toBe(1)
+    expect(warns[0]).toMatch(/credentials 未注入/)
+    expect(warns[0]).toMatch(/acc-1/)
+  })
+
+  it('★ 读不到凭据 ⇒ warn；有凭据但无 refresh_token ⇒ 另一条 warn（两种账号级问题分档）', async () => {
+    const { ctx, warns } = makeContextWithLogger()
+    const { store } = makeCredentialStore({
+      REF_GONE: JSON.stringify(makeCredential('GONE', '')),
+    })
+    const auth = new CodelyAuth(ctx, { credentials: store })
+    // 读不到凭据
+    await auth.refreshAccountCredential('REF_MISSING', undefined, 'acc-gone')
+    expect(warns.length).toBe(1)
+    expect(warns[0]).toMatch(/读不到凭据/)
+    expect(warns[0]).toMatch(/REF_MISSING/)
+    // 有凭据但 refresh_token 为空 —— 另一条早退，文案必须区分
+    await auth.refreshAccountCredential('REF_GONE', undefined, 'acc-empty')
+    expect(warns.length).toBe(2)
+    expect(warns[1]).toMatch(/没有 refresh_token/)
+    expect(warns[1]).toMatch(/acc-empty/)
+  })
+
+  it('★ 上游续期失败（返回 undefined）⇒ warn 留痕且不记账', async () => {
+    const { ctx, warns } = makeContextWithLogger()
+    const { store } = makeCredentialStore({
+      REF_DEAD: JSON.stringify(makeCredential('DEAD', 'REFRESH-DEAD')),
+    })
+    const fetchImpl = vi.fn(async () => new Response('nope', { status: 401 }))
+    const auth = new CodelyAuth(ctx, { credentials: store, fetcher: fetchImpl as never })
+    await auth.refreshAccountCredential('REF_DEAD', undefined, 'acc-dead')
+    expect(fetchImpl, '必须真发过续期请求（先排除「没请求就早退」的假路径）').toHaveBeenCalledTimes(1)
+    expect(warns.length, '上游失败必须留痕').toBe(1)
+    expect(warns[0]).toMatch(/续期失败/)
+    expect(warns[0]).toMatch(/acc-dead/)
+  })
+
+  it('★ 续期成功路径不得产生任何 warn（防「凡早退都加 warn」顺手污染成功路）', async () => {
+    const { ctx, warns } = makeContextWithLogger()
+    const { store } = makeCredentialStore({
+      REF_OK: JSON.stringify(makeCredential('OK', 'REFRESH-OK')),
+    })
+    const fetchImpl = vi.fn(async () => new Response(
+      JSON.stringify({ access_token: 'NEW', refresh_token: 'REFRESH-OK' }),
+      { status: 200 },
+    ))
+    const auth = new CodelyAuth(ctx, { credentials: store, fetcher: fetchImpl as never })
+    await auth.refreshAccountCredential('REF_OK', undefined, 'acc-ok')
+    expect(warns, '成功路径零 warn').toEqual([])
+  })
+})

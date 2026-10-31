@@ -241,6 +241,64 @@ describe('Codely 请求级换号 + 冷却', () => {
     expect(String((error as Error).message), '团队级不该再建议签到（领的是个人积分）').not.toMatch(/签到/)
   })
 
+  it('★ 报文带 request_id / 浮点尾差 ⇒ 归一化后仍判团队级（2026-10-31 对抗审计 1D 修）', async () => {
+    const { pool, marks, clears } = makePool([
+      { id: 'acc-1', credential: cred('TOK-A') },
+      { id: 'acc-2', credential: cred('TOK-B') },
+    ])
+    // ⚠️⚠️ 本用例与「团队预算耗尽」的差别只在**报文不再逐字相同**：
+    //    每份报文带不同的 `request_id`（LiteLLM problem/json 实测逐次易变），
+    //    `cost` 是同一数值的两种序列化尾差。逐字比对会让团队级判定**静默永不
+    //    触发**（两号报文必然不等）⇒ 退化回修复前「整池封到次日 0 点」。
+    //    判据必须先归一化（剥 request_id + 抹浮点尾差）再比。
+    const withNoise = (cost: string, requestId: string) => new Response(JSON.stringify({
+      error: {
+        message: `Budget has been exceeded! Current cost: ${cost}, Max budget: -1.0.`,
+        type: 'budget_exceeded',
+        param: null,
+        code: '402',
+      },
+      request_id: requestId,
+      instance: '/v1/chat/completions',
+    }), { status: 402 })
+    const { adapter, chatCalls } = makeAdapter({
+      pool,
+      chatQueue: [withNoise('54.708759999999994', 'req-aaa'), withNoise('54.70876', 'req-bbb')],
+    })
+    const { error } = await run(adapter)
+
+    expect((error as { code?: string }).code).toBe('QUOTA_EXCEEDED')
+    expect(chatCalls(), '归一化后骨架一致 ⇒ 第 2 个号即停').toBe(2)
+    expect(marks.map((m) => m.accountId), '第 2 个号不被连坐记账').toEqual(['acc-1'])
+    expect(clears.map((c) => c.accountId), '第 1 个号的账被回滚').toEqual(['acc-1'])
+    expect(String((error as Error).message)).toMatch(/团队/)
+  })
+
+  it('★ 连续性反例：A 402(X) → B 429 → C 402(X) ⇒ 不判团队级，三个号都记账（2026-10-31 审计补牙）', async () => {
+    const { pool, marks } = makePool([
+      { id: 'acc-1', credential: cred('TOK-A') },
+      { id: 'acc-2', credential: cred('TOK-B') },
+      { id: 'acc-3', credential: cred('TOK-C') },
+    ])
+    // ⚠️⚠️ 「团队级判定要求**真正连续**」的另一半：非预算轮次（429）必须清空
+    //    lastBudgetDetail。删掉清空分支 ⇒ C 拿 A 的报文比对成功 ⇒ 误判团队级、
+    //    提前 break、C 不记账 —— 而真实情况是 B 只是被限流、池里还有可用号。
+    //    本用例钉住：429 插在两个相同 402 之间**必须打断**连续性。
+    const { adapter, chatCalls } = makeAdapter({
+      pool,
+      chatQueue: [budgetExceeded(), rateLimited(), budgetExceeded()],
+    })
+    const { error } = await run(adapter)
+
+    expect((error as { code?: string }).code, '三个号各撞各的墙 ⇒ 仍是 QUOTA_EXCEEDED').toBe('QUOTA_EXCEEDED')
+    expect(chatCalls(), '不得在 C 号提前停止（429 打断了连续性）').toBe(3)
+    expect(marks.map((m) => m.accountId), '三个号全部记账（C 是真预算耗尽，必须记）')
+      .toEqual(['acc-1', 'acc-2', 'acc-3'])
+    expect(String((error as Error).message), '不是团队级 ⇒ 不得出现团队级专属文案'
+      + '（账号级文案本身含「团队预算」四字，判据必须钉团队级独有那句）')
+      .not.toMatch(/团队层面|换号无用|均已回滚/)
+  })
+
   it('★ 换号预算上限：账号再多也只试 5 个（不得无限换号）', async () => {
     const accounts = Array.from({ length: 8 }, (_, i) => ({ id: `acc-${i}`, credential: cred(`TOK-${i}`) }))
     const { pool, marks } = makePool(accounts)
