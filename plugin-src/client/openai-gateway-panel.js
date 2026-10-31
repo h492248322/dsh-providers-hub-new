@@ -115,47 +115,94 @@ export async function copyToClipboard(value) {
 function showManualCopy(value) {
   if (typeof document === 'undefined' || !document.body) return false;
   try {
+    // ⚠️ 2026-10-31 审计（P3）：失败环境下连点 N 次「复制」会叠 N 个遮罩面板
+    //    （每个都要单独点关闭）。已有面板在场时直接复用它：更新 textarea 内容、
+    //    重新全选 —— 语义仍是「用户拿到了文本」，且不叠加。
+    //    用 data 属性标记而不是保存全局引用：本函数无状态，重复弹守卫靠 DOM 自身。
+    const existing = document.body.querySelector('[data-dsh-manual-copy]');
+    if (existing) {
+      const again = existing.querySelector('textarea');
+      if (again) {
+        again.value = value;
+        again.focus();
+        again.select();
+        again.setSelectionRange(0, value.length);
+        return true;
+      }
+      existing.remove();
+    }
+
     const overlay = document.createElement('div');
     overlay.setAttribute('role', 'dialog');
     overlay.setAttribute('aria-modal', 'true');
+    // ⚠️ 给查询选择器留钩子（见上面的重复弹守卫）。
+    overlay.setAttribute('data-dsh-manual-copy', '');
     overlay.style.cssText = [
       'position:fixed', 'inset:0', 'z-index:2147483647',
       'display:flex', 'align-items:center', 'justify-content:center', 'padding:24px',
       'background:rgba(0,0,0,.45)', 'font-family:inherit',
+      // ⚠️ 2026-10-31 审计（P2）：宿主可能跑深色主题（DSH Web 常见形态），
+      //    硬编码浅色会在深色界面里糊一块高亮白。用 color-scheme 声明跟随宿主
+      //    （textarea 的 UA 默认色/滚动条随之适配），其余颜色尽量走系统语义色，
+      //    实在写死的（边框/阴影）选中性灰，深浅两版都不刺眼。
+      'color-scheme:dark light',
     ].join(';');
 
     const box = document.createElement('div');
     box.style.cssText = [
-      'background:#fff', 'border-radius:12px', 'box-shadow:0 12px 40px rgba(0,0,0,.28)',
+      'background:Canvas', 'color:CanvasText',
+      'border-radius:12px', 'box-shadow:0 12px 40px rgba(0,0,0,.28)',
+      'border:1px solid rgba(128,128,128,.35)',
       'width:min(720px,100%)', 'max-height:80vh', 'display:flex',
       'flex-direction:column', 'padding:16px', 'gap:12px',
     ].join(';');
 
     const title = document.createElement('div');
     title.textContent = '浏览器阻止了自动复制，请按 Ctrl+C 复制（内容已全选）';
-    title.style.cssText = 'font-size:13px;font-weight:600;color:#1f2329';
+    title.style.cssText = 'font-size:13px;font-weight:600;color:CanvasText';
 
     const textarea = document.createElement('textarea');
     textarea.value = value;
     textarea.setAttribute('readonly', '');
+    // ⚠️ 审计（P2）：密钥/模型 ID 不是人类语言，别让浏览器给它画拼写红线。
+    textarea.setAttribute('spellcheck', 'false');
     textarea.style.cssText = [
       'flex:1', 'min-height:220px', 'box-sizing:border-box',
       'font-family:ui-monospace,Consolas,monospace', 'font-size:12px', 'line-height:1.5',
-      'border:1px solid #d9dce2', 'border-radius:8px', 'padding:8px', 'resize:vertical',
+      'border:1px solid rgba(128,128,128,.35)', 'border-radius:8px',
+      'padding:8px', 'resize:vertical', 'color-scheme:dark light',
     ].join(';');
 
     const close = document.createElement('button');
     close.type = 'button';
     close.textContent = '关闭';
+    close.title = '关闭（Esc）';
     close.style.cssText = [
       'align-self:flex-end', 'padding:6px 16px', 'border-radius:6px',
-      'border:1px solid #d9dce2', 'background:#fff', 'cursor:pointer',
-      'font-size:13px', 'font-family:inherit',
+      'border:1px solid rgba(128,128,128,.35)', 'background:transparent',
+      'color:inherit', 'cursor:pointer', 'font-size:13px', 'font-family:inherit',
     ].join(';');
 
-    const dismiss = () => { overlay.remove(); };
-    close.addEventListener('click', dismiss);
-    overlay.addEventListener('click', (event) => { if (event.target === overlay) dismiss(); });
+    // ⚠️ 2026-10-31 审计（P1）：面板声明了 aria-modal 却没有 Escape 处理，而
+    //    宿主在 document 级注册了 `Escape → 关闭网关 modal`（jet-hub.js 的
+    //    onKeyDown）。用户按 Esc 想关这个小面板，结果**先关掉底层大模态**，
+    //    小面板挂在 body 上残留（不随 React 卸载）。⇒ 面板自己接 Escape 并在
+    //    **capture 阶段**拦下（stopPropagation 阻断后宿主的 document 冒泡监听
+    //    收不到该事件），关闭时移除监听。textarea 初始持焦点，keydown 必经这里。
+    const dismissAndCleanup = () => {
+      document.removeEventListener('keydown', onKeyDown, { capture: true });
+      overlay.remove();
+    };
+    const onKeyDown = (event) => {
+      if (event.key === 'Escape') {
+        event.stopPropagation();
+        event.preventDefault();
+        dismissAndCleanup();
+      }
+    };
+    document.addEventListener('keydown', onKeyDown, { capture: true });
+    close.addEventListener('click', dismissAndCleanup);
+    overlay.addEventListener('click', (event) => { if (event.target === overlay) dismissAndCleanup(); });
 
     box.append(title, textarea, close);
     overlay.append(box);

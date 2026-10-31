@@ -444,6 +444,166 @@ describe('凭据的展示与复制', () => {
     }
   })
 
+  // ⚠️ 2026-10-31 审计（P2 补牙）：showManualCopy 原先零覆盖 —— 删掉函数体只剩
+  //    return false，全文件测试仍全绿。三层降级的核心承诺「用户总能拿到文本」
+  //    不能只靠注释自律。本组三条用例直接观测第三层的 DOM 行为。
+  describe('第三层手动复制面板（showManualCopy）', () => {
+    /** 造一个足够真实的 DOM 桩：overlay/box/textarea/button 各自独立创建。 */
+    function makeDomStub() {
+      const appended: any[] = []
+      const removed: any[] = []
+      const documentListeners: Array<{ type: string; fn: (e: any) => void; options?: any }> = []
+      /**
+       * 只看**当前还挂在 body 上**的节点：legacyCopy 的 textarea 会 append 后
+       * 立刻 removeChild（ parentNode=null），手动面板则一直挂着。
+       * 断言「面板挂出来了」必须过滤掉前者，否则 appended[0] 是那个已摘除的
+       * 隐形 textarea。
+       */
+      const live = () => appended.filter((el) => el.parentNode !== null)
+      const makeEl = (tag: string) => {
+        const listeners: Record<string, Array<(e: any) => void>> = {}
+        const el: any = {
+          tagName: tag,
+          value: '',
+          style: {} as Record<string, string>,
+          parentNode: null as any,
+          children: [] as any[],
+          setAttribute: vi.fn((k: string, v: string) => { el[`data-attr-${k}`] = v }),
+          focus: vi.fn(),
+          select: vi.fn(),
+          setSelectionRange: vi.fn(),
+          append: (...kids: any[]) => { el.children.push(...kids) },
+          remove: vi.fn(() => { removed.push(el) }),
+          // 递归子树查找（真实 DOM 的 querySelector 语义的最小实现）——
+          // 重复弹守卫用 overlay.querySelector('textarea') 取文本框
+          querySelector: (sel: string) => {
+            const tag = sel.replace(/[[\]']/g, '')
+            const walk = (node: any): any => {
+              for (const kid of node.children ?? []) {
+                if (kid.tagName === tag) return kid
+                const hit = walk(kid)
+                if (hit) return hit
+              }
+              return undefined
+            }
+            return walk(el)
+          },
+          addEventListener: (type: string, fn: (e: any) => void) => {
+            ;(listeners[type] ??= []).push(fn)
+          },
+          __fire: (type: string, event: any) => {
+            for (const fn of listeners[type] ?? []) fn({ target: el, ...event })
+          },
+        }
+        return el
+      }
+      const documentStub = {
+        body: {
+          appendChild: (el: any) => { el.parentNode = documentStub.body; appended.push(el); return el },
+          removeChild: (el: any) => { el.parentNode = null; return el },
+          // 查询选择器桩：返回当前**还挂着**的 overlay（无则 null）—— 重复弹守卫读它。
+          // 同样要过滤已摘除的 legacyCopy textarea。
+          querySelector: (sel: string) => (sel.includes('manual-copy')
+            ? (live().find((el) => el.tagName === 'div') ?? null)
+            : null),
+        },
+        // ⚠️ 每次createElement 给独立对象（不能用 mockReturnValue 单例）——
+        //    legacyCopy 与 showManualCopy 各自创建元素，共享对象会让第二个
+        //    消费者拿到被前一个污染的实例（这也正是被测实现依赖的真实语义）。
+        createElement: (tag: string) => makeEl(tag),
+        addEventListener: (type: string, fn: (e: any) => void, options?: any) => {
+          documentListeners.push({ type, fn, options })
+        },
+        removeEventListener: (type: string, fn: (e: any) => void, options?: any) => {
+          const i = documentListeners.findIndex((l) => l.type === type && l.fn === fn)
+          if (i >= 0) documentListeners.splice(i, 1)
+        },
+        __documentListeners: documentListeners,
+      }
+      vi.stubGlobal('navigator', {})
+      vi.stubGlobal('document', documentStub)
+      /**
+       * 面板 overlay = 当前仍挂在 body 上的 div（legacyCopy 的 textarea 已摘除，
+       * 且它不是 div）。三条用例共用这一判定，避免各自摸 appended 数组下标。
+       */
+      const findLiveOverlay = () => live().find((el) => el.tagName === 'div')
+      const liveOverlays = () => live().filter((el) => el.tagName === 'div')
+      const findTextarea = (el: any): any => {
+        if (el === undefined || el === null) return undefined
+        if (el.tagName === 'textarea') return el
+        for (const kid of el.children ?? []) {
+          const hit = findTextarea(kid)
+          if (hit) return hit
+        }
+        return undefined
+      }
+      return { appended, removed, documentListeners, findLiveOverlay, liveOverlays, findTextarea }
+    }
+
+    it('★ execCommand 失败 ⇒ body 上真的挂出含完整文本的 overlay（用户总能拿到文本）', async () => {
+      const { findLiveOverlay, findTextarea } = makeDomStub()
+      try {
+        expect(await copyToClipboard('secret-key-123')).toBe(false)
+        const overlay = findLiveOverlay()
+        expect(overlay, '第三层必须真的往 body 挂面板').toBeDefined()
+        const ta = findTextarea(overlay)
+        expect(ta, '面板里必须有 textarea').toBeDefined()
+        expect(ta.value, '面板必须携带完整原文').toBe('secret-key-123')
+        expect(ta.setAttribute).toHaveBeenCalledWith('readonly', '')
+        expect(ta.setAttribute, '密钥不是词，别让浏览器画拼写红线').toHaveBeenCalledWith('spellcheck', 'false')
+        // 打开即全选（Ctrl+C 直接可用）
+        expect(ta.select).toHaveBeenCalled()
+        expect(ta.setSelectionRange).toHaveBeenCalledWith(0, 'secret-key-123'.length)
+      } finally {
+        vi.unstubAllGlobals()
+      }
+    })
+
+    it('★ Escape 关闭面板且阻断冒泡（宿主 document 级的 Esc 监听不得收到事件）', async () => {
+      const { documentListeners, findLiveOverlay } = makeDomStub()
+      try {
+        await copyToClipboard('secret')
+        const overlay = findLiveOverlay()
+        expect(overlay, '面板必须已挂出').toBeDefined()
+        // 面板必须在 document 上注册了 capture 阶段的 keydown（否则宿主先收到 Esc）
+        const captureKeydown = documentListeners.find((l) => l.type === 'keydown' && l.options?.capture === true)
+        expect(captureKeydown, 'Escape 拦截必须是 capture 阶段').toBeDefined()
+
+        // 模拟按 Esc：断言 stopPropagation 被调（阻断宿主监听）+ overlay 被移除
+        const stopPropagation = vi.fn()
+        const preventDefault = vi.fn()
+        captureKeydown!.fn({ key: 'Escape', stopPropagation, preventDefault })
+        expect(stopPropagation, '必须阻断冒泡，否则宿主的大模态会被误关').toHaveBeenCalled()
+        expect(overlay.remove, 'Escape 必须关掉面板本身（而不是宿主的大模态）').toHaveBeenCalled()
+        // 关闭后 document 监听必须摘掉（不泄漏）
+        expect(
+          documentListeners.some((l) => l.type === 'keydown' && l.options?.capture === true),
+          '关闭后 keydown 监听必须移除',
+        ).toBe(false)
+      } finally {
+        vi.unstubAllGlobals()
+      }
+    })
+
+    it('★ 连点失败 ⇒ 不叠加面板（复用已有 overlay，更新内容重新全选）', async () => {
+      const { liveOverlays, findTextarea } = makeDomStub()
+      try {
+        await copyToClipboard('first-value')
+        await copyToClipboard('second-value')
+        const overlays = liveOverlays()
+        expect(
+          overlays,
+          '连点 N 次不得叠 N 个遮罩（重复弹守卫）',
+        ).toHaveLength(1)
+        const ta = findTextarea(overlays[0])
+        expect(ta.value, '复用面板时内容要更新成最新一次的').toBe('second-value')
+        expect(ta.select, '复用时重新全选').toHaveBeenCalled()
+      } finally {
+        vi.unstubAllGlobals()
+      }
+    })
+  })
+
   it('面板默认不把密钥明文渲染进 DOM，只有点「显示明文」才出现', () => {
     // 设置页会被截图/录屏/投屏，明文默认躺在屏幕上等于把凭据带出去。
     const body = source.slice(
