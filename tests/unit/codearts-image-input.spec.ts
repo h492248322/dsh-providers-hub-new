@@ -36,7 +36,7 @@
  * | ③ VL 模型仍在目录外 | 把它们放进 `listModels` ⇒ 用户可选中当主模型（回归） | 断言目录 id 集合**不含**它们 |
  * | ④ `prepareCall` 不覆盖模态 | 加回 `inputModalities: ['text']` 硬覆盖 ⇒ ① 被静默抹平 | 断言 `prepareCall().model` 与 `resolveModel()` **一致** |
  */
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it } from 'vitest'
 import {
   CODEARTS_FALLBACK_CONTEXT_WINDOW,
   CodeArtsAdapter,
@@ -44,6 +44,11 @@ import {
   codeartsImagePart,
   codeartsVisionModel,
 } from '../../src/llm-adapter.js'
+import {
+  resetCodeartsImageModels,
+  setCodeartsImageModels,
+} from '../../src/codearts-vision.js'
+import { fetchCodeArtsRemoteModels, SNAP_MODEL_BUILTIN_URL } from '../../src/models.js'
 import type { CodeArtsCredential } from '../../src/types.js'
 
 const validCredential: CodeArtsCredential = {
@@ -200,5 +205,124 @@ describe('CodeArts 图片输入：能力判定与 wire 形态', () => {
   it('⑦ 识图模型是 kimi-k2.6-vl（IDE fetchMultimodalModelId 的实测选择）', () => {
     expect(codeartsVisionModel()).toBe('kimi-k2.6-vl')
     expect(codeartsAcceptsImage(codeartsVisionModel())).toBe(true)
+  })
+})
+
+/**
+ * CodeArts 图片输入：**跟随远端目录**新增的多模态模型（2026-10-26 报障驱动）。
+ *
+ * ## 报障原文
+ *
+ * 「codearts/kimi-k3 不支持图片，但官方是支持的」
+ *
+ * ## 根因
+ *
+ * `codeartsAcceptsImage` 原**只查静态表** `CODEARTS_VL_MODELS`（两个老 VL 模型）。
+ * 而上游会持续新增/替换多模态模型，静态表**不会自己更新** ⇒ 新模型一上线就必然
+ * 被判成「不能收图」：`inputModalities` 被声明成 `['text']` ⇒ DSH 在**图片入库
+ * 阶段**就拒掉，请求根本发不到上游 —— 用户看到的正是「提示阻止发送」。
+ *
+ * ⇒ 判据改为「远端目录 `supports_images` **∪** 静态表」。
+ */
+describe('CodeArts 图片输入：跟随远端目录新增的多模态模型', () => {
+  // ⚠️ `catalogImageModels` 是**模块级单例**状态，会跨用例、甚至跨测试文件残留
+  //    ⇒ 每个用例后必须清掉，否则本文件的断言会把「能收图」泄漏到别处。
+  afterEach(() => {
+    resetCodeartsImageModels()
+  })
+
+  /**
+   * 守卫 ⑧：本条是**这次报障的核心** —— 静态表里没有、但远端标了
+   * `supports_images: true` 的模型必须能收图。
+   *
+   * ⚠️ 有牙：把判据改回「只查静态表」⇒ 第二条断言变红。
+   */
+  it('⑧ 静态表没有、但远端标了 supports_images 的模型能收图（kimi-k3）', () => {
+    expect(
+      codeartsAcceptsImage('kimi-k3'),
+      '灌入目录前：静态表不含 kimi-k3 ⇒ 不能收图（这正是用户报的现象）',
+    ).toBe(false)
+    setCodeartsImageModels(['kimi-k3'])
+    expect(codeartsAcceptsImage('kimi-k3'), '灌入后：远端说它能收 ⇒ 必须能收').toBe(true)
+  })
+
+  /** 守卫 ⑨：目录里**没**标 true 的模型仍不能收图 —— 别把并集写成「全都放行」。 */
+  it('⑨ 目录未标 true 的模型仍不能收图（不误放行）', () => {
+    setCodeartsImageModels(['kimi-k3'])
+    expect(codeartsAcceptsImage('glm-5.3')).toBe(false)
+    expect(codeartsAcceptsImage('deepseek-v4.1-flash')).toBe(false)
+  })
+
+  /**
+   * 守卫 ⑩：判据是**并集**，不是「目录加载后以目录为准」。
+   *
+   * ⚠️ 有牙：改成以目录为准 ⇒ 这两条变红。而走那条路的后果是：上游某天不再
+   *   下发 `supports_images`，`kimi-k2.6-vl` 就从「能收图」变成「不能」，
+   *   `analyzeImage` 借它识图的整条链路当场失效。
+   */
+  it('⑩ 并集：目录加载后静态表里的老模型仍可收图', () => {
+    setCodeartsImageModels(['kimi-k3'])
+    expect(codeartsAcceptsImage('kimi-k2.6-vl')).toBe(true)
+    expect(codeartsAcceptsImage('Qwen3-VL-235B')).toBe(true)
+  })
+
+  /** 守卫 ⑪：目录 id 的大小写/空白归一（上游两种写法都出现过）。 */
+  it('⑪ 目录 id 大小写与空白归一', () => {
+    setCodeartsImageModels(['Kimi-K3'])
+    expect(codeartsAcceptsImage('kimi-k3')).toBe(true)
+    expect(codeartsAcceptsImage(' kimi-k3 ')).toBe(true)
+  })
+
+  /** 守卫 ⑫：清空后回退静态表（= 目录从未加载成功时的行为，不得回归）。 */
+  it('⑫ 清空后回退静态表', () => {
+    setCodeartsImageModels(['kimi-k3'])
+    resetCodeartsImageModels()
+    expect(codeartsAcceptsImage('kimi-k3')).toBe(false)
+    expect(codeartsAcceptsImage('kimi-k2.6-vl'), '静态表兜底仍生效').toBe(true)
+  })
+
+  /**
+   * 守卫 ⑬：**端到端** —— 目录拉取真的把 `supports_images` 灌进了判据。
+   *
+   * ⚠️ 这条覆盖前面 5 条**都覆盖不到**的一处：`models.ts` 必须在
+   *    `parseModelInfo` 过滤 `-VL` **之前**收集 —— 因为能收图的恰恰是那批
+   *    VL 模型，它们被丢出目录后、走 `models` 数组根本看不到 ⇒ 漏了这一步，
+   *    `kimi-k2.6-vl` 就会失去 image 能力，`analyzeImage` 随之失效。
+   *
+   * ⚠️ 有牙：把收集挪到 `parseModelInfo` 之后 ⇒ 倒数第二条断言变红。
+   */
+  it('⑬ 端到端：目录拉取把 supports_images 灌进判据（含被 -VL 过滤的模型）', async () => {
+    const fetcher = (async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (url === SNAP_MODEL_BUILTIN_URL) {
+        return new Response(JSON.stringify({
+          builtinModels: [
+            { model_id: 'kimi-k3', model_name: 'Kimi-K3', supports_images: true },
+            { model_id: 'glm-5.3', model_name: 'GLM-5.3', supports_images: false },
+            // ⚠️ 会被 parseModelInfo 的 `-VL` 判据丢出目录，但**必须**仍记为能收图。
+            //
+            //    两个 id 形态都是刻意挑的：
+            //    · 必须**大写** `-VL` 结尾 —— 判据只认 `-VL-` / `-VL`（大写），
+            //      实测小写 `-vl`（真机 `kimi-k2.6-vl` 正是小写）会**逃过过滤**
+            //      留在目录里（既有行为，非本次引入，此处不擅自改判据）；
+            //    · 必须**不在静态表里** —— `kimi-k2.6-vl` / `Qwen3-VL-235B` 都在
+            //      静态表，收集漏了也会被兜底判成 true ⇒ 断言**没有牙**。
+            { model_id: 'kimi-k4-VL', model_name: 'Kimi-K4-VL', supports_images: true },
+          ],
+        }), { status: 200 })
+      }
+      return new Response('', { status: 404 })
+    }) as unknown as typeof fetch
+
+    const models = await fetchCodeArtsRemoteModels(validCredential, fetcher)
+    const ids = models.map((m) => m.id)
+    expect(ids, 'kimi-k3 不带 -VL 后缀 ⇒ 进目录').toContain('kimi-k3')
+    expect(ids, 'kimi-k4-VL 大写 -VL 结尾 ⇒ 被丢出目录').not.toContain('kimi-k4-VL')
+    expect(codeartsAcceptsImage('kimi-k3'), '远端标 true ⇒ 能收图').toBe(true)
+    expect(
+      codeartsAcceptsImage('kimi-k4-VL'),
+      '虽被丢出目录，仍须能收图 ⇒ 收集必须发生在 -VL 过滤之前',
+    ).toBe(true)
+    expect(codeartsAcceptsImage('glm-5.3'), '远端标 false ⇒ 不放行').toBe(false)
   })
 })
