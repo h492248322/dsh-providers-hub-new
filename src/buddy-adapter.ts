@@ -1573,9 +1573,26 @@ function errorDetail(body: string): string {
     const display = typeof data.displayMsg === 'object' && data.displayMsg !== null
       ? data.displayMsg as Record<string, unknown>
       : undefined
-    const localized = typeof display?.zh === 'string'
-      ? display.zh
-      : typeof display?.en === 'string' ? display.en : undefined
+    // ⚠️⚠️ **`displayTips` 也要认**（2026-10-31，第五族 11140 实测）：
+    // 「账号被平台限制」那份报文**只有 `displayTips`、没有 `displayMsg`**：
+    // ```
+    // {"code":11140,"msg":"request illegal",
+    //  "displayTips":{"zh":"账号存在异常行为，已被限制使用"}}
+    // ```
+    // ⇒ 旧实现在这里提不出任何本地化文案，用户只看到 `request illegal` ——
+    // 上游唯一说清原因的字段被白白埋掉（与上面 `displayMsg` 那条事故**同型**）。
+    // ⚠️ 顺序：`displayMsg`（直接面向用户的展示文案）在前，`displayTips`（提示）
+    // 在后 —— 两者都在时以 `displayMsg` 为准。
+    const tips = typeof data.displayTips === 'object' && data.displayTips !== null
+      ? data.displayTips as Record<string, unknown>
+      : undefined
+    // ⚠️ `displayMsg`（直接展示文案）优先于 `displayTips`（提示）—— 两者都在时以
+    // 前者为准；写成显式函数而非 `??` 链：`??` 与三元混排的优先级极易写错
+    //（第一版就写出「恒 nullish」被 TS 拒绝，见 git 历史）。
+    const localizedText = (source: Record<string, unknown> | undefined): string | undefined =>
+      typeof source?.zh === 'string' ? source.zh
+        : typeof source?.en === 'string' ? source.en : undefined
+    const localized = localizedText(display) ?? localizedText(tips)
     const parts = [
       // 本地化文案最可读，排在最前。
       localized,

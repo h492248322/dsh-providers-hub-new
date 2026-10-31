@@ -783,6 +783,24 @@ unapproved channel`）⇒ 说明那批请求确实打到了能报 11128 的网�
 用它会把**内容级**的 `Illegal API invocation…` 拖进换号，而那一句换号**完全无效**
 （腾讯指纹改写链路处理、每个账号都被拦在同一句上）⇒ 整池被白烧。
 
+##### ✅ 但 `errorDetail` 的**展示出口**必须认 `displayTips`（2026-10-31 修）
+
+上面那条「判据不得用 `displayTips`」说的是**分类**；**展示**是另一回事 ——
+第五族报文（账号被限制）**只有 `displayTips`、没有 `displayMsg`**：
+
+```json
+{"code":11140,"msg":"request illegal",
+ "displayTips":{"zh":"账号存在异常行为，已被限制使用"}}
+```
+
+旧 `errorDetail` 只认 `displayMsg` ⇒ 提不出任何本地化文案 ⇒ 用户只看到
+`request illegal`，**上游唯一说清原因的字段被白白埋掉** —— 与 2026-09-27 那条
+`displayMsg` 事故（`errorDetail` 只读 `data.message`）**同型**。
+修法：`errorDetail` 加 `displayTips.{zh,en}` 腿，**优先级锁死**
+`displayMsg` 在前、`displayTips` 在后（两者都在时以前者为准），由两条行为级
+用例锁住（含优先级对照格）。⚠️ **与判据的边界要分清**：分类判据**仍不得**
+扫 `displayTips`（上面那条警告照旧成立）—— 展示出口与分类出口是两条路。
+
 ⚠️ **右边界是 `(?![\d.])`、不是 `(?![0-9])`**（自引入缺陷，单测实测）：
 JSON 允许非整数码，`JSON.stringify({code:11128.5})` 写出 `11128.5`，`.` 不在
 `[0-9]` 里 ⇒ 只挡数字的写法会**放行小数**并误命中。

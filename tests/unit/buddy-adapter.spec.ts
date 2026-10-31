@@ -1726,6 +1726,69 @@ describe('BuddyAdapter credential handling', () => {
     expect(message).not.toContain('requestId')
   })
 
+  /**
+   * 守卫：`displayTips.zh`（**第五族**报文唯一的本地化文案）必须到达用户眼前
+   * （2026-10-31 实测，见 `docs/agent-notes/providers-buddy.md` 的「第五族」小节）。
+   *
+   * ⚠️⚠️ 真实报文**只有 `displayTips`、没有 `displayMsg`**：
+   * ```
+   * {"code":11140,"msg":"request illegal",
+   *  "displayTips":{"zh":"账号存在异常行为，已被限制使用"}}
+   * ```
+   * 旧 `errorDetail` 只认 `displayMsg` ⇒ 提不出任何本地化文案 ⇒ 用户只看到
+   * `request illegal`，上游唯一说清原因的字段被白白埋掉 —— 与 2026-09-27 那条
+   * `displayMsg` 事故**同型**（上一条用例守的就是它）。
+   *
+   * ⚠️ 优先级锁死：`displayMsg` 在前、`displayTips` 在后 —— 两者都在时以
+   * `displayMsg` 为准（第二条断言）。
+   */
+  it('★★ 第五族报文（只有 displayTips）的中文文案必须到达用户眼前', async () => {
+    const raw = JSON.stringify({
+      code: 11140,
+      msg: 'request illegal',
+      displayTips: { en: 'The account has been restricted.', zh: '账号存在异常行为，已被限制使用' },
+    })
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      refresh: async () => { throw new Error('refresh failed') },
+      accountPool: makePool([
+        { id: 'acc-1', credential: makeCredential({ access_token: 'AT1' }) },
+        { id: 'acc-2', credential: makeCredential({ access_token: 'AT2' }) },
+      ]),
+      fetchImpl: async () => new Response(raw, { status: 403 }),
+    })
+    const error = await collectChunks(adapter, streamOptions).catch((e: unknown) => e)
+    const message = (error as LlmError).message
+    // ⚠️ 上游唯一说清原因的文案必须**出现**（修复前用户只看到 `request illegal`）。
+    expect(message, `用户应当看到被限制的原因，实际：${message}`).toContain('账号存在异常行为，已被限制使用')
+    expect(message).toContain('request illegal')
+    // ⚠️ 噪声字段不得倾倒。
+    expect(message).not.toContain('displayTips')
+    expect(message).not.toContain('The account has been restricted')
+  })
+
+  it('★★ displayMsg 与 displayTips 都在时，以 displayMsg 为准（优先级锁死）', async () => {
+    const raw = JSON.stringify({
+      code: 11140,
+      msg: 'request illegal',
+      displayMsg: { zh: '请求被安全策略拦截，请稍后重试' },
+      displayTips: { zh: '账号存在异常行为，已被限制使用' },
+    })
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      refresh: async () => { throw new Error('refresh failed') },
+      accountPool: makePool([
+        { id: 'acc-1', credential: makeCredential({ access_token: 'AT1' }) },
+        { id: 'acc-2', credential: makeCredential({ access_token: 'AT2' }) },
+      ]),
+      fetchImpl: async () => new Response(raw, { status: 403 }),
+    })
+    const error = await collectChunks(adapter, streamOptions).catch((e: unknown) => e)
+    const message = (error as LlmError).message
+    expect(message).toContain('请求被安全策略拦截')
+    expect(message).not.toContain('账号存在异常行为')
+  })
+
   it('401 换号不会无限循环：每个账号最多试一次', async () => {
     let calls = 0
     const adapter = makeAdapter({
