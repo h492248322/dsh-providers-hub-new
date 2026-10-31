@@ -207,6 +207,38 @@ if ($needInstall) {
     Die "依赖已安装但找不到宿主入口: $dshBin"
   }
   Info '      宿主依赖安装完成'
+
+  # ⚠️ 2026-10-31 审计（P2）：npm ci 带 --ignore-scripts 后，node-pty 等需要 install
+  #    脚本的包不会跑 postinstall —— 缺 win32-x64 prebuild 则 PTY 运行时才炸。
+  #    对照 build-standalone.mjs 的既有做法：装完后单独 rebuild node-pty。
+  #    失败默认 Die（-SkipVerify 放行为 Warn —— 与本脚本的核验口径一致）。
+  $ptyDir = Join-Path $profilesDir 'node_modules\node-pty'
+  if (Test-Path $ptyDir) {
+    $ptyPrebuilds = Join-Path $ptyDir 'prebuilds\win32-x64'
+    $ptyHasNative = (Test-Path $ptyPrebuilds) -and (@(Get-ChildItem -Path $ptyPrebuilds -Filter '*.node' -ErrorAction SilentlyContinue).Count -gt 0)
+    if (-not $ptyHasNative) {
+      Info '      node-pty 缺少 win32-x64 prebuild，单独重建该包（仅它需要 install 脚本）...'
+      $ptyNpmArgs = @('rebuild', 'node-pty', '--ignore-scripts=false', '--foreground-scripts', '--loglevel=error')
+      Push-Location $profilesDir
+      try {
+        & $runNpm $ptyNpmArgs
+        $ptyCode = $LASTEXITCODE
+      } finally {
+        Pop-Location
+      }
+      if ($ptyCode -ne 0) {
+        if ($SkipVerify) {
+          Warn "node-pty rebuild 失败（exit=$ptyCode，-SkipVerify 已忽略）—— PTY 相关功能可能不可用"
+        } else {
+          Die "node-pty rebuild 失败（exit=$ptyCode）。Windows 终端/PTY 功能会加载失败；可用 -SkipVerify 跳过。"
+        }
+      } else {
+        Info '      node-pty rebuild 完成'
+      }
+    } else {
+      Info '      node-pty 已带 win32-x64 prebuild'
+    }
+  }
 } else {
   Info "[4/8] 宿主依赖已就绪，跳过下载（$dshBin）"
 }
@@ -311,10 +343,21 @@ if ($SkipVerify) {
   } else {
     $bad = @()
     foreach ($f in $nodeFiles) {
-      if ($f.FullName -match '[-_](linux|darwin|freebsd)[-_]' -or $f.FullName -match '^.*\\(linux|darwin)\\-') { $bad += $f.FullName }
+      # ⚠️ 2026-10-31 审计（P2）：第二条正则（'^.*\\(linux|darwin)\\-'）要求
+      #    「反斜杠+linux+反斜杠+连字符」，实际路径形如 ...\prebuilds\linux-x64\...
+      #    —— 恒不命中的死正则，删除。只保留第一条段式判据。
+      if ($f.FullName -match '[-_](linux|darwin|freebsd)[-_]') { $bad += $f.FullName }
     }
     if ($bad.Count -gt 0) {
-      Warn "发现非 Windows 平台的 .node 文件（$($bad.Count) 个），可能是跨平台 lock 造成的:"
+      # ⚠️ 2026-10-31 审计（P2）：旧版这里只 Warn —— 检查没有牙。发现非 Windows
+      #    平台的 .node 默认 Die（-SkipVerify 放行），否则传输/跨平台 lock 造成的
+      #    错误产物在目标机上完全不可见。
+      $msg = "发现非 Windows 平台的 .node 文件（$($bad.Count) 个），可能是跨平台 lock 造成的:"
+      if ($SkipVerify) {
+        Warn "$msg（-SkipVerify 已忽略）"
+      } else {
+        Die $msg
+      }
       $bad | Select-Object -First 5 | ForEach-Object { Warn "  $_" }
     }
     Info "      共 $($nodeFiles.Count) 个 .node（Windows 侧）"

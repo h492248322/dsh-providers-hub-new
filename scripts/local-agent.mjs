@@ -22,7 +22,9 @@
 //   --dry-run         只打印将要写的改动，不真正落盘
 //
 // 安全红线（硬编码，不提供开关）：
-//   * 路径必须落在 --root 之内（realpath 后校验，Windows 大小写不敏感）
+//   * 路径必须落在 --root 之内（对已存在部分 realpath 后校验，Windows 大小写不敏感；
+//     目标尚不存在时上溯最近存在祖先做 realpath、接回剩余词法段后重校验）
+//   * fs_write 拒绝以 symlink/junction 为目标；fs_delete 只删文件或空目录（不递归）
 //   * .env* / *.pem / *.key / id_rsa* / *.pfx / .npmrc / credentials* 一律拒绝读写
 //   * node_modules / dist / .git 等目录不扫描、不允许写
 //   * 写文件必须带 expectSha256，不匹配即拒绝（防覆盖用户手改）
@@ -30,7 +32,7 @@
 
 import { createHash } from 'node:crypto'
 import {
-  existsSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync,
+  existsSync, lstatSync, readFileSync, readdirSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync,
 } from 'node:fs'
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
@@ -113,20 +115,56 @@ class Denied extends Error {
   }
 }
 
-/** 把用户/模型给的相对路径解析成绝对路径，并校验必须落在 ROOT 内。 */
+/** ROOT 的真实路径（realpath 后再小写，供下面前缀比较；ROOT 在启动时已确认存在）。 */
+const ROOT_REAL = realpathSync(ROOT).toLowerCase()
+
+/** 逐段检查剩余词法段（不落盘），判据与调用方保持同一套 SKIP_DIRS / SENSITIVE。 */
+function lexicalCheck(abs, orig) {
+  // ⚠️ Windows 路径大小写不敏感，比较必须归一化，否则 C:\App 与 c:\app 会绕开前缀判断
+  const rel = relative(ROOT.toLowerCase(), abs.toLowerCase())
+  if (rel === '..' || rel.startsWith('..') || isAbsolute(rel)) {
+    throw new Denied('path_outside_root', orig)
+  }
+  if (rel.split(/[\\/]/).some((seg) => SKIP_DIRS.has(seg.toLowerCase()))) {
+    throw new Denied('skipped_dir', orig)
+  }
+  if (SENSITIVE.some((re) => re.test(basename(abs)))) throw new Denied('sensitive_file', orig)
+}
+
+/**
+ * 把用户/模型给的相对路径解析成绝对路径，并校验必须落在 ROOT 内。
+ *
+ * ⚠️ 2026-10-31 审计（P0）：仅做词法检查挡不住 symlink / NTFS junction ——
+ *    模型可以 fs_write 新建一个指向根外的链接再要求写穿，fs_read/fs_write/fs_delete
+ *    都会落到根外。因此必须对「真实落盘会经过的每个存在路径」做 realpath 后重校验：
+ *    - 目标本身存在：对它做 realpath（跟随链接）后校验 —— 穿过链接到达的终点必须在根内；
+ *    - 目标尚不存在（写场景）：上溯到最近存在的祖先做 realpath，再把剩余词法段接回，
+ *      然后对拼接结果重做词法校验。真实创建发生在祖先内部，不存在任何中间目录
+ *      被解析到根外的问题；祖先本身已过 realpath 校验。
+ *    - 同时用 lstat 拒绝「路径上的任何存在段自身是链接」（见 isLinkUnsafe）。
+ */
 function safePath(p) {
   if (typeof p !== 'string' || p === '') throw new Denied('bad_path', '空路径')
   if (/^[a-zA-Z]:/.test(p) || isAbsolute(p)) throw new Denied('bad_path', '只接受相对路径')
   const abs = resolve(ROOT, p)
-  // ⚠️ Windows 路径大小写不敏感，比较必须归一化，否则 C:\App 与 c:\app 会绕开前缀判断
-  const rel = relative(ROOT.toLowerCase(), abs.toLowerCase())
-  if (rel === '..' || rel.startsWith('..') || isAbsolute(rel)) {
+  lexicalCheck(abs, p)
+  // 已存在的目标：realpath（跟随链接）后整体重校验 —— 链接指向根外时这里拒绝。
+  if (existsSync(abs)) {
+    lexicalCheck(realpathSync(abs).toLowerCase(), p)
+    return abs
+  }
+  // 目标尚不存在（典型是 fs_write 的新文件）：上溯最近存在的祖先。
+  let existing = dirname(abs)
+  while (existing !== dirname(existing) && !existsSync(existing)) {
+    existing = dirname(existing)
+  }
+  if (existing === dirname(existing)) throw new Denied('bad_path', `无法定位已存在的祖先目录: ${p}`)
+  // 最近存在祖先的 realpath 必须落在根内（根的祖先也可能是链接，如 subst 盘符）。
+  if (!realpathSync(existing).toLowerCase().startsWith(ROOT_REAL)) {
     throw new Denied('path_outside_root', p)
   }
-  if (rel.split(/[\\/]/).some((seg) => SKIP_DIRS.has(seg.toLowerCase()))) {
-    throw new Denied('skipped_dir', p)
-  }
-  if (SENSITIVE.some((re) => re.test(basename(abs)))) throw new Denied('sensitive_file', p)
+  // 祖先之内不会再被解析改写，接回剩余词法段后重校验即可。
+  lexicalCheck(join(realpathSync(existing), relative(existing, abs)).toLowerCase(), p)
   return abs
 }
 
@@ -135,10 +173,30 @@ function sha256OfFile(file) {
   return createHash('sha256').update(readFileSync(file)).digest('hex')
 }
 
+/**
+ * 路径上任何**存在**的段（含目标本身与中间目录）都不能自身是 symlink / junction。
+ *
+ * ⚠️ 2026-10-31 审计（P0）：lstat 逐段检查 —— 中间目录是链接而终点合法的情况
+ *    （如 root/data -> 别处）同样要拒绝，只查 basename 或只查终点都挡不住。
+ *    读/list 也一并收紧：穿透链接读取根外文件与写穿是同一类逃逸。
+ */
+function assertNoLinkOnPath(abs, orig) {
+  let cur = abs
+  while (cur !== dirname(cur)) {
+    if (existsSync(cur)) {
+      const st = lstatSync(cur)
+      if (!st.isDirectory() && !st.isFile() && !st.isSymbolicLink()) throw new Denied('bad_path', orig)
+      if (st.isSymbolicLink()) throw new Denied('symlink_target', `${orig}（路径含符号链接/junction）`)
+    }
+    cur = dirname(cur)
+  }
+}
+
 // ---------------------------------------------------------------- 工具实现
 
 function toolList({ path = '.', depth = 2 }) {
   const dir = safePath(path)
+  assertNoLinkOnPath(dir, path)
   if (!existsSync(dir)) throw new Denied('not_found', path)
   if (!statSync(dir).isDirectory()) throw new Denied('not_a_directory', path)
 
@@ -165,6 +223,7 @@ function toolList({ path = '.', depth = 2 }) {
 
 function toolRead({ path, maxBytes = 2_000_000 }) {
   const file = safePath(path)
+  assertNoLinkOnPath(file, path)
   if (!existsSync(file)) throw new Denied('not_found', path)
   const st = statSync(file)
   if (!st.isFile()) throw new Denied('not_a_file', path)
@@ -193,6 +252,13 @@ async function confirm(question) {
 
 async function toolWrite({ path, content, expectSha256, createIfMissing = false }) {
   const file = safePath(path)
+  assertNoLinkOnPath(dirname(file), path)
+  // ⚠️ 2026-10-31 审计（P0）：目标自身若是 symlink/junction，rename 会整链接替换、
+  //    或写入穿透到根外 —— 在落盘前用 lstat 显式拒绝（safePath 的 realpath 只挡
+  //    「链接已指向根外」；「把合法文件替换成链接」这条要在这里挡）。
+  if (existsSync(file) && lstatSync(file).isSymbolicLink()) {
+    throw new Denied('symlink_target', `${path}（目标是符号链接/junction）`)
+  }
   const before = sha256OfFile(file)
   if (before !== '' && before !== expectSha256) {
     throw new Denied('conflict', `文件已被改动（当前 ${before.slice(0, 8)}，期望 ${String(expectSha256).slice(0, 8)}）`)
@@ -214,10 +280,22 @@ async function toolWrite({ path, content, expectSha256, createIfMissing = false 
 
 function toolDelete({ path }) {
   const file = safePath(path)
+  assertNoLinkOnPath(dirname(file), path)
   if (!existsSync(file)) throw new Denied('not_found', path)
   if (!args.allowWrite) throw new Denied('permission', '未开启 --allow-write')
   if (args.dryRun) return { path, dryRun: true, preview: `删除 ${path}` }
-  rmSync(file, { recursive: true, force: true })
+  if (lstatSync(file).isSymbolicLink()) throw new Denied('symlink_target', `${path}（目标是符号链接/junction）`)
+  const st = statSync(file)
+  // ⚠️ 2026-10-31 审计（P0）：与 fs_delete 的 schema 声明对齐 —— 只删「文件或空目录」。
+  //    旧实现 recursive:true 会整目录树删除，配合 symlink 可删掉根外的任意目录树。
+  if (st.isDirectory()) {
+    if (readdirSync(file).length > 0) throw new Denied('not_empty', `${path}（只允许删除文件或空目录）`)
+    rmdirSync(file)
+  } else if (st.isFile()) {
+    rmSync(file, { force: true })
+  } else {
+    throw new Denied('not_a_file', path)
+  }
   return { path, deleted: true }
 }
 

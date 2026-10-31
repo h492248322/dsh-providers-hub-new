@@ -228,15 +228,26 @@ if (args.thin) {
   // 插件依赖只有 4 个（jose / undici / cosmokit / schemastery），直接内置最省事：
   // 目标机不必为它们再跑一次 npm install。
   const srcModules = join(CACHE_DIR, 'apppkg', 'node_modules')
-  if (!existsSync(srcModules)) {
-    log('3/7', '插件依赖缓存不存在，正在生成...')
+  // ⚠️ 2026-10-31 审计（P1）：缓存判据不能只有「目录存在」——package.json 改了依赖
+  //    也永远复用旧缓存，插件在目标机加载时报 ERR_MODULE_NOT_FOUND 且打包零告警。
+  //    对照 build-standalone.mjs 的既有做法：slimPkgText 逐字节相同 && node_modules
+  //    （含 .package-lock.json）存在才复用，否则删除重建。
+  const slimPkgText = `${JSON.stringify({ ...slimPkg, name: 'dsh-app-deps', version: '0.0.0', private: true }, null, 2)}\n`
+  const cachePkgFile = join(CACHE_DIR, 'apppkg', 'package.json')
+  const appCached = existsSync(srcModules)
+    && existsSync(join(srcModules, '.package-lock.json'))
+    && existsSync(cachePkgFile)
+    && readFileSync(cachePkgFile, 'utf8') === slimPkgText
+  if (!appCached) {
+    log('3/7', appCached === false && existsSync(srcModules)
+      ? '插件依赖缓存存在但 package.json 已变化（依赖清单改动），正在重建...'
+      : '插件依赖缓存不存在，正在生成...')
+    removePath(join(CACHE_DIR, 'apppkg'))
     mkdirSync(join(CACHE_DIR, 'apppkg'), { recursive: true })
-    writeFileSync(
-      join(CACHE_DIR, 'apppkg', 'package.json'),
-      `${JSON.stringify({ ...slimPkg, name: 'dsh-app-deps', version: '0.0.0', private: true }, null, 2)}\n`,
-      'utf8',
-    )
+    writeFileSync(cachePkgFile, slimPkgText, 'utf8')
     runNpm(['install', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund', '--loglevel=error'], join(CACHE_DIR, 'apppkg'))
+  } else {
+    log('3/7', '复用插件依赖缓存（依赖清单与上次逐字节一致）')
   }
   copyTree(srcModules, join(pluginDir, 'node_modules'))
   log('3/7', `插件依赖已内置（${pluginDeps.length} 个包）`)
@@ -251,14 +262,43 @@ mkdirSync(hostDir, { recursive: true })
 const cachedHostPkg = join(CACHE_DIR, 'hostpkg', 'package.json')
 const cachedHostLock = join(CACHE_DIR, 'hostpkg', 'package-lock.json')
 
-if (existsSync(cachedHostPkg) && existsSync(cachedHostLock) && args.lock) {
+// ⚠️ 2026-10-31 审计（P1）：复用 cache hostpkg 的 lock 前必须核对其中钉住的
+//    @deepseek-ai/dsh 版本等于本次 args.dshVersion —— 旧实现只看文件存在，
+//    用户改 --dsh-version 后产物声称新版本、目标机 npm ci 却装回 lock 里的旧版。
+//    对照 build-standalone.mjs 的既有做法（读宿主安装清单核对版本）。
+const cachedHostInstalled = join(CACHE_DIR, 'hostpkg', 'node_modules', '@deepseek-ai', 'dsh', 'package.json')
+const cachedLockVersion = (() => {
+  try {
+    const lock = JSON.parse(readFileSync(cachedHostLock, 'utf8'))
+    // lock v2/v3：packages['node_modules/@deepseek-ai/dsh'].version；lock v1：dependencies 递归。两种都试。
+    const v2 = lock.packages?.['node_modules/@deepseek-ai/dsh']?.version
+    if (v2) return v2
+    return lock.dependencies?.['@deepseek-ai/dsh']?.version ?? null
+  } catch { return null }
+})()
+// 兜底：lock 里读不到（罕见）再试宿主安装清单。
+function cachedHostDshVersion() {
+  try {
+    return JSON.parse(readFileSync(cachedHostInstalled, 'utf8')).version ?? null
+  } catch { return null }
+}
+
+const hostFilesExist = existsSync(cachedHostPkg) && existsSync(cachedHostLock)
+const lockDshVersion = cachedLockVersion ?? cachedHostDshVersion()
+const canReuseHostLock = args.lock && hostFilesExist && lockDshVersion === args.dshVersion
+
+if (args.lock && hostFilesExist && !canReuseHostLock) {
+  log('4/7', `宿主 lock 缓存钉的是 @deepseek-ai/dsh@${lockDshVersion ?? '（未知）'}，与本次 --dsh-version ${args.dshVersion} 不符 —— 走 lockgen 重建`)
+}
+
+if (canReuseHostLock) {
   // ⚠️ 必须**成对**拷贝：npm ci 要求 package.json 与 lock 的 dependencies 完全一致。
   //    cache 里那份是 build-standalone.mjs 装 548 个包时生成的，可直接复用。
   copyFileSync(cachedHostPkg, join(hostDir, 'package.json'))
   copyFileSync(cachedHostLock, join(hostDir, 'package-lock.json'))
-  log('4/7', '复用打包机的宿主 lock（依赖树与打包机逐字节一致）')
+  log('4/7', `复用打包机的宿主 lock（@deepseek-ai/dsh@${lockDshVersion}，依赖树与打包机逐字节一致）`)
 } else if (args.lock) {
-  // 没有 cache 时用 --package-lock-only 只解析依赖树、不下载包（快且足够）。
+  // 没有 cache（或 cache 版本不符）时用 --package-lock-only 只解析依赖树、不下载包（快且足够）。
   const staging = join(CACHE_DIR, 'lockgen')
   rmSync(staging, { recursive: true, force: true })
   mkdirSync(staging, { recursive: true })
@@ -300,6 +340,11 @@ log('5/7', '生成安装/启停脚本...')
 const runtimeDir = join(productDir, 'runtime')
 mkdirSync(runtimeDir, { recursive: true })
 copyFileSync(join(REPO_ROOT, 'service-runner.mjs'), join(runtimeDir, 'service-runner.mjs'))
+
+// ⚠️ 2026-10-31 审计（P1）：产物此前只带 service-runner.mjs 不带 service.bat，
+//    README/MANIFEST 却指导用户在目标机注册服务 —— 无脚本可跑。随附一份仓库根的
+//    service.bat，让「产物目录里就地注册服务」成为自包含操作。
+copyFileSync(join(REPO_ROOT, 'service.bat'), join(productDir, 'service.bat'))
 
 const template = readFileSync(join(HERE, 'templates', 'install-bootstrap.ps1'), 'utf8')
 const installPs1 = template
@@ -496,7 +541,11 @@ const manifest = {
   profileData: '不随产物分发；用 Jet Hub「账号备份导入」恢复',
   installCommand: 'install.cmd',
   startCommand: 'start.cmd',
-  serviceCommand: `service.bat install -Mode bootstrap -BundleDir "${productDir}"`,
+  serviceCommand: `service.bat install -Mode bootstrap -BundleDir "${productDir}" -Profile ${args.profile}`,
+  // ⚠️ 2026-10-31 审计（P1）：旧版命令缺 -NoPackage，且产物没带 service.bat ——
+  //    目标机上按旧文档执行必然 die（scripts\build-bootstrap.mjs 不存在）。
+  //    现在产物随附 service.bat，且新脚本会自动检测产物目录并跳过打包。
+  serviceCommandNote: '产物已随附 service.bat；新版脚本检测到完整产物时自动跳过打包，无需 -NoPackage。',
   files: {},
 }
 for (const rel of ['install.ps1', 'start.cmd', 'stop.cmd', 'stop.ps1', 'plugin/lib/index.js', 'plugin/lib/client/jet-hub.js', 'plugin/cordis.patch.yml', 'host/package.json']) {
@@ -538,9 +587,12 @@ const readme = `dsh-providers-hub ${pkg.version} —— 引导式部署产物
      DSH_PROFILE=prod  DSH_HOST=127.0.0.1  DSH_PORT=8123
      DSH_OPENAI_GATEWAY_PORT=8326  DSH_OPENAI_GATEWAY_HOST=127.0.0.1
 
-4) 注册成 Windows 服务（管理员 + NSSM）：
+4) 注册成 Windows 服务（管理员 + NSSM；产物根目录已随附 service.bat）：
 
      service.bat install -Mode bootstrap -BundleDir "${productDir}" -Profile ${args.profile}
+
+   ⚠️ 2026-10-31 审计（P1）：新脚本检测到完整产物时会自动跳过打包，无需 -NoPackage；
+   老版本（不带该自动检测的）请加 -NoPackage，否则它会尝试在目标机重新打包而失败。
 
 目录结构
 --------
@@ -549,6 +601,7 @@ ${productName}\\
 ├─ README.txt             本文件
 ├─ install.cmd / install.ps1   目标机安装（下载依赖 + 组装 profile）
 ├─ start.cmd / stop.cmd / stop.ps1
+├─ service.bat            注册 Windows 服务（install -Mode bootstrap -BundleDir 本目录）
 ├─ runtime\\
 │  ├─ service-runner.mjs  服务包装器
 ${args.withNode ? '│  ├─ node.exe            内置 Node ' + nodeVersion + '\n│  └─ node_modules\\npm     内置 npm\n' : ''}├─ plugin\\                 插件本体（lib / locale / cordis.patch.yml / package.json）
@@ -596,6 +649,7 @@ const required = [
   join(productDir, 'install.cmd'),
   join(productDir, 'start.cmd'),
   join(productDir, 'stop.cmd'),
+  join(productDir, 'service.bat'),
   join(runtimeDir, 'service-runner.mjs'),
   join(pluginDir, 'lib', 'index.js'),
   join(pluginDir, 'lib', 'client', 'jet-hub.js'),
@@ -633,4 +687,4 @@ console.log(`[完成] Node: ${args.withNode ? `已内置 ${nodeVersion}` : '未�
 if (args.zip) console.log(`[完成] zip: ${join(args.out, `${productName}.zip`)}`)
 console.log('')
 console.log('目标机部署：解压 -> install.cmd -> start.cmd')
-console.log(`注册服务：service.bat install -Mode bootstrap -BundleDir "${productDir}"`)
+console.log(`注册服务（产物已随附 service.bat）：service.bat install -Mode bootstrap -BundleDir "${productDir}" -Profile ${args.profile}`)

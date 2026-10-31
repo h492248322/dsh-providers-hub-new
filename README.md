@@ -206,6 +206,7 @@ dsh-providers-hub-<版本>-win-x64\
 ├─ README.txt             部署说明
 ├─ install.cmd / install.ps1   目标机安装（下载依赖 + 组装 profile）
 ├─ start.cmd / stop.cmd / stop.ps1
+├─ service.bat            注册 Windows 服务（产物随附，目标机就地可跑）
 ├─ runtime\
 │  ├─ service-runner.mjs  服务包装器
 │  └─ node.exe            ← 仅 --with-node 打包时存在（含 npm，+130 MB）
@@ -262,6 +263,7 @@ dsh-providers-hub-<版本>-win-x64\
 ├─ README.txt             部署说明（目录结构、启动方式、限制）
 ├─ start.cmd              启动（前台，用内置 Node）
 ├─ stop.cmd / stop.ps1    停止
+├─ service.bat            注册 Windows 服务（产物随附，目标机就地可跑）
 ├─ runtime\
 │  ├─ node.exe            内置 Node 运行时（目标机无需装 Node）
 │  └─ service-runner.mjs  服务包装器
@@ -310,12 +312,16 @@ Web UI：`http://<DSH_HOST>:<DSH_PORT>`；网关：`http://<网关地址>:<端�
 ⚠️ 不要把监听地址改成 `0.0.0.0` / `::` —— 宿主与网关都会在启动前**显式拒绝**并报错退出；
 要给内网访问请填**具体网卡 IP**，并务必设置 `DSH_OPENAI_GATEWAY_API_KEY`。
 
-注册成 Windows 服务（需管理员 + NSSM）：
+注册成 Windows 服务（需管理员 + NSSM；两种产物根目录都已随附 `service.bat`）：
 
 ```bat
 service.bat install -Mode standalone -BundleDir <产物目录> -Profile prod   :: 离线式
 service.bat install -Mode bootstrap  -BundleDir <产物目录> -Profile prod   :: 引导式（先跑过 install.cmd）
 ```
+
+> ⚠️ 2026-10-31 审计（P1）：新版 `service.bat` 检测到 `-BundleDir` 已是完整产物时
+> **自动跳过打包**（打印一行提示），无需再加 `-NoPackage`；`-Force` 仍可强制重打包。
+> 老版本（无自动检测的）必须显式加 `-NoPackage`，否则它会在目标机上尝试重新打包而失败。
 
 > ⚠️ 账号登录仍需在浏览器里完成（Jet Hub 设置页）；无浏览器环境请用「账号备份与迁移」里的
 > 导出/导入把账号搬过去。

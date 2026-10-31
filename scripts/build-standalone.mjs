@@ -650,6 +650,10 @@ writeText(join(productDir, 'start.cmd'), startCmd, { crlf: true })
 writeText(join(productDir, 'stop.cmd'), stopCmd, { crlf: true })
 writeText(join(productDir, 'stop.ps1'), stopPs1)
 
+// ⚠️ 2026-10-31 审计（P1）：产物此前只带 service-runner.mjs 不带 service.bat，
+//    README 却指导用户注册服务 —— 无脚本可跑。随附一份仓库根的 service.bat。
+copyFileSync(join(REPO_ROOT, 'service.bat'), join(productDir, 'service.bat'))
+
 // ---- 清单 ----
 const hostPackages = listPackages(hostInnerModules).map((p) => {
   let version = null
@@ -700,6 +704,7 @@ ${productName}\\
 ├─ README.txt             本文件
 ├─ start.cmd              启动（前台）
 ├─ stop.cmd / stop.ps1    停止
+├─ service.bat            注册 Windows 服务（install -Mode standalone -BundleDir 本目录）
 ├─ runtime\\
 │  ├─ node.exe            内置 Node 运行时
 │  └─ service-runner.mjs  服务包装器（配合 service.bat -Mode standalone）
@@ -732,9 +737,12 @@ ${productName}\\
    Web UI : http://<DSH_HOST>:<DSH_PORT>
    网关   : http://<DSH_OPENAI_GATEWAY_HOST>:<DSH_OPENAI_GATEWAY_PORT>/v1
 
-2) 注册为 Windows 服务（需管理员 + NSSM）：
+2) 注册为 Windows 服务（需管理员 + NSSM；产物根目录已随附 service.bat）：
 
      service.bat install -Mode standalone -BundleDir <本目录> -Profile ${args.profile}
+
+   ⚠️ 2026-10-31 审计（P1）：新脚本检测到完整产物时会自动跳过打包，无需 -NoPackage；
+   老版本（不带该自动检测的）请加 -NoPackage。
 
 3) 停止： stop.cmd
 
@@ -837,4 +845,4 @@ console.log(`[完成] 宿主依赖 ${hostPackages.length} 个 / 插件依赖 ${a
 console.log(`[完成] 原生二进制包: ${nativeReport.map((n) => n.package).join(', ') || '（无）'}`)
 if (args.zip) console.log(`[完成] zip: ${join(args.out, `${productName}.zip`)}`)
 console.log('')
-console.log('目标机部署：解压 -> start.cmd（或 service.bat install -Mode standalone）')
+console.log('目标机部署：解压 -> start.cmd（或 service.bat install -Mode standalone，产物已随附 service.bat）')
