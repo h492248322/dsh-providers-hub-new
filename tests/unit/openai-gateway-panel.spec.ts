@@ -377,6 +377,73 @@ describe('凭据的展示与复制', () => {
     }
   })
 
+  // ⚠️ 这条锁的是「局域网 http 打不开复制」那个报障的修复（2026-10-23）。
+  //    `navigator.clipboard` 只在安全上下文存在；用 `http://<内网 IP>` 访问时它是
+  //    `undefined`，而此时**必须**降级到 `execCommand('copy')`，不能直接返回 false。
+  it('非安全上下文（局域网 http，没有 navigator.clipboard）时降级到 execCommand', async () => {
+    const execCommand = vi.fn().mockReturnValue(true)
+    const appended: any[] = []
+    const body = {
+      appendChild: (el: any) => { el.parentNode = body; appended.push(el); return el },
+      removeChild: (el: any) => { el.parentNode = null; return el },
+    }
+    const textarea = {
+      value: '',
+      style: {} as Record<string, string>,
+      parentNode: null as any,
+      setAttribute: vi.fn(),
+      select: vi.fn(),
+      setSelectionRange: vi.fn(),
+    }
+    const focus = vi.fn()
+    vi.stubGlobal('navigator', {})  // 没有 clipboard —— 正是局域网 http 的样子
+    vi.stubGlobal('document', {
+      body,
+      activeElement: { focus },
+      createElement: vi.fn().mockReturnValue(textarea),
+      execCommand,
+    })
+    try {
+      expect(await copyToClipboard('secret')).toBe(true)
+      expect(execCommand).toHaveBeenCalledWith('copy')
+      // 值必须真的塞进 textarea，否则复制到的是空串
+      expect(textarea.value).toBe('secret')
+      // 必须真的插入 DOM 才能选中；用完必须摘掉，不能留垃圾节点
+      expect(appended).toHaveLength(1)
+      expect(textarea.parentNode).toBeNull()
+      // 焦点要还给用户，否则键盘操作位置丢失
+      expect(focus).toHaveBeenCalled()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('降级路径也失败时返回 false（不能让 UI 以为复制成功了）', async () => {
+    const body = {
+      appendChild: (el: any) => { el.parentNode = body; return el },
+      removeChild: (el: any) => { el.parentNode = null; return el },
+    }
+    vi.stubGlobal('navigator', {})
+    vi.stubGlobal('document', {
+      body,
+      activeElement: null,
+      createElement: () => ({
+        value: '',
+        style: {} as Record<string, string>,
+        parentNode: null as any,
+        setAttribute() {},
+        select() {},
+        setSelectionRange() {},
+      }),
+      execCommand: vi.fn().mockReturnValue(false),
+    })
+    try {
+      expect(await copyToClipboard('secret')).toBe(false)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
   it('面板默认不把密钥明文渲染进 DOM，只有点「显示明文」才出现', () => {
     // 设置页会被截图/录屏/投屏，明文默认躺在屏幕上等于把凭据带出去。
     const body = source.slice(
