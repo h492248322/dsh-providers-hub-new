@@ -243,6 +243,12 @@ function parseModelInfo(
   // 过滤视觉（VL）多模态模型
   // id 含 -VL- 或以 -VL 结尾（如 Qwen3-VL-235B），上下文小、不支持工具调用，
   // 不适合当 agent 主模型，从列表隐藏；只通过 analyzeImage 等工具间接调用。
+  //
+  // ⚠️ 本判据**大小写敏感**（登记，2026-10-31 审计）：真机 `kimi-k2.6-vl` 是
+  //    小写 `-vl`，会**逃过**本过滤留在 `models`/`remoteModels` 与磁盘缓存里；
+  //    目录可见性由 `llm-adapter.ts` 的 `catalogEntries`（`/-VL-/i`，不敏感）
+  //    二次拦下 ⇒ 最终仍不进目录。两层口径分叉是**既有行为**，不在此擅自统一
+  //    （统一属行为变更，须另行登记取证）。
   if (id.includes('-VL-') || id.endsWith('-VL')) return undefined
   const rawName = m['model_name']
   /**
@@ -455,6 +461,10 @@ export async function fetchSignedGet(
  * 直接抛 `TargetPressureConfigError`。⇒ 上游的输出上限**不**进
  * `RemoteModel`（见该接口 `contextWindow` 旁的注释）；出站预算由
  * `CODEARTS_MAX_OUTPUT_TOKENS` 单点决定。
+ *
+ * ⚠️ **`supports_images` 也不在本函数读**（2026-10-31 审计修）—— 它是
+ * 「图片能力」不是「窗口」，本函数只管窗口；`supports_images` 的灌入在
+ * {@link fetchAgentCenterWindows} 的收集循环里直接做（见该处注释）。
  */
 export function readAgentCenterWindow(
   m: Record<string, unknown>,
@@ -466,6 +476,26 @@ export function readAgentCenterWindow(
   const ctx = p['context_window']
   if (typeof ctx === 'number' && Number.isInteger(ctx) && ctx > 0) out.contextWindow = ctx
   return out
+}
+
+/**
+ * AgentCenter 通道本轮收到的「能收图」模型 id（`supports_images === true`）。
+ *
+ * ⚠️ 为什么不直接在收集循环里调 `setCodeartsImageModels`：灌入判据要与
+ * builtin 通道取**并集**（builtin 有、AgentCenter 漏的模型不能被后者冲掉），
+ * 所以这里只暂存、由 `fetchCodeArtsRemoteModels` 在两个通道都跑完后统一灌。
+ * 空数组**不清空**由 `setCodeartsImageModels` 自身兑现（空集守卫）。
+ */
+let agentCenterImageIds: string[] = []
+
+/**
+ * 取走 AgentCenter 本轮收到的图片能力 id 并清空暂存（仅供
+ * {@link fetchCodeArtsRemoteModels} 在合并阶段调用一次）。
+ */
+function takeAgentCenterImageIds(): string[] {
+  const taken = agentCenterImageIds
+  agentCenterImageIds = []
+  return taken
 }
 
 /**
@@ -578,6 +608,19 @@ export async function fetchAgentCenterWindows(
       const rawId = m['model_id'] ?? m['model_alias'] ?? m['model_name']
       const id = typeof rawId === 'string' ? rawId.trim() : ''
       if (id.length === 0) continue
+      // ⚠️⚠️ **`supports_images` 在这里顺路收走**（2026-10-31 审计修 kimi-k3 盲区）：
+      //    `kimi-k3` 只在 AgentCenter 出现（builtin 漏发，见
+      //    `providers-codearts.md` 的漂移表），而 builtin 灌入通道只扫 builtin ——
+      //    不在这里收 ⇒ 报障主诉模型永远进不了 `codeartsAcceptsImage` 的判定集。
+      //    实测该端点的 `model_parameters` 里就带 `supports_images`
+      //    （文档 `providers-codearts.md` 的端点表逐字记载）。
+      //    ⚠️ 与窗口收集**解耦**：不带窗口但带图能力的条目也要收
+      //    （`continue` 在下面才发生）。
+      //    收进模块级暂存，由 {@link flushAgentCenterImageModels} 统一灌给
+      //    `codearts-vision.ts`（与 builtin 通道**并集**，见调用点注释）。
+      if ((m['model_parameters'] as Record<string, unknown> | undefined)?.['supports_images'] === true) {
+        agentCenterImageIds.push(id)
+      }
       const w = readAgentCenterWindow(m)
       if (w.contextWindow === undefined) continue
       /**
@@ -682,6 +725,11 @@ export async function fetchCodeArtsRemoteModels(
   // 2. snap-access /v1/model/builtin — 常规模型（GLM-5.2、openpangu、glm-5.2-sft-harmony 等）
   //    Agent-Type: PromptCenter + X-Language: zh-cn（不参与签名）。
   //    替代旧 statistics/plugin（已不再返回 model_metrics）。
+  //
+  //    ⚠️ builtin 通道的图片能力 id 收集在下面的循环里（`builtinImageIds`），
+  //    与 AgentCenter 通道取**并集**后统一灌入（见合并处注释）——
+  //    各自单独灌会让后灌的覆盖先灌的。
+  const builtinImageIds: string[] = []
   const snapText = await fetchSignedGet(fetcher, SNAP_MODEL_BUILTIN_URL, ak, sk, st, {
     'Content-Type': 'application/json',
     'Agent-Type': 'PromptCenter',
@@ -695,13 +743,12 @@ export async function fetchCodeArtsRemoteModels(
     // ⚠️ `supports_images` 必须在本循环里**单独**读，不能指望 `RemoteModel`：
     //    `parseModelInfo` 会把 `-VL-` / `-VL` 结尾的模型**整条丢掉**（它们不进
     //    对话目录），而能收图的恰恰就是这批模型 ⇒ 走 `models` 数组根本看不到它们。
-    const imageIds: string[] = []
     for (const item of snapArr) {
       if (typeof item === 'object' && item !== null) {
         const entry = item as Record<string, unknown>
         if (entry['supports_images'] === true) {
           const rawId = entry['model_id']
-          if (typeof rawId === 'string' && rawId.length > 0) imageIds.push(rawId)
+          if (typeof rawId === 'string' && rawId.length > 0) builtinImageIds.push(rawId)
         }
         const mi = parseModelInfo(entry, seen, nowMs)
         if (mi) models.push(mi)
@@ -709,7 +756,8 @@ export async function fetchCodeArtsRemoteModels(
     }
     // ⚠️ 只在**本来源取到**时才灌入：请求失败（snapArr 为 undefined）时不动
     //   已灌入的集合 —— 一次抖动就把「刚能收图」的模型变不能，比保持原样更糟。
-    setCodeartsImageModels(imageIds)
+    //   （实际灌入统一在下方 builtin ∪ AgentCenter 合并处；此处保留注释防止
+    //   有人把 `setCodeartsImageModels` 挪回循环里。）
   }
 
   /**
@@ -762,6 +810,18 @@ export async function fetchCodeArtsRemoteModels(
       '[codearts] AgentCenter 动态窗口不可用，窗口分母将退化到静态兜底表（目录本身不受影响）',
     )
   }
+
+  /**
+   * 图片能力灌入：**builtin ∪ AgentCenter 并集**（2026-10-31 审计修 kimi-k3 盲区）。
+   *
+   * builtin 通道已在上面的循环里收好 `imageIds`；AgentCenter 通道在
+   * {@link fetchAgentCenterWindows} 里顺路收进了暂存（`kimi-k3` 只在那个端点
+   * 出现）。两个通道**取并集**后一次灌入 —— 若各自单独灌，后灌的会覆盖先灌的
+   * （`setCodeartsImageModels` 原为整体覆盖；现空集不清空，但非空集仍覆盖）。
+   * ⚠️ AgentCenter 失败时 `takeAgentCenterImageIds()` 返回空数组 —— 空集不清空
+   * 的守卫保证它不会冲掉 builtin 收到的集合。
+   */
+  setCodeartsImageModels([...builtinImageIds, ...takeAgentCenterImageIds()])
 
   /**
    * 持久化 benefit 集合：chat 请求签名时据此决定是否带 `maas_type`。

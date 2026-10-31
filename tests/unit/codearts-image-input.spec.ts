@@ -48,7 +48,7 @@ import {
   resetCodeartsImageModels,
   setCodeartsImageModels,
 } from '../../src/codearts-vision.js'
-import { fetchCodeArtsRemoteModels, SNAP_MODEL_BUILTIN_URL } from '../../src/models.js'
+import { fetchCodeArtsRemoteModels, SNAP_AGENT_CENTER_DETAIL_URL, SNAP_AGENT_CENTER_USERAGENTS_URL, SNAP_MODEL_BUILTIN_URL } from '../../src/models.js'
 import type { CodeArtsCredential } from '../../src/types.js'
 
 const validCredential: CodeArtsCredential = {
@@ -324,5 +324,94 @@ describe('CodeArts 图片输入：跟随远端目录新增的多模态模型', (
       '虽被丢出目录，仍须能收图 ⇒ 收集必须发生在 -VL 过滤之前',
     ).toBe(true)
     expect(codeartsAcceptsImage('glm-5.3'), '远端标 false ⇒ 不放行').toBe(false)
+  })
+
+  /**
+   * 守卫 ⑭：**AgentCenter 通道**的 `supports_images` 也要灌进判据（2026-10-31 审计修）。
+   *
+   * ⚠️⚠️ 本用例的形状与真实上游**一致**：`kimi-k3` **只在 AgentCenter 出现**
+   *    （builtin 漏发 —— 真实上游就是这么下发的，见
+   *    `providers-codearts.md` 的漂移表），且 master 已把它移出兜底目录
+   *    ⇒ 若 AgentCenter 通道不收，它**永远**进不了判定集（⑬ 的 fixture 把
+   *    kimi-k3 放在 builtin 里，测的是理想化输入，盖不住这条真实路径）。
+   *
+   * ⚠️ 两个通道必须**并集**：本用例 builtin 只给 glm-5.3（不能收图）、
+   *    AgentCenter 给 kimi-k3 + `kimi-k5-ac-VL`（能收图）⇒
+   *    若 AgentCenter 单独灌并覆盖 builtin，或反之，断言都会红。
+   *
+   * ⚠️ 有牙：删掉 AgentCenter 收集腿 ⇒ 最后一条红；把并集改回「各自灌」
+   *    （AgentCenter 后灌覆盖 builtin）⇒ 倒数第二条红。
+   */
+  it('⑭ AgentCenter 通道的 supports_images 也灌进判据（kimi-k3 真实路径），与 builtin 并集', async () => {
+    const fetcher = (async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (url === SNAP_AGENT_CENTER_USERAGENTS_URL) {
+        // 与 fetchAgentCenterWindows 的解析口径一致：agents[]，取 primary。
+        return new Response(JSON.stringify({
+          agents: [{ agent_id: 'ag-1', is_primary_agent: true }],
+        }), { status: 200 })
+      }
+      if (url.startsWith(SNAP_AGENT_CENTER_DETAIL_URL)) {
+        // 与真机实测条目键集同形：gpts.models[] 带 model_alias + model_parameters。
+        return new Response(JSON.stringify({
+          gpts: { models: [
+            {
+              model_alias: 'kimi-k3', model_name: 'Kimi K3',
+              model_parameters: { context_window: 1048576, supports_images: true },
+            },
+            {
+              // 大写 -VL 结尾 ⇒ 与目录层过滤同口径被丢（但它要能收图）。
+              model_alias: 'kimi-k5-ac-VL', model_name: 'Kimi K5 AC VL',
+              model_parameters: { context_window: 1048576, supports_images: true },
+            },
+            {
+              // 带窗口但不带图能力 ⇒ 不得被灌进图片集合。
+              model_alias: 'glm-5.3', model_name: 'GLM 5.3',
+              model_parameters: { context_window: 1048576 },
+            },
+          ] },
+        }), { status: 200 })
+      }
+      if (url === SNAP_MODEL_BUILTIN_URL) {
+        // builtin 刻意**不含** kimi-k3（与真实上游一致），只给一个不能收图的。
+        return new Response(JSON.stringify({
+          builtinModels: [
+            { model_id: 'glm-5.2', model_name: 'GLM-5.2', supports_images: false },
+          ],
+        }), { status: 200 })
+      }
+      return new Response('', { status: 404 })
+    }) as unknown as typeof fetch
+
+    const models = await fetchCodeArtsRemoteModels(validCredential, fetcher)
+    const ids = models.map((m) => m.id)
+    expect(ids, 'kimi-k3 是 windowOnly 条目（AgentCenter 有、目录没有）').toContain('kimi-k3')
+    expect(codeartsAcceptsImage('kimi-k3'), 'AgentCenter 标 true ⇒ 能收图（真实报障路径）').toBe(true)
+    expect(
+      codeartsAcceptsImage('kimi-k5-ac-VL'),
+      'AgentCenter 的 -VL 条目同样要在 -VL 过滤前收走',
+    ).toBe(true)
+    expect(codeartsAcceptsImage('glm-5.3'), 'AgentCenter 未标 ⇒ 不放行').toBe(false)
+    expect(codeartsAcceptsImage('glm-5.2'), 'builtin 标 false ⇒ 不放行').toBe(false)
+  })
+
+  /**
+   * 守卫 ⑮：**空集不清空**（2026-10-31 审计 P2 修）——「只增不减」的兑现。
+   *
+   * ⚠️ 场景：本轮目录拉取成功但上游某端点漏发/该账号无下发 ⇒ 灌入收到空数组。
+   *    若空集直接覆盖，所有目录派生的多模态模型瞬间失去收图能力。
+   *    修后语义：空集 + 已有非空集合 ⇒ 保持原集合；真空集从零开始仍可灌（首灌）。
+   */
+  it('⑮ 空集不清空已有集合；首次空灌后回退静态表', () => {
+    setCodeartsImageModels(['kimi-k3'])
+    setCodeartsImageModels([])
+    expect(codeartsAcceptsImage('kimi-k3'), '空集不得清空已有能力').toBe(true)
+    resetCodeartsImageModels()
+    setCodeartsImageModels([])
+    // ⚠️ 「首次空灌」的可观测行为与「从未加载」相同：都回退静态表。
+    //    `kimi-k2.6-vl` 在静态表里 ⇒ true 是**正确**行为（不是缺陷）；
+    //    `kimi-k3` 不在静态表 ⇒ false（证明目录集合确实没塞进它）。
+    expect(codeartsAcceptsImage('kimi-k2.6-vl'), '静态表兜底仍生效').toBe(true)
+    expect(codeartsAcceptsImage('kimi-k3'), '静态表没有 kimi-k3 ⇒ false').toBe(false)
   })
 })

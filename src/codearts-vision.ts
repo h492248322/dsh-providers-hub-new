@@ -140,8 +140,9 @@ export const CODEARTS_VL_MODELS: readonly string[] = ['kimi-k2.6-vl', 'Qwen3-VL-
  *
  * `undefined` = **目录尚未加载成功过**（离线 / 请求失败）⇒ 判据回退到静态表。
  *
- * ⚠️ **只增不减**地覆盖：加载失败时**保留上一次成功的集合**，不回退静态表 ——
- * 一次网络抖动就让「刚刚还能收图」的模型变不能收，是不可接受的抖动。
+ * ⚠️ **只增不减**：空集不清空（见 {@link setCodeartsImageModels}）、「请求失败
+ * 不灌入」由调用方（`models.ts`）负责 —— 一次网络抖动就让「刚刚还能收图」的
+ * 模型变不能收，是不可接受的抖动。
  */
 let catalogImageModels: ReadonlySet<string> | undefined
 
@@ -154,6 +155,18 @@ let catalogImageModels: ReadonlySet<string> | undefined
  * 目录在 `models.ts` 里，而 `models.ts` 反过来依赖本模块的判据 ⇒ 只能由
  * `models.ts` **单向**把结果灌进来，本模块绝不反向 import。
  *
+ * ## ⚠️ 「只增不减」由**本函数**兑现，不是调用方（2026-10-31 审计 P2 修）
+ *
+ * **空集不清空**：`ids` 归一化后为空、而当前已有非空集合时，**保持原集合不变**。
+ * 理由：`builtinModels: []`（或 AgentCenter 列表为空）可能是「请求成功但该账号
+ * 无下发」的合法状态，也可能只是上游该端点**临时**漏发 —— 无论哪种，把它当成
+ * 「确认全部下架」去清空，都会让所有目录派生的多模态模型瞬间失去收图能力，
+ * 只剩静态表两个兜底；而「真的全部下架」的代价只是发图被上游 406 拒（改动前
+ * 的既有行为）。两害相权，宁可陈旧、不清空。
+ *
+ * ⚠️ 调用方**仍然**负责「请求失败不调用」（`models.ts` 在 `snapArr === undefined`
+ * 时跳过）—— 本函数只兑现「成功但空 ⇒ 不清空」这半边。
+ *
  * @param ids - 远端 `supports_images === true` 的模型 id（原始大小写均可）
  */
 export function setCodeartsImageModels(ids: Iterable<string>): void {
@@ -163,6 +176,7 @@ export function setCodeartsImageModels(ids: Iterable<string>): void {
     const key = id.trim().toLowerCase()
     if (key.length > 0) next.add(key)
   }
+  if (next.size === 0 && catalogImageModels !== undefined && catalogImageModels.size > 0) return
   catalogImageModels = next
 }
 
